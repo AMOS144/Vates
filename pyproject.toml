@@ -1,0 +1,33 @@
+[project]
+name = "mlx-streaming-moe"
+version = "0.1.0"
+description = "Apple Silicon 上的显存外置流式 MoE 推理 + Qwen3-Next MTP 自投机解码(基于 MLX)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mlx>=0.31",
+    "mlx-lm>=0.31",
+    "numpy>=2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+# 默认用清华镜像(pypi 在国内慢/TLS 偶发重置)。如不需要可删除本段。
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# 包名仍为 mlx_streaming(保持现有 import 路径不变)
+[tool.hatch.build.targets.wheel]
+packages = ["mlx_streaming"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["mlx_streaming/tests"]

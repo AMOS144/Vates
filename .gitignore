@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# 模型/专家权重等大文件不入库(通过环境变量指向本地/tmp)
+*.safetensors
+/models/
+/experts/
