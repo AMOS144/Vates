@@ -2,7 +2,20 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.worktrees/
 # 模型/专家权重等大文件不入库(通过环境变量指向本地/tmp)
 *.safetensors
 /models/
 /experts/
+# native 构建产物不入库(源码在 native/,产物由 make/cmake 现场生成)
+native/ext/build/
+# bench/ 下编译出的一次性基准二进制(无后缀)
+native/bench/pack_loader
+native/bench/array_bench
+native/bench/qlinear_bench
+native/bench/compute_buffer_bench
+native/bench/metal_staging_bench
+native/bench/metal_fused_moe_bench
+native/bench/native_moe_runner
+# 由 `make -C native/ext native_moe_ext` 生成的 MLX 扩展(.so 不入库,需现场编译)
+mlx_streaming/native_moe_ext*.so

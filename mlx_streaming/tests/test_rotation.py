@@ -32,7 +32,7 @@ def test_weight_prerotation_equivalence():
 
 
 def test_rotate_requantize_file_preserves_shape_and_keys():
-    from mlx_streaming.rotate_requantize_experts import rotate_requantize_file
+    from mlx_streaming.prep.rotate_requantize_experts import rotate_requantize_file
     # 造一个「源 4-bit 单专家」文件：gate/up (768,2048)，down (2048,768)
     src = {}
     for name, (out, inp) in {
@@ -89,9 +89,9 @@ def test_rotated_forward_matches_plain_switchglu():
     # 管线无 bias 断言：在 8-bit（量化噪声可忽略）下，旋转前向应与普通前向数值一致。
     # 4-bit 下 plain 与 rot 各自有独立量化网格噪声，不能直接对比（那是 Task 5 在真实
     # 权重上做的质量对比，随机高斯权重旋转无增益）。
-    from mlx_streaming.rotate_requantize_experts import rotate_requantize_dir
-    from mlx_streaming.expert_store import FileExpertStore
-    from mlx_streaming.streaming_moe import RotatedSubGLU, PersistentSubGLU
+    from mlx_streaming.prep.rotate_requantize_experts import rotate_requantize_dir
+    from mlx_streaming.core.cache.expert_store import FileExpertStore
+    from mlx_streaming.core.moe.compute import RotatedSubGLU, PersistentSubGLU
     with tempfile.TemporaryDirectory() as root:
         src = os.path.join(root, "src")
         rot = os.path.join(root, "rot")
@@ -122,8 +122,9 @@ def test_rotated_forward_matches_plain_switchglu():
 
 
 def test_patch_filebacked_uses_rotated_sub():
-    from mlx_streaming.streaming_moe import FileStreamingMoeBlock, RotatedSubGLU
-    from mlx_streaming.expert_store import FileExpertStore
+    from mlx_streaming.core.moe.block import FileStreamingMoeBlock
+    from mlx_streaming.core.moe.compute import RotatedSubGLU
+    from mlx_streaming.core.cache.expert_store import FileExpertStore
     with tempfile.TemporaryDirectory() as root:
         _make_expert_files(root, n_experts=4)
         store = FileExpertStore(root, capacity=8)

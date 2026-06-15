@@ -1,4 +1,4 @@
-from mlx_streaming.mem import MemSnapshot, snapshot, rss_bytes
+from mlx_streaming.core.mem import MemSnapshot, snapshot, rss_bytes
 
 
 def test_rss_is_positive():

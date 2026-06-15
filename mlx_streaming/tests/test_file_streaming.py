@@ -6,13 +6,11 @@ import mlx.nn as nn
 from mlx_lm.models.switch_layers import SwitchGLU
 from mlx_lm.models.qwen3_moe import Model, ModelArgs
 
-from mlx_streaming.split_experts import split_switch_glu
-from mlx_streaming.expert_store import FileExpertStore
-from mlx_streaming.streaming_moe import (
-    streaming_switch_glu_forward_from_store,
-    patch_model_filebacked,
-    FileStreamingMoeBlock,
-)
+from mlx_streaming.prep.split_experts import split_switch_glu
+from mlx_streaming.core.cache.expert_store import FileExpertStore
+from mlx_streaming.core.moe.compute import streaming_switch_glu_forward_from_store
+from mlx_streaming.core.prefetch.patch import patch_model_filebacked
+from mlx_streaming.core.moe.block import FileStreamingMoeBlock
 
 
 def test_file_backed_matches_resident_quantized():
@@ -83,6 +81,31 @@ def test_filebacked_patch_matches_quantized_model():
     assert got.shape == ref.shape
     assert mx.allclose(ref, got, atol=1e-4).item()
     assert store.misses >= 1
+
+
+def test_gpu_remap_decode_matches_host(monkeypatch):
+    # warm 后 seq=1 解码:GPU 侧 slot 重映射(GPU_REMAP=1)须与 host 路径(=0)逐 bit 一致,
+    # 且确实走了 GPU 查找表(_slot_table 被建立)。
+    mx.random.seed(0)
+    model, args = _tiny_quantized_moe()
+    out_dir = tempfile.mkdtemp(prefix="mlx_gpu_remap_")
+    gp = None
+    for i, layer in enumerate(model.layers):
+        sm = layer.mlp.switch_mlp
+        split_switch_glu(sm, out_dir, i)
+        gp = sm.gate_proj
+    store = FileExpertStore(out_dir, capacity=args.num_experts)   # 全装得下,不驱逐
+    patch_model_filebacked(model, store, gp.input_dims, gp.output_dims,
+                           gp.group_size, gp.bits)
+
+    blk = model.layers[0].mlp
+    x = mx.random.normal((1, 1, gp.input_dims))
+    monkeypatch.setenv("GPU_REMAP", "0")
+    y_host = blk(x); mx.eval(y_host)          # host 路径,顺便预热池
+    monkeypatch.setenv("GPU_REMAP", "1")
+    y_gpu = blk(x); mx.eval(y_gpu)            # 全命中 → 走 GPU remap
+    assert mx.allclose(y_host, y_gpu, atol=1e-6).item()
+    assert 0 in getattr(store._resident, "_slot_table", {})
 
 
 def test_resident_pool_falls_back_when_uniques_exceed_capacity():

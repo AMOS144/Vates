@@ -2,7 +2,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.switch_layers import SwitchGLU
 
-from mlx_streaming.streaming_moe import streaming_switch_glu_forward
+from mlx_streaming.core.moe.compute import streaming_switch_glu_forward
 
 
 def test_streaming_matches_switchglu():

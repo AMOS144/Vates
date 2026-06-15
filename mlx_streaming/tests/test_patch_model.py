@@ -2,7 +2,8 @@
 import mlx.core as mx
 from mlx_lm.models.qwen3_moe import Model, ModelArgs
 
-from mlx_streaming.streaming_moe import patch_model, StreamingMoeBlock
+from mlx_streaming.core.prefetch.patch import patch_model
+from mlx_streaming.core.moe.block import StreamingMoeBlock
 
 
 def _tiny_model():

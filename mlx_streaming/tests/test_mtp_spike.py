@@ -2,9 +2,9 @@ import mlx.core as mx
 
 from mlx_lm.models.qwen3_next import ModelArgs
 
-from mlx_streaming.extract_mtp import stack_mtp_experts, bump_mtp_norms
-from mlx_streaming.qwen3_next_mtp import Qwen3NextMTP
-from mlx_streaming.validate_mtp import capture_prenorm_hidden
+from mlx_streaming.prep.extract_mtp import stack_mtp_experts, bump_mtp_norms
+from mlx_streaming.mtp.qwen3_next_mtp import Qwen3NextMTP
+from mlx_streaming.model_builder import capture_prenorm_hidden
 
 
 def _tiny_args():

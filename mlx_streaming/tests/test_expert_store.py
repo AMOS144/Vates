@@ -1,6 +1,8 @@
+import os
+
 import mlx.core as mx
 
-from mlx_streaming.expert_store import LruExpertStore, FileExpertStore
+from mlx_streaming.core.cache.expert_store import LruExpertStore, FileExpertStore
 
 
 def _fake_stacked(num_experts=8, out=16, inp=12):
@@ -68,3 +70,24 @@ def test_record_hot_and_pin(tmp_path):
     store.fetch(0, [2])                            # 冷专家走 LRU miss
     assert store.misses == 1
     assert store.pinned_count() == 1              # pinned 永不驱逐
+
+
+def test_file_store_loads_from_layer_bundle(tmp_path, monkeypatch):
+    d = str(tmp_path)
+    os.makedirs(tmp_path / "layer_bundles")
+    for e in range(2):
+        mx.save_safetensors(f"{d}/layer00_expert{e:03d}.safetensors",
+                            {"weight": mx.full((2, 2), float(e))})
+    mx.save_safetensors(
+        f"{d}/layer_bundles/layer00.safetensors",
+        {
+            "expert000.weight": mx.full((2, 2), 0.0),
+            "expert001.weight": mx.full((2, 2), 1.0),
+        },
+    )
+    monkeypatch.setenv("EXPERT_BUNDLE", "1")
+    store = FileExpertStore(d, capacity=4)
+    arrs, slots = store.acquire(0, [0, 1])
+    assert mx.array_equal(arrs["weight"][slots[0]], mx.full((2, 2), 0.0)).item()
+    assert mx.array_equal(arrs["weight"][slots[1]], mx.full((2, 2), 1.0)).item()
+    assert store.bundle_loads == 1

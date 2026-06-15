@@ -4,7 +4,7 @@ import mlx.nn as nn
 from mlx_lm.models import cache as kvcache
 from mlx_lm.models.qwen3_next import ModelArgs
 
-from mlx_streaming.qwen3_next_mtp import Qwen3NextMTP, mtp_step
+from mlx_streaming.mtp.qwen3_next_mtp import Qwen3NextMTP, mtp_advance, mtp_step
 
 
 def _tiny_args():
@@ -48,9 +48,34 @@ def test_mtp_step_single_token():
     assert mh.shape == (1, 1, args.hidden_size)
 
 
+def test_mtp_advance_batch_matches_stepwise_hidden():
+    """批量推进 cache 的 hidden 应与逐 token 推进一致,且不依赖 logits。"""
+    mx.random.seed(6)
+    args = _tiny_args()
+    mtp = Qwen3NextMTP(args)
+    mx.eval(mtp.parameters())
+    head = mx.random.normal((args.hidden_size, args.vocab_size))
+    lm = lambda h: h @ head
+    hidden = mx.random.normal((1, 3, args.hidden_size))
+    token = mx.array([[3, 5, 7]])
+
+    batch_cache = kvcache.KVCache()
+    batch_H = mtp_advance(mtp, hidden, token, batch_cache)
+
+    step_cache = kvcache.KVCache()
+    parts = []
+    for i in range(token.shape[1]):
+        _, H = mtp_step(mtp, hidden[:, i:i + 1, :], token[:, i:i + 1], lm, step_cache)
+        parts.append(H)
+    step_H = mx.concatenate(parts, axis=1)
+
+    assert batch_cache.offset == step_cache.offset == 3
+    assert float(mx.abs(batch_H - step_H).max()) < 2e-3
+
+
 # ---------------------------------------------------------------- Task 2
 def test_snapshot_restore_kvcache_idempotent():
-    from mlx_streaming.mtp_generate import _snapshot, _restore
+    from mlx_streaming.mtp.kv_cache import _snapshot, _restore
     mx.random.seed(0)
     c = kvcache.KVCache()
     k0 = mx.random.normal((1, 2, 3, 8))
@@ -67,7 +92,7 @@ def test_snapshot_restore_kvcache_idempotent():
 
 def test_snapshot_restore_empty_kvcache():
     """空 KVCache 也要能快照/恢复,真实 MTP cache 首步就是空的。"""
-    from mlx_streaming.mtp_generate import _snapshot, _restore
+    from mlx_streaming.mtp.kv_cache import _snapshot, _restore
 
     c = kvcache.KVCache()
     snap = _snapshot([c])
@@ -80,7 +105,7 @@ def test_snapshot_restore_empty_kvcache():
 
 
 def test_snapshot_restore_arrayscache_idempotent():
-    from mlx_streaming.mtp_generate import _snapshot, _restore
+    from mlx_streaming.mtp.kv_cache import _snapshot, _restore
     c = kvcache.ArraysCache(size=2)
     c.cache = [mx.ones((1, 3, 4)), mx.ones((1, 5))]
     snap = _snapshot([c])
@@ -91,17 +116,17 @@ def test_snapshot_restore_arrayscache_idempotent():
 
 # ---------------------------------------------------------------- Task 3
 def test_accept_prefix_partial():
-    from mlx_streaming.mtp_generate import accept_prefix
+    from mlx_streaming.mtp.generate import accept_prefix
     assert accept_prefix([11, 22, 33], [11, 22, 99]) == 2
 
 
 def test_accept_prefix_first_miss():
-    from mlx_streaming.mtp_generate import accept_prefix
+    from mlx_streaming.mtp.generate import accept_prefix
     assert accept_prefix([11, 22, 33], [99, 22, 33]) == 0
 
 
 def test_accept_prefix_all_match():
-    from mlx_streaming.mtp_generate import accept_prefix
+    from mlx_streaming.mtp.generate import accept_prefix
     assert accept_prefix([11, 22, 33], [11, 22, 33]) == 3
 
 
@@ -188,7 +213,7 @@ class _SelfDraft:
         self.embed_tokens = model.model.embed_tokens
 
     def draft(self, H_last, x_ids, mtp_cache, K):
-        from mlx_streaming.mtp_generate import forward_with_hidden
+        from mlx_streaming.mtp.generate import forward_with_hidden
         # 用独立 cache 喂当前 token,取 argmax 作为单草稿(K 限定为 1)
         logits, _ = forward_with_hidden(self.model, x_ids, self.model.make_cache())
         return [int(mx.argmax(logits[:, -1, :]))]
@@ -212,7 +237,7 @@ class _RandDraft:
 
 
 def _naive_greedy(model, prompt, n):
-    from mlx_streaming.mtp_generate import forward_with_hidden
+    from mlx_streaming.mtp.generate import forward_with_hidden
     cache = model.make_cache()
     ids, out = prompt, []
     for _ in range(n):
@@ -225,7 +250,7 @@ def _naive_greedy(model, prompt, n):
 
 
 def test_mtp_generate_greedy_equiv_kv():
-    from mlx_streaming.mtp_generate import mtp_generate
+    from mlx_streaming.mtp.generate import mtp_generate
     mx.random.seed(0)
     model = _ToyModel(nl=2)            # 全 KVCache(无线性层)
     model.make_cache = lambda: [kvcache.KVCache() for _ in model.layers]
@@ -238,7 +263,7 @@ def test_mtp_generate_greedy_equiv_kv():
 
 
 def test_mtp_generate_greedy_equiv_arrayscache():
-    from mlx_streaming.mtp_generate import mtp_generate
+    from mlx_streaming.mtp.generate import mtp_generate
     mx.random.seed(1)
     model = _ToyModel(nl=2)
     model.model.layers[0] = _RecurLayer(32)   # 第 0 层换递归(ArraysCache)
@@ -251,7 +276,7 @@ def test_mtp_generate_greedy_equiv_arrayscache():
 
 def test_mtp_generate_greedy_equiv_kv_k3():
     """K=3 多草稿并行验证 + 部分命中路径,等价性与草稿质量无关。"""
-    from mlx_streaming.mtp_generate import mtp_generate
+    from mlx_streaming.mtp.generate import mtp_generate
     mx.random.seed(0)
     model = _ToyModel(nl=2, vocab=40)
     model.make_cache = lambda: [kvcache.KVCache() for _ in model.layers]
@@ -264,7 +289,7 @@ def test_mtp_generate_greedy_equiv_kv_k3():
 
 def test_mtp_generate_greedy_equiv_arrayscache_k3():
     """K=3 + 含 ArraysCache 递归层,验证多 token 重放下递归状态回滚正确。"""
-    from mlx_streaming.mtp_generate import mtp_generate
+    from mlx_streaming.mtp.generate import mtp_generate
     mx.random.seed(3)
     model = _ToyModel(nl=3, vocab=40)
     model.model.layers[1] = _RecurLayer(32)
@@ -277,7 +302,7 @@ def test_mtp_generate_greedy_equiv_arrayscache_k3():
 
 def test_mtp_generate_arrayscache_default_uses_safe_replay(monkeypatch):
     """正确版:block-align exact 默认不直接提交递归 cache,而是重放 unsafe tail。"""
-    from mlx_streaming.mtp_generate import mtp_generate
+    from mlx_streaming.mtp.generate import mtp_generate
 
     monkeypatch.delenv("MTP_VERIFY_MODE", raising=False)
     monkeypatch.delenv("MTP_ARRAY_COMMIT", raising=False)
@@ -297,7 +322,7 @@ def test_mtp_generate_arrayscache_default_uses_safe_replay(monkeypatch):
 
 def test_mtp_generate_arrayscache_step_verify_direct_commit_exact(monkeypatch):
     """第二步:verify 逐 token 走解码路径时,可 exact 地 direct commit。"""
-    from mlx_streaming.mtp_generate import mtp_generate
+    from mlx_streaming.mtp.generate import mtp_generate
 
     monkeypatch.setenv("MTP_VERIFY_MODE", "step")
     monkeypatch.delenv("MTP_ARRAY_COMMIT", raising=False)
@@ -317,7 +342,7 @@ def test_mtp_generate_arrayscache_step_verify_direct_commit_exact(monkeypatch):
 
 def test_mtp_drafter_sync_advances_cache_with_accepted_main_hidden():
     """vLLM 语义:MTP KV cache 随已接受 token 持久前进,不能每步清空。"""
-    from mlx_streaming.mtp_generate import MTPDrafter
+    from mlx_streaming.mtp.drafter import MTPDrafter
 
     mx.random.seed(4)
     args = _tiny_args()
@@ -335,9 +360,32 @@ def test_mtp_drafter_sync_advances_cache_with_accepted_main_hidden():
     assert mtp_cache[0].offset == 2
 
 
+def test_mtp_drafter_sync_does_not_compute_logits():
+    """同步 MTP cache 只需推进状态,不能额外跑 lm_head 白算 logits。"""
+    from mlx_streaming.mtp.drafter import MTPDrafter
+
+    mx.random.seed(5)
+    args = _tiny_args()
+    mtp = Qwen3NextMTP(args)
+    mx.eval(mtp.parameters())
+
+    def fail_lm_head(_):
+        raise AssertionError("sync 不应调用 lm_head")
+
+    drafter = MTPDrafter(mtp, fail_lm_head)
+    mtp_cache = drafter.make_cache()
+
+    prev_H = mx.random.normal((1, 1, args.hidden_size))
+    replay_in = mx.array([[5, 7]])
+    rH = mx.random.normal((1, 2, args.hidden_size))
+    drafter.sync(prev_H, rH, replay_in, mtp_cache)
+
+    assert mtp_cache[0].offset == 2
+
+
 def test_commit_verified_prefix_trims_kvcache_without_replay():
     """vLLM 语义:验证 K 个 token 后,KVCache 可直接裁掉 rejected 后缀完成 commit。"""
-    from mlx_streaming.mtp_generate import commit_verified_prefix
+    from mlx_streaming.mtp.kv_cache import commit_verified_prefix
 
     c = kvcache.KVCache()
     keys = mx.random.normal((1, 2, 5, 4))
@@ -352,7 +400,7 @@ def test_commit_verified_prefix_trims_kvcache_without_replay():
 
 def test_commit_verified_prefix_uses_arrayscache_checkpoint():
     """线性注意力递归 cache 有 per-token checkpoint 时,应能直接提交 accepted prefix。"""
-    from mlx_streaming.mtp_generate import commit_verified_prefix
+    from mlx_streaming.mtp.kv_cache import commit_verified_prefix
 
     c = kvcache.ArraysCache(size=2)
     c.cache = [mx.full((1, 3, 4), 99.0), mx.full((1, 2, 2), 99.0)]

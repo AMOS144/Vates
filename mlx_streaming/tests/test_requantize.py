@@ -9,7 +9,7 @@ import os
 
 import mlx.core as mx
 
-from mlx_streaming.requantize_experts import requantize_file
+from mlx_streaming.prep.requantize_experts import requantize_file
 
 PROJ_NAMES = ["gate_proj", "up_proj", "down_proj"]
 

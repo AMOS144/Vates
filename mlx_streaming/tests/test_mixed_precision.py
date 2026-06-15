@@ -27,7 +27,7 @@ def _make_src_experts(d, n_experts=4):
 
 
 def test_requantize_mixed_writes_per_proj_bits_and_meta():
-    from mlx_streaming.requantize_experts import requantize_dir
+    from mlx_streaming.prep.requantize_experts import requantize_dir
     with tempfile.TemporaryDirectory() as root:
         src = os.path.join(root, "src")
         dst = os.path.join(root, "dst")
@@ -45,7 +45,7 @@ def test_requantize_mixed_writes_per_proj_bits_and_meta():
 
 
 def test_persistent_subglu_honors_proj_bits():
-    from mlx_streaming.streaming_moe import PersistentSubGLU
+    from mlx_streaming.core.moe.compute import PersistentSubGLU
     proj_bits = {"gate_proj": 2, "up_proj": 3, "down_proj": 3}
     sub = PersistentSubGLU(2048, 768, group_size=64, bits=2, proj_bits=proj_bits)
     sub._ensure(4)
@@ -59,9 +59,9 @@ def test_mixed_forward_close_to_true_weights():
     # 注：此处用随机高斯权重，2-bit 量化的相对误差本就较大（真实权重有结构、误差小得多，
     # 端到端困惑度才好）；本测仅用于抓「bit 接线错」这类会导致崩溃/量级错误的问题，
     # 故阈值放宽到 0.8，并固定随机种子保证可复现。
-    from mlx_streaming.requantize_experts import requantize_dir
-    from mlx_streaming.expert_store import FileExpertStore
-    from mlx_streaming.streaming_moe import PersistentSubGLU
+    from mlx_streaming.prep.requantize_experts import requantize_dir
+    from mlx_streaming.core.cache.expert_store import FileExpertStore
+    from mlx_streaming.core.moe.compute import PersistentSubGLU
     mx.random.seed(0)
     with tempfile.TemporaryDirectory() as root:
         src = os.path.join(root, "src")
@@ -90,7 +90,7 @@ def test_mixed_forward_close_to_true_weights():
 
 
 def test_boundary_scheme_maps_layers():
-    from mlx_streaming.requantize_experts import boundary_scheme
+    from mlx_streaming.prep.requantize_experts import boundary_scheme
     moe_layers = list(range(10))           # 假设 10 个 MoE 层
     mixB = {"gate_proj": 2, "up_proj": 3, "down_proj": 3}
     p2 = {"gate_proj": 2, "up_proj": 2, "down_proj": 2}
@@ -102,7 +102,7 @@ def test_boundary_scheme_maps_layers():
 
 
 def test_requantize_layered_per_layer_bits_and_meta():
-    from mlx_streaming.requantize_experts import requantize_dir_layered
+    from mlx_streaming.prep.requantize_experts import requantize_dir_layered
     with tempfile.TemporaryDirectory() as root:
         src = os.path.join(root, "src")
         dst = os.path.join(root, "dst")
@@ -141,8 +141,8 @@ def test_requantize_layered_per_layer_bits_and_meta():
 
 
 def test_patch_filebacked_layer_proj_bits():
-    from mlx_streaming.streaming_moe import patch_model_filebacked
-    from mlx_streaming.expert_store import FileExpertStore
+    from mlx_streaming.core.prefetch.patch import patch_model_filebacked
+    from mlx_streaming.core.cache.expert_store import FileExpertStore
     with tempfile.TemporaryDirectory() as root:
         _make_src_experts(root, n_experts=4)
         store = FileExpertStore(root, capacity=8)
@@ -176,8 +176,8 @@ def test_patch_filebacked_layer_proj_bits():
 def test_shared_expert_added_to_output():
     # Qwen3-Next：FileStreamingMoeBlock 须把常驻共享专家 sigmoid(gate)*shared(x) 叠加到路由输出。
     import mlx.nn as nn
-    from mlx_streaming.streaming_moe import FileStreamingMoeBlock
-    from mlx_streaming.expert_store import FileExpertStore
+    from mlx_streaming.core.moe.block import FileStreamingMoeBlock
+    from mlx_streaming.core.cache.expert_store import FileExpertStore
     mx.random.seed(0)
     with tempfile.TemporaryDirectory() as root:
         _make_src_experts(root, n_experts=4)
@@ -208,8 +208,8 @@ def test_shared_expert_added_to_output():
 
 def test_patch_filebacked_captures_shared_expert():
     import mlx.nn as nn
-    from mlx_streaming.streaming_moe import patch_model_filebacked
-    from mlx_streaming.expert_store import FileExpertStore
+    from mlx_streaming.core.prefetch.patch import patch_model_filebacked
+    from mlx_streaming.core.cache.expert_store import FileExpertStore
     with tempfile.TemporaryDirectory() as root:
         _make_src_experts(root, n_experts=4)
         store = FileExpertStore(root, capacity=8)
@@ -240,8 +240,8 @@ def test_patch_filebacked_captures_shared_expert():
 
 
 def test_patch_filebacked_passes_proj_bits():
-    from mlx_streaming.streaming_moe import FileStreamingMoeBlock
-    from mlx_streaming.expert_store import FileExpertStore
+    from mlx_streaming.core.moe.block import FileStreamingMoeBlock
+    from mlx_streaming.core.cache.expert_store import FileExpertStore
     with tempfile.TemporaryDirectory() as root:
         _make_src_experts(root, n_experts=4)
         store = FileExpertStore(root, capacity=8)
@@ -257,3 +257,54 @@ def test_patch_filebacked_passes_proj_bits():
         blk._sub._ensure(4)
         assert blk._sub._glu.gate_proj.bits == 2
         assert blk._sub._glu.down_proj.bits == 3
+
+
+def test_custom_qproj_gate_up_matches_default_path(monkeypatch):
+    from mlx_streaming.core.cache.expert_store import FileExpertStore
+    from mlx_streaming.core.moe.compute import PersistentSubGLU
+    mx.random.seed(1)
+    with tempfile.TemporaryDirectory() as root:
+        _make_src_experts(root, n_experts=4)
+        store = FileExpertStore(root, capacity=8)
+        fetched = store.fetch(0, [0, 1, 2, 3])
+        hidden, moe_inter = 2048, 768
+        x = mx.random.normal((1, 1, hidden)) * 0.1
+        local = mx.array([[[0, 1, 2, 3]]])
+        ref = PersistentSubGLU(hidden, moe_inter, group_size=64, bits=4, layer_idx=0)
+        y_ref = ref.forward(fetched, 4, x, local)
+
+        monkeypatch.setenv("CUSTOM_QPROJ", "1")
+        monkeypatch.setenv("CUSTOM_QPROJ_LAYERS", "0")
+        monkeypatch.setenv("CUSTOM_QPROJ_BITS", "4")
+        monkeypatch.setenv("CUSTOM_QPROJ_TILE", "4")
+        got = PersistentSubGLU(hidden, moe_inter, group_size=64, bits=4, layer_idx=0)
+        y_got = got.forward(fetched, 4, x, local)
+        mx.eval(y_ref, y_got)
+        rel = float(mx.mean(mx.abs(y_ref - y_got)) / (mx.mean(mx.abs(y_ref)) + 1e-9))
+        assert rel < 1e-5
+
+
+def test_custom_qproj_all_projections_matches_default_path(monkeypatch):
+    from mlx_streaming.core.cache.expert_store import FileExpertStore
+    from mlx_streaming.core.moe.compute import PersistentSubGLU
+    mx.random.seed(2)
+    with tempfile.TemporaryDirectory() as root:
+        _make_src_experts(root, n_experts=4)
+        store = FileExpertStore(root, capacity=8)
+        fetched = store.fetch(0, [0, 1, 2, 3])
+        hidden, moe_inter = 2048, 768
+        x = mx.random.normal((1, 1, hidden)) * 0.1
+        local = mx.array([[[0, 1, 2, 3]]])
+        ref = PersistentSubGLU(hidden, moe_inter, group_size=64, bits=4, layer_idx=0)
+        y_ref = ref.forward(fetched, 4, x, local)
+
+        monkeypatch.setenv("CUSTOM_QPROJ", "1")
+        monkeypatch.setenv("CUSTOM_QPROJ_LAYERS", "0")
+        monkeypatch.setenv("CUSTOM_QPROJ_BITS", "4")
+        monkeypatch.setenv("CUSTOM_QPROJ_TILE", "4")
+        monkeypatch.setenv("CUSTOM_QPROJ_TARGETS", "gate,up,down")
+        got = PersistentSubGLU(hidden, moe_inter, group_size=64, bits=4, layer_idx=0)
+        y_got = got.forward(fetched, 4, x, local)
+        mx.eval(y_ref, y_got)
+        rel = float(mx.mean(mx.abs(y_ref - y_got)) / (mx.mean(mx.abs(y_ref)) + 1e-9))
+        assert rel < 1e-5

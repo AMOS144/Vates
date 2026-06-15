@@ -80,6 +80,35 @@ margin/每层预算压到高水位以下),不再严格无损。margin=1.15 是�
 
 **推荐默认配置**:`EXPERT_DIR=…_2bit EXPERT_SLOTS=256 RESIDENT_POOL=1 K=2 MTP_VERIFY_MODE=batch MTP_ARRAY_COMMIT=1` → **21.6-24.7 tok/s**(2.3-2.4×,随盘热度/温度波动)/ 14.6GB(可接受 batch 语义);内存敏感场景用单路 64 槽 18 tok/s / 3.9GB。
 
+## 2026-06-08 复盘:MTP 红利来源的正确归因 + 两个 NO-GO
+
+### 热盘复现:24.88 tok/s / 2.91×(冷盘 14.5 是机器态,非缺陷)
+
+同机背靠背(256 槽 / K=2 / batch / array-commit,静态 profile):冷启动几轮时 baseline 仅 7.6、
+spec 14.5;盘热起来后 **baseline 8.56 → spec 24.88(2.91×)**,`avg_accept_len=1.778`(K=2 的 89%)、
+`spec_hit_rate=0.986`、`disk_load_ratio=0.15`。**复现报告的 24.7,机制完好;早期低值纯属冷盘/热漂移。**
+
+### 正确归因:MTP 的提速几乎全来自摊薄 I/O,不是摊薄计算
+
+- `probe_verify_scaling`(warm,已隔离 I/O)实测一次前向墙钟**近线性于 token 数**(verify-3 ≈ 2.6×
+  单 token,只有 ~13% 摊薄)。即 **batch 验证买到的计算红利很小**。
+- 根因(本模型特有,非"线性注意力不能用 MTP"):**A3B 激活极小** → 可共享的 dense 权重占比低;
+  **gated-delta 线性注意力是逐 token 递归**(`conv/ssm_state` 顺序更新),K 个位置的状态更新摊不到
+  一起。两者叠加 → 没有"巨大的、按 token 重复搬的固定权重"可摊 → 前向≈线性。
+- 真正的大杠杆是 **I/O 摊薄**:批量验证一次加载 K 个 token 的专家**并集**(并集次线性),baseline
+  ~42 读盘/token → spec ~11 读盘/步,`disk_load_ratio` 1.x → 0.15。verify 一次过 2–3 个 token 反而比
+  baseline 单 token 还快,纯因躲掉了大部分冷读盘。**所以 MTP 只在 I/O 受限的真实场景给红利;一旦 I/O
+  归零(如单路 100% 命中 28.5),它顶到同一堵"按 token 计算"的墙,无法再超。**
+
+### NO-GO:draft 全程 GPU argmax(消除每草稿 host 同步)
+
+`probe_draft_breakdown`(已删)隔离测得单个 draft step 仅 2.6ms(lm_head 70% / 注意力+MoE 31% /
+argmax 同步≈0),但实跑 `t_draft` 达 47ms/步 → 疑为每草稿 `int(argmax)` 的 host 同步夹在大块
+verify/快照间吃满屏障延迟。**改成"K 个 argmax 全留 GPU、末尾一次 .tolist()"后反而更慢**:A/B 同机
+draft 慢 5×(`t_draft` 0.44→2.15s)、端到端 **24.9→16.3**。原因:逐步 `int()` 同步让 MLX 把每步
+draft 的图保持极小、及时释放;攒大惰性图(argmax 当 embedding 索引)单次 eval 更贵。**保留逐步同步,
+不接入。** 教训:隔离探针在"小 kernel 夹在大屏障之间"的场景会系统性低估,只能信端到端 A/B。
+
 ---
 
 ## TL;DR(以下为更正前的历史记录,结论已被上方更新)
