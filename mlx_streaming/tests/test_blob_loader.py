@@ -1,9 +1,30 @@
 import os
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from mlx_streaming.core.cache.blob_loader import BlobExpertSource
+
+
+def test_load_experts_stacked_matches_per_expert(tmp_path):
+    # 自包含（不需外部 blob fixture）：BlobExpertSource 构造仅算段表，patch read_raw 喂合成字节，
+    # 断言批量物化 stacked[k][i] 与逐专家 _materialize 字节级一致。
+    src = BlobExpertSource(str(tmp_path), hidden=64, inter=64, group=32, bits=4,
+                           num_experts=8, nocache=False, quant_mode="mxfp4")
+    try:
+        rng = np.random.default_rng(0)
+        raws = {e: rng.integers(0, 256, size=src.stride, dtype=np.uint8).tobytes()
+                for e in (3, 5)}
+        src.read_raw = lambda layer, ids: [raws[int(e)] for e in ids]
+        stacked = src.load_experts_stacked(0, [3, 5])
+        per = {e: src._materialize(raws[e]) for e in (3, 5)}
+        for i, e in enumerate([3, 5]):
+            for k in per[e]:
+                assert stacked[k].dtype == per[e][k].dtype
+                assert mx.array_equal(stacked[k][i], per[e][k]).item()
+    finally:
+        src.close()
 
 BLOB_DIR = "/tmp/cb_2bit_blob"
 EXPERT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "models", "qwen3_next_experts_2bit_g128")

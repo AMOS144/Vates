@@ -11,6 +11,80 @@ def _loader_factory():
     return load
 
 
+def test_batch_loader_equiv_to_serial():
+    # batch_loader 路径应与逐专家串行加载得到完全相同的槽位与内容
+    calls = []
+
+    def batch(layer, ids):
+        calls.append(list(ids))                       # 记录一次批量调用收到哪些 miss
+        return {int(e): {"weight": mx.full((4, 3), float(e))} for e in ids}
+
+    pool = ResidentExpertPool(capacity=8, loader=_loader_factory(), batch_loader=batch)
+    arrs, slots = pool.acquire(0, [2, 5, 5, 9])        # 唯一 miss = {2,5,9}，一次批量读
+    assert calls == [[2, 5, 9]]                        # 三个 miss 收成一批，仅一次调用
+    assert pool.misses == 3 and pool.hits == 0         # uniq 去重后重复的 5 不单独计 hit（与串行一致）
+    assert mx.array_equal(arrs["weight"][slots[0]], mx.full((4, 3), 2.0)).item()
+    assert mx.array_equal(arrs["weight"][slots[1]], mx.full((4, 3), 5.0)).item()
+    assert slots[1] == slots[2]                        # 重复专家共享同一槽
+    assert mx.array_equal(arrs["weight"][slots[3]], mx.full((4, 3), 9.0)).item()
+    # 第二次全命中，不再批量读
+    pool.acquire(0, [2, 5, 9])
+    assert calls == [[2, 5, 9]]
+
+
+def test_write_slots_batch_writes_all_in_one_scatter():
+    # 新增批量写:一次 stacked scatter 把多个专家写进各自槽位，内容正确、旧槽不动。
+    pool = ResidentExpertPool(capacity=8, loader=_loader_factory())
+    pool.acquire(0, [0])                                # 建池，槽 0 = 专家 0
+    s7, _ = pool._alloc_slot(0, 7, {0, 7, 8})
+    s8, _ = pool._alloc_slot(0, 8, {0, 7, 8})
+    pool._write_slots_batch(0, [s7, s8],
+                            [{"weight": mx.full((4, 3), 7.0)},
+                             {"weight": mx.full((4, 3), 8.0)}])
+    assert mx.array_equal(pool._pools[0]["weight"][s7], mx.full((4, 3), 7.0)).item()
+    assert mx.array_equal(pool._pools[0]["weight"][s8], mx.full((4, 3), 8.0)).item()
+    assert mx.array_equal(pool._pools[0]["weight"][0], mx.full((4, 3), 0.0)).item()
+
+
+def test_acquire_batches_miss_writes():
+    # demand 多 miss 走批量写：不再逐槽 _write_slot，每 key 仅一次 scatter。
+    pool = ResidentExpertPool(capacity=8, loader=_loader_factory())
+    calls = {"n": 0}
+    orig = pool._write_slot
+
+    def counted(layer, slot, expert):
+        calls["n"] += 1
+        return orig(layer, slot, expert)
+
+    pool._write_slot = counted
+    arrs, slots = pool.acquire(0, [2, 5, 9])           # 3 miss
+    assert calls["n"] == 0                              # 批量路径不调用逐槽 _write_slot
+    assert mx.array_equal(arrs["weight"][slots[0]], mx.full((4, 3), 2.0)).item()
+    assert mx.array_equal(arrs["weight"][slots[1]], mx.full((4, 3), 5.0)).item()
+    assert mx.array_equal(arrs["weight"][slots[2]], mx.full((4, 3), 9.0)).item()
+
+
+def test_stacked_batch_loader_equiv_to_serial():
+    # stacked_batch_loader 返回 {k:(N,*)}（批量读+批量物化），写池结果与逐专家等价。
+    calls = []
+
+    def stacked(layer, ids):
+        calls.append(list(ids))
+        return {"weight": mx.stack([mx.full((4, 3), float(e)) for e in ids], axis=0)}
+
+    pool = ResidentExpertPool(capacity=8, loader=_loader_factory(),
+                              stacked_batch_loader=stacked)
+    arrs, slots = pool.acquire(0, [2, 5, 5, 9])        # 唯一 miss = {2,5,9}
+    assert calls == [[2, 5, 9]]                        # 三个 miss 收成一批，一次调用
+    assert pool.misses == 3 and pool.hits == 0
+    assert mx.array_equal(arrs["weight"][slots[0]], mx.full((4, 3), 2.0)).item()
+    assert mx.array_equal(arrs["weight"][slots[1]], mx.full((4, 3), 5.0)).item()
+    assert slots[1] == slots[2]
+    assert mx.array_equal(arrs["weight"][slots[3]], mx.full((4, 3), 9.0)).item()
+    pool.acquire(0, [2, 5, 9])                          # 全命中，不再批量读
+    assert calls == [[2, 5, 9]]
+
+
 def test_acquire_miss_then_hit_slots_stable():
     pool = ResidentExpertPool(capacity=4, loader=_loader_factory())
     arrs1, slots1 = pool.acquire(0, [2, 5])      # 2 miss
@@ -153,6 +227,47 @@ def test_lfu_policy_keeps_frequent_expert_over_lru_oldest(monkeypatch):
     m0 = pool.misses
     pool.acquire(0, [0])
     assert pool.misses == m0
+
+
+def test_lfu_decay_off_by_default(monkeypatch):
+    # 默认 LFU_DECAY_INTERVAL=0 → 频率持续累加,绝不减半
+    monkeypatch.setenv("EVICT_POLICY", "lfu")
+    monkeypatch.delenv("LFU_DECAY_INTERVAL", raising=False)
+    pool = ResidentExpertPool(capacity=4, loader=_loader_factory())
+    assert pool.lfu_decay_interval == 0
+    for _ in range(20):
+        pool.acquire(0, [0])
+    assert pool._freq[0][0] == 20
+
+
+def test_lfu_decay_when_interval_positive(monkeypatch):
+    # 显式开启 interval=4 时,第 4 次访问触发减半 4→2
+    monkeypatch.setenv("EVICT_POLICY", "lfu")
+    monkeypatch.setenv("LFU_DECAY_INTERVAL", "4")
+    pool = ResidentExpertPool(capacity=4, loader=_loader_factory())
+    for _ in range(4):
+        pool.acquire(0, [0])
+    assert pool._freq[0][0] == 2
+
+
+def test_acquire_gpu_counts_frequency_for_lfu(monkeypatch):
+    # 全命中 GPU 快路径也要计频(否则 LFU 在稳态 decode 失效)
+    monkeypatch.setenv("EVICT_POLICY", "lfu")
+    monkeypatch.delenv("LFU_DECAY_INTERVAL", raising=False)
+    pool = ResidentExpertPool(capacity=4, loader=_loader_factory())
+    pool.acquire(0, [2, 5])                       # 驻留 2,5,freq 各 1
+    for _ in range(3):                            # 3 次全命中快路径
+        pool.acquire_gpu(0, mx.array([[[2, 5]]]), num_experts=8)
+    assert pool._freq[0][2] == 4 and pool._freq[0][5] == 4
+
+
+def test_acquire_gpu_no_freq_when_lru(monkeypatch):
+    # LRU 默认路径不应触碰 _freq(零开销、行为不变)
+    monkeypatch.setenv("EVICT_POLICY", "lru")
+    pool = ResidentExpertPool(capacity=4, loader=_loader_factory())
+    pool.acquire(0, [2, 5])
+    pool.acquire_gpu(0, mx.array([[[2, 5]]]), num_experts=8)
+    assert sum(pool._freq.get(0, {}).values()) == 0
 
 
 def test_layer_cap_caps_at_global_capacity():

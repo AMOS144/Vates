@@ -1,8 +1,11 @@
 """全流式 blob 专家源：并行 pread + F_NOCACHE + 即时物化为 MLX 量化数组。
 
-blob 格式见 prep/repack_expert_blobs.py：每专家一个连续 864KB blob（16KB 页对齐），
-段序 gate[w,s,b]+up[w,s,b]+down[w,s,b]。weight 为 uint32，scales/biases 存 uint16
-原始位、用时 .view(bfloat16)。计算复用 MLX quantized_matmul（不碰已 NO-GO 的 fused kernel）。
+字节布局由 prep/blob_layout.py 统一描述（单一真相源），支持两种格式：
+- v1 affine（expert_blob_v1）：每 proj 段序 [weight, scales, biases]；weight uint32，
+  scales/biases 存 uint16 原始位、用时 .view(bfloat16)。
+- v2 mxfp4（expert_blob_v2_mxfp4）：每 proj 段序 [weight, scales]（无 biases）；
+  weight uint32，scales 为 uint8 原始位、绝不 view(bf16)。
+计算复用 MLX quantized_matmul / gather_qmm（不碰已 NO-GO 的 fused kernel）。
 """
 import os
 import threading
@@ -20,11 +23,16 @@ _F_NOCACHE = 48
 
 class BlobExpertSource:
     def __init__(self, blob_dir: str, hidden: int, inter: int, group: int, bits: int,
-                 num_experts: int, workers: int = 8, nocache: bool = True):
+                 num_experts: int, workers: int = 8, nocache: bool = True,
+                 quant_mode: str = "affine", blob_format: "str | None" = None):
         self.dir = blob_dir
         self.h, self.i, self.g, self.b, self.ne = hidden, inter, group, bits, num_experts
         self.workers = workers
         self.nocache = nocache
+        # blob 格式：mxfp4 默认 v2（无 biases、scales uint8），其余默认 v1 affine。
+        self.quant_mode = quant_mode
+        self.blob_format = blob_format or (
+            "expert_blob_v2_mxfp4" if quant_mode == "mxfp4" else "expert_blob_v1")
         self._segs, self.stride = self._layout()
         self._fds: "dict[int, int]" = {}
         # 后台预取：只预读原始字节进 _pf_cache（不建 mx.array，可后台线程跑）；
@@ -39,15 +47,9 @@ class BlobExpertSource:
         self.prefetch_hits = 0
 
     def _layout(self):
-        segs = []
-        for proj, out_dim, in_dim in (
-            ("gate_proj", self.i, self.h), ("up_proj", self.i, self.h), ("down_proj", self.h, self.i)):
-            words = in_dim * self.b // 32
-            groups = in_dim // self.g
-            segs.append((proj, "weight", np.uint32, (out_dim, words), out_dim * words * 4))
-            segs.append((proj, "scales", np.uint16, (out_dim, groups), out_dim * groups * 2))
-            segs.append((proj, "biases", np.uint16, (out_dim, groups), out_dim * groups * 2))
-        return segs, sum(s[4] for s in segs)
+        # 段表统一由 blob_layout.layout_for 给出（dtype 为字符串 "uint32"/"uint16"/"uint8"）。
+        from mlx_streaming.prep.blob_layout import layout_for
+        return layout_for(self.blob_format, self.h, self.i, self.b, self.g)
 
     def _fd(self, layer: int) -> int:
         fd = self._fds.get(layer)
@@ -65,12 +67,15 @@ class BlobExpertSource:
     def _materialize(self, raw: bytes, view_bf16: bool = True) -> dict:
         # view_bf16=False：scales/biases 保留 uint16（.view(bfloat16) 在后台线程会报
         # no Stream(gpu,0)，故后台物化时关掉，由主线程消费时再 view）。
+        # 段表 dtype 为字符串：仅 v1 affine 的 uint16 scales/biases 是 bf16 位重解释；
+        # mxfp4 的 uint8 scales 保持原样，绝不 view(bf16)。
         out = {}
         off = 0
         for proj, tensor, dt, shape, nb in self._segs:
-            view = np.frombuffer(raw, dtype=dt, count=nb // np.dtype(dt).itemsize, offset=off).reshape(shape)
+            np_dt = np.dtype(dt)
+            view = np.frombuffer(raw, dtype=np_dt, count=nb // np_dt.itemsize, offset=off).reshape(shape)
             arr = mx.array(view)
-            if view_bf16 and tensor in ("scales", "biases"):
+            if view_bf16 and dt == "uint16" and tensor in ("scales", "biases"):
                 arr = arr.view(mx.bfloat16)
             out[f"{proj}.{tensor}"] = arr
             off += nb
@@ -155,6 +160,29 @@ class BlobExpertSource:
         raws = self.read_raw(layer, ids)
         return {e: self._materialize(raw, view_bf16=view_bf16) for e, raw in zip(ids, raws)}
 
+    def load_experts_stacked(self, layer: int, expert_ids, view_bf16: bool = True) -> dict:
+        """批量物化：每段只建一个 (N,*shape) mx.array（np.stack 后单次构造），
+        取代逐专家 6N 次 frombuffer+mx.array。返回 {proj.tensor: (N,*shape)}，按 ids 顺序。
+
+        与 load_experts 同源（同段表、同 view_bf16 语义），只是把"逐专家逐段"折成
+        "逐段一次堆叠"——demand 多 miss 消费的碎 mx.array 构造从 6N 降到 6。
+        """
+        ids = [int(e) for e in expert_ids]
+        raws = self.read_raw(layer, ids)
+        out = {}
+        off = 0
+        for proj, tensor, dt, shape, nb in self._segs:
+            np_dt = np.dtype(dt)
+            cnt = nb // np_dt.itemsize
+            views = [np.frombuffer(raw, dtype=np_dt, count=cnt, offset=off).reshape(shape)
+                     for raw in raws]
+            arr = mx.array(np.stack(views, axis=0))      # (N, *shape) 单次构造
+            if view_bf16 and dt == "uint16" and tensor in ("scales", "biases"):
+                arr = arr.view(mx.bfloat16)
+            out[f"{proj}.{tensor}"] = arr
+            off += nb
+        return out
+
     def load_experts_native(self, layer: int, expert_ids, view_bf16: bool = False) -> dict:
         """native 物化：用 C++ blob_load 把字节 pread 进 MLX 数组（eval 时在 C++ 跑、绕 GIL），
         Python 侧只建惰性切片/view 图（无数据拷贝）。目的是把"拷贝"挪出 GIL，减少后台线程
@@ -171,12 +199,16 @@ class BlobExpertSource:
             off = 0
             for proj, tensor, dt, shape, nb in self._segs:
                 seg = row[off:off + nb]
-                if tensor == "weight":
+                # 按段 dtype 重解释：weight→uint32；v1 affine 的 uint16 scales/biases
+                # 可再 view(bf16)；mxfp4 的 uint8 scales 保持 uint8。
+                if dt == "uint32":
                     arr = seg.view(mx.uint32).reshape(shape)
-                else:
+                elif dt == "uint16":
                     arr = seg.view(mx.uint16).reshape(shape)
                     if view_bf16:
                         arr = arr.view(mx.bfloat16)
+                else:  # uint8（mxfp4 scales）
+                    arr = seg.reshape(shape)
                 d[f"{proj}.{tensor}"] = arr
                 off += nb
             out[e] = d

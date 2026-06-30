@@ -5,12 +5,11 @@ from mlx_streaming.core.prefetch.cross_layer import enable_cross_layer_prefetch
 
 
 def patch_model_filebacked(model, store, hidden, moe_inter, group_size, bits,
-                           rotated: bool = False, proj_bits: dict | None = None,
+                           proj_bits: dict | None = None,
                            layer_proj_bits: dict | None = None):
     """把每个 MoE 块替换为 FileStreamingMoeBlock，并丢弃常驻的堆叠 switch_mlp。
 
     store：FileExpertStore（所有 MoE 层共用，按 (layer,expert) 缓存）。
-    rotated：是否用 Hadamard 旋转前向（专家权重须为 rotate_requantize 产出的旋转版）。
     proj_bits：非空时走混合精度（逐 proj 不同 bit），专家须为对应混合重量化产出。
     layer_proj_bits：{绝对层号: {proj:bits}}，非空时逐层用各自 proj_bits（优先于 proj_bits），
         对应 requantize_dir_layered 产出。各层 QSL 用该层 bit，与流式存盘文件一一对应。
@@ -19,7 +18,9 @@ def patch_model_filebacked(model, store, hidden, moe_inter, group_size, bits,
     patched = 0
     for i, layer in enumerate(model.layers):
         layer._layer_idx = i
-        layer._prefetch_model_ref = model
+        # 用 object.__setattr__ 存反向 model 引用,避免进 nn.Module(=dict)的子模块树:
+        # 否则 model→layer→model 成环,wired_limit 等 tree_reduce 遍历会无限递归(RecursionError)。
+        object.__setattr__(layer, "_prefetch_model_ref", model)
         mlp = getattr(layer, "mlp", None)
         if mlp is not None and hasattr(mlp, "switch_mlp") and hasattr(mlp, "gate"):
             pb = layer_proj_bits.get(i, proj_bits) if layer_proj_bits else proj_bits
@@ -27,11 +28,12 @@ def patch_model_filebacked(model, store, hidden, moe_inter, group_size, bits,
             layer.mlp = FileStreamingMoeBlock(
                 gate=mlp.gate, top_k=mlp.top_k, norm_topk_prob=mlp.norm_topk_prob,
                 store=store, layer_idx=i, hidden=hidden, moe_inter=moe_inter,
-                group_size=group_size, bits=bits, rotated=rotated, proj_bits=pb,
+                group_size=group_size, bits=bits, proj_bits=pb,
                 shared_expert=getattr(mlp, "shared_expert", None),
                 shared_expert_gate=getattr(mlp, "shared_expert_gate", None),
             )
-            layer.mlp._prefetch_model_ref = model  # 供 native-fused-prefetch 取下层 gate
+            # 同理:不进 dict,避免 mlp→model→...→mlp 成环。供 native-fused-prefetch 取下层 gate。
+            object.__setattr__(layer.mlp, "_prefetch_model_ref", model)
             patched += 1
     if config.cross_layer_prefetch() or getattr(store, "_staging", None) is not None:
         enable_cross_layer_prefetch()

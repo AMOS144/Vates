@@ -5,11 +5,11 @@
   只在实际激活的少数专家上 gather 计算。
 - `PersistentSubGLU`：跨调用复用一套 SwitchGLU + 3×QuantizedSwitchLinear 对象，
   解码 batch=1 时唯一专家数恒为 top_k，只首次构造、之后原地 update 权重，省重建开销。
-- `RotatedSubGLU`：在 gate/up 前与 down 前插入 Hadamard 旋转，配合旋转权重数学等价。
 """
 from typing import Tuple
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx_lm.models.switch_layers import SwitchLinear, QuantizedSwitchLinear, SwitchGLU
 
 from mlx_streaming import config
@@ -103,7 +103,8 @@ class PersistentSubGLU:
     """
 
     def __init__(self, hidden: int, moe_inter: int, group_size: int, bits: int,
-                 proj_bits: dict | None = None, layer_idx: int | None = None):
+                 proj_bits: dict | None = None, layer_idx: int | None = None,
+                 quant_mode: str = "affine", swiglu_limit: float = 0.0):
         self.hidden = hidden
         self.moe_inter = moe_inter
         self.group_size = group_size
@@ -112,6 +113,9 @@ class PersistentSubGLU:
         # 混合精度：每个 proj 用各自 bit；None 时三 proj 统一用 bits。
         self.proj_bits = proj_bits or {
             "gate_proj": bits, "up_proj": bits, "down_proj": bits}
+        # quant_mode：量化模式（affine / mxfp4）；swiglu_limit>0 时走 DeepSeek 手动 clip 路径。
+        self.quant_mode = quant_mode
+        self.swiglu_limit = swiglu_limit
         self._glu = None
         self._n = None
 
@@ -122,13 +126,13 @@ class PersistentSubGLU:
         glu = SwitchGLU(self.hidden, self.moe_inter, n)
         glu.gate_proj = QuantizedSwitchLinear(
             self.hidden, self.moe_inter, n, bias=False,
-            group_size=self.group_size, bits=pb["gate_proj"], mode="affine")
+            group_size=self.group_size, bits=pb["gate_proj"], mode=self.quant_mode)
         glu.up_proj = QuantizedSwitchLinear(
             self.hidden, self.moe_inter, n, bias=False,
-            group_size=self.group_size, bits=pb["up_proj"], mode="affine")
+            group_size=self.group_size, bits=pb["up_proj"], mode=self.quant_mode)
         glu.down_proj = QuantizedSwitchLinear(
             self.moe_inter, self.hidden, n, bias=False,
-            group_size=self.group_size, bits=pb["down_proj"], mode="affine")
+            group_size=self.group_size, bits=pb["down_proj"], mode=self.quant_mode)
         self._glu = glu
         self._n = n
 
@@ -137,6 +141,17 @@ class PersistentSubGLU:
         _update_qsl(self._glu.gate_proj, "gate_proj", fetched)
         _update_qsl(self._glu.up_proj, "up_proj", fetched)
         _update_qsl(self._glu.down_proj, "down_proj", fetched)
+        if self.swiglu_limit > 0:
+            # DeepSeek 路径：手动 gate/up/clip/silu/down，不能用 SwiGLU 融合激活
+            # （镜像 deepseek_v4.Experts：up 双侧 clip、gate 上侧 minimum）。
+            x_exp = mx.expand_dims(x, (-2, -3))            # (..., 1, 1, D)
+            gate = self._glu.gate_proj(x_exp, local)
+            up = self._glu.up_proj(x_exp, local)
+            up = mx.clip(up, -self.swiglu_limit, self.swiglu_limit)
+            gate = mx.minimum(gate, self.swiglu_limit)
+            h = nn.silu(gate) * up
+            y = self._glu.down_proj(h, local)
+            return y.squeeze(-2)
         max_fused_seq = config.custom_fused_moe_max_seq()
         if (x.shape[1] <= max_fused_seq
                 and _custom_fused_moe_enabled(self.layer_idx or -1, self.proj_bits)):
@@ -191,38 +206,3 @@ class PersistentSubGLU:
             return y.reshape(shape + (self.hidden,))
         y = self._glu.down_proj(a, local)
         return y.squeeze(-2)
-
-
-class RotatedSubGLU(PersistentSubGLU):
-    """旋转版 PersistentSubGLU：复用对象缓存/原地 update，但前向在 gate/up 前旋转输入、
-    在 down 前旋转中间激活。配合 rotate_requantize_experts 产出的旋转权重，数学等价 W·x。
-    """
-
-    def forward(self, fetched: dict, n: int, x: mx.array, local: mx.array) -> mx.array:
-        self._ensure(n)
-        _update_qsl(self._glu.gate_proj, "gate_proj", fetched)
-        _update_qsl(self._glu.up_proj, "up_proj", fetched)
-        _update_qsl(self._glu.down_proj, "down_proj", fetched)
-        return self._rotated_call(self._glu, x, local)
-
-    def _rotated_call(self, glu, x, indices):
-        # 镜像 mlx_lm SwitchGLU.__call__，仅在两处插入 Hadamard（沿特征维，与 token 维排序正交）
-        hs = self.hidden ** -0.5
-        ms = self.moe_inter ** -0.5
-        x = mx.hadamard_transform(x, scale=hs)        # 输入旋转（gate/up 共用）
-        x = mx.expand_dims(x, (-2, -3))
-        do_sort = indices.size >= 64
-        idx = indices
-        inv_order = None
-        if do_sort:
-            from mlx_lm.models.switch_layers import _gather_sort
-            x, idx, inv_order = _gather_sort(x, indices)
-        x_up = glu.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = glu.gate_proj(x, idx, sorted_indices=do_sort)
-        a = glu.activation(x_up, x_gate)              # 融合激活（原 SwitchGLU 约定）
-        a = mx.hadamard_transform(a, scale=ms)        # 中间激活旋转（down 前）
-        x = glu.down_proj(a, idx, sorted_indices=do_sort)
-        if do_sort:
-            from mlx_lm.models.switch_layers import _scatter_unsort
-            x = _scatter_unsort(x, inv_order, indices.shape)
-        return x.squeeze(-2)

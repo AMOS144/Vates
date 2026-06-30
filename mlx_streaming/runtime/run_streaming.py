@@ -11,10 +11,12 @@
 import os
 import time
 import json
+import statistics
 
 import mlx.core as mx
 from mlx_lm import load, generate
 
+from mlx_streaming import config
 from mlx_streaming.core.mem import snapshot, reset_peak, clear_cache
 from mlx_streaming.core.cache.expert_store import FileExpertStore
 from mlx_streaming.prep.split_experts import split_model
@@ -26,6 +28,10 @@ EXPERT_DIR = os.environ.get("EXPERT_DIR", "/tmp/mlx_qwen3_experts")
 EXPERT_SLOTS = int(os.environ.get("EXPERT_SLOTS", "8"))   # 每层槽数
 PROMPT = os.environ.get("PROMPT", "用三句话解释什么是混合专家模型。")
 MAXTOK = int(os.environ.get("MAXTOK", "128"))
+# 稳态测速:warmup 跑满 MAXTOK(把整段会路由到的专家都装进常驻池 + 编译 Metal kernel),
+# 再重复 REPEAT 次取中位数,避免冷启动/补池污染绝对 tok/s。WARMUP_TOK=0 关 warmup。
+WARMUP_TOK = int(os.environ.get("WARMUP_TOK", str(MAXTOK)))
+REPEAT = int(os.environ.get("REPEAT", "3"))
 WIRED_GB = os.environ.get("WIRED_GB")
 CACHE_GB = os.environ.get("CACHE_GB")
 CLEAR_ON_EVICT = os.environ.get("CLEAR_ON_EVICT", "0") == "1"
@@ -34,8 +40,6 @@ CAL_TOK = int(os.environ.get("CAL_TOK", "32"))       # 校准生成 token 数
 # 专家量化格式覆盖：当 EXPERT_DIR 指向重量化目录(2/3-bit)时，文件后端 QSL 要用对应 bit/group
 EXPERT_BITS = os.environ.get("EXPERT_BITS")
 EXPERT_GROUP = os.environ.get("EXPERT_GROUP")
-EXPERT_ROT = os.environ.get("EXPERT_ROT", "0") == "1"   # 专家为 Hadamard 旋转重量化版时置 1
-
 
 def _first_moe_dims(model):
     for layer in model.layers:
@@ -96,25 +100,44 @@ def main():
     store = FileExpertStore(EXPERT_DIR, capacity=EXPERT_SLOTS, layer_caps=layer_caps,
                             clear_on_evict=CLEAR_ON_EVICT, record=PIN_HOT > 0)
     n = patch_model_filebacked(model, store, dims["hidden"], dims["moe_inter"],
-                               dims["group_size"], dims["bits"], rotated=EXPERT_ROT,
+                               dims["group_size"], dims["bits"],
                                proj_bits=proj_bits, layer_proj_bits=layer_proj_bits)
     t1 = time.perf_counter()
     after_patch = snapshot()
+
+    # 分块 prefill:把 mlx_lm.generate 内部 prefill 步长压到 config.prefill_chunk()(默认 2),
+    # 整段 prefill 的激活峰值 ∝prompt 长度 → ∝chunk,使 prefill 与 decode 同稳态。
+    # PREFILL_CHUNK=0 时不传,回退 mlx_lm 默认 2048。
+    _ps = config.prefill_chunk()
+    _gen_kw = {"prefill_step_size": _ps} if _ps > 0 else {}
 
     # 3.5 ③ 热专家常驻：先校准跑一遍统计激活频率，钉住每层最热的 PIN_HOT 个专家
     cal_s = 0.0
     if PIN_HOT > 0:
         tc = time.perf_counter()
-        generate(model, tok, prompt=PROMPT, max_tokens=CAL_TOK, verbose=False)
+        generate(model, tok, prompt=PROMPT, max_tokens=CAL_TOK, verbose=False, **_gen_kw)
         for li in store.recorded_layers():
             store.pin(li, store.hot(li, PIN_HOT))
         store.record = False
         store.reset_stats()
         cal_s = round(time.perf_counter() - tc, 2)
 
-    # 4. 生成
+    # 3.6 warmup:跑满 MAXTOK 把整段专家装进常驻池并编译 Metal kernel(PIN_HOT 已校准时
+    # 这里仍补满全长,确保第一次正式测量即稳态)。
+    if WARMUP_TOK > 0:
+        generate(model, tok, prompt=PROMPT, max_tokens=WARMUP_TOK, verbose=False, **_gen_kw)
+
+    # 4. 生成:重复 REPEAT 次取中位数;最后一次清零专家统计供命中率口径对应稳态。
     reset_peak()
-    text = generate(model, tok, prompt=PROMPT, max_tokens=MAXTOK, verbose=False)
+    text = None
+    gen_runs = []
+    for r in range(REPEAT):
+        if r == REPEAT - 1:
+            store.reset_stats()
+        tg = time.perf_counter()
+        text = generate(model, tok, prompt=PROMPT, max_tokens=MAXTOK, verbose=False, **_gen_kw)
+        gen_runs.append(round(MAXTOK / (time.perf_counter() - tg), 2))
+    tok_per_s = statistics.median(gen_runs)
     t2 = time.perf_counter()
     clear_cache()
     after_gen = snapshot()
@@ -128,11 +151,14 @@ def main():
         "wired_gb": WIRED_GB, "cache_gb": CACHE_GB,
         "clear_on_evict": CLEAR_ON_EVICT,
         "pin_hot": PIN_HOT, "cal_s": cal_s,
+        "warmup_tok": WARMUP_TOK, "repeat": REPEAT,
         "patched_moe_layers": n,
         "resident_experts": store.resident_count(),
         "pinned_experts": store.pinned_count(),
-        "load_patch_s": round(t1 - t0, 2), "gen_s": round(t2 - t1, 2),
-        "tok_per_s": round(MAXTOK / (t2 - t1), 2),
+        "load_patch_s": round(t1 - t0, 2),
+        "tok_per_s": tok_per_s,
+        "tok_per_s_runs": gen_runs,
+        "tok_per_s_minmax": [min(gen_runs), max(gen_runs)],
         "rss_gb_after_patch": round(after_patch.rss_bytes / 1e9, 2),
         "rss_gb_after_gen": round(after_gen.rss_bytes / 1e9, 2),
         "mlx_active_gb_after_gen": round(after_gen.mlx_active_bytes / 1e9, 2),

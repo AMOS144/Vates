@@ -19,8 +19,17 @@ from mlx_streaming.mtp.kv_cache import (
     _snapshot, _restore, commit_verified_prefix, commit_verified_snapshot)
 
 
-def forward_with_hidden(model, ids, cache):
-    """跑主模型层循环 + 最终 norm,返回 (logits(1,L,V), H(1,L,hidden))。H 为 norm 后。"""
+def forward_with_hidden(model, ids, cache, compute_logits: bool = True):
+    """跑主模型层循环 + 最终 norm,返回 (logits(1,L,V), hidden(1,L,H))。
+
+    logits 恒由 final-norm 后的 H 经 lm_head 得到(保证与贪婪一致)。
+    返回给 MTP drafter 的 hidden:**默认用 final-norm 之前的 h**——这与 MTP 训练/验证
+    (`capture_prenorm_hidden`)消费的输入一致;喂 norm 后的 hidden 会双重归一化、显著压低
+    草稿接受率(不影响正确性,因 verify 走主模型)。`MTP_HIDDEN=post_norm` 可切回旧行为对照。
+
+    compute_logits=False:跳过 lm_head(2048×151936 的大投影),只更新 cache 并返回 hidden。
+    供分块 prefill 的中间块用(中间块不需要 logits,只需 cache 因果累积)。
+    """
     inner = model.model
     h = inner.embed_tokens(ids)
     layers = inner.layers
@@ -34,7 +43,31 @@ def forward_with_hidden(model, ids, cache):
         mask = ssm_mask if layer.is_linear else fa_mask
         h = layer(h, mask=mask, cache=c)
     H = inner.norm(h)
-    return model.lm_head(H), H
+    hidden = H if config.mtp_hidden() == "post_norm" else h
+    logits = model.lm_head(H) if compute_logits else None
+    return logits, hidden
+
+
+def prefill_chunked(model, ids, cache, chunk: "int | None" = None):
+    """分块 prefill:把 ids 按 chunk 切片逐块喂入,增量更新 cache,返回最后一块的 (logits, hidden)。
+
+    整段 prefill 一次前向的激活峰值 ∝ prompt 长度(每 MoE 层瞬时物化大量唯一专家 + 长序列激活)。
+    分块后每块只算 chunk 个 token,逐块 eval 释放上一块瞬时图,峰值压回 ∝chunk,与 decode 同稳态。
+
+    数值等价:全注意力层逐块因果累积与整段完全等价;线性层(gated-delta)分块在 chunk 边界处有
+    重结合的末位浮点差异(与 decode 本身逐 token 同源,可忽略)。中间块跳过 lm_head 省大投影。
+    chunk<=0 或 prompt 不超过一块时,退化为整段 prefill。
+    """
+    if chunk is None:
+        chunk = config.prefill_chunk()
+    L = ids.shape[1]
+    if chunk <= 0 or L <= chunk:
+        return forward_with_hidden(model, ids, cache)
+    last_start = ((L - 1) // chunk) * chunk
+    for s in range(0, last_start, chunk):
+        _, h = forward_with_hidden(model, ids[:, s:s + chunk], cache, compute_logits=False)
+        mx.eval(h)                      # 物化本块、写 cache、释放上一块瞬时图
+    return forward_with_hidden(model, ids[:, last_start:], cache)
 
 
 def forward_with_hidden_stepwise(model, ids, cache, capture_snapshots: bool = False):
@@ -89,8 +122,8 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     mtp_cache = drafter.make_cache() if hasattr(drafter, "make_cache") else None
     ids = prompt if ids_mode else mx.array([tok.encode(prompt)])
 
-    # prefill:得到第 1 个 pending token x 与其 hidden
-    logits, H = forward_with_hidden(model, ids, main_cache)
+    # prefill(分块):得到第 1 个 pending token x 与其 hidden;分块把激活峰值压到与 decode 同稳态。
+    logits, H = prefill_chunked(model, ids, main_cache)
     x = int(mx.argmax(logits[:, -1, :]))
     H_last = H[:, -1:, :]
     produced = [x]
@@ -139,20 +172,18 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
 
         accepted_len = min(matched + 1, K)
 
-        has_recurrent_cache = any(not c.is_trimmable() for c in main_cache)
         if verify_snaps is not None:
             # step 模式：逐 token 解码路径产生的快照可精确 direct commit。
             committed = commit_verified_snapshot(main_cache, verify_snaps,
                                                  accepted_len, verified_len=K)
-        elif has_recurrent_cache:
-            # 递归状态 cache（Qwen3-Next gated-delta 的 conv/ssm）一律回滚重放，保证与非投机
-            # 贪婪逐位等价。原因：batch verify 捕获的 per-token checkpoint 走手写
-            # _gated_delta_step_ops，与 baseline 的 kernel 化 gated_delta_update 不逐 bit 等价，
-            # 直接提交会产生不忠实输出（实测 MAXTOK=96 时 37/96 token 偏离贪婪）；且其更低的接受率
-            # 反让端到端更慢（实测 13.6 vs 重放 14.5 tok/s）——既不正确也不更快，故不再提供该捷径。
-            committed = False
         else:
-            # 可裁剪 cache（KVCache）：trim 掉 rejected 后缀即精确，直接提交省一次重放。
+            # batch 模式：一次并行验证后按接受长度直接提交，零 replay。
+            # - 可裁剪 cache（KVCache）：trim 掉 rejected 后缀即精确。
+            # - 递归状态 cache（Qwen3-Next gated-delta 的 conv/ssm）：verify 前向里用
+            #   multistate kernel 捕获的 per-token checkpoint 与 baseline kernel 逐 bit 等价
+            #   （见 mtp/kv_cache.py 与 tests/test_gated_delta_multistate.py），可精确直提交。
+            # commit_verified_prefix 一次处理混合 cache：KV 走 trim、Arrays 走 checkpoint 直提交。
+            # 若任一递归 cache 缺 checkpoint（异常情况）则返回 False，自动回退到下方 replay。
             committed = commit_verified_prefix(main_cache, verified_len=K,
                                                accepted_len=accepted_len)
         if snap_d is not None:

@@ -54,9 +54,10 @@ def stack_mtp_experts(weights: dict, num_experts: int) -> dict:
 
 SHARD = "model-00041-of-00041.safetensors"
 REPO = "Qwen/Qwen3-Next-80B-A3B-Instruct"
-SHARD_DIR = os.environ.get("MTP_SHARD_DIR", "/tmp/qn_mtp_shard")
-OUT_PATH = os.environ.get("MTP_OUT", "/tmp/qn_mtp_weights.safetensors")
-CONFIG = os.environ.get("QN_CONFIG", "/tmp/qn_orig_config.json")
+from mlx_streaming import config as _cfg
+SHARD_DIR = os.environ.get("MTP_SHARD_DIR", "/tmp/qn_mtp_shard")  # 临时分片，可留 /tmp
+OUT_PATH = _cfg.mtp_out()        # 默认 models/qn_mtp_weights.safetensors（持久）
+CONFIG = _cfg.qn_config()        # 默认 models/qwen3_next_80b_4bit/config.json
 
 _DL_URL = (
     f"https://www.modelscope.cn/api/v1/models/{REPO}/repo"

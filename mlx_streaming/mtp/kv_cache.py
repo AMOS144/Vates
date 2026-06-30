@@ -24,8 +24,10 @@ def enable_qwen3next_speculative_checkpoints():
     if _QWEN3NEXT_CHECKPOINTS_PATCHED:
         return
 
-    from mlx_lm.models.gated_delta import compute_g, _gated_delta_step_ops
     from mlx_lm.models.qwen3_next import Qwen3NextGatedDeltaNet
+    from mlx_streaming.core.linear_attn.gated_delta_multistate import (
+        gated_delta_update_multistate,
+    )
 
     orig_call = Qwen3NextGatedDeltaNet.__call__
 
@@ -77,38 +79,21 @@ def enable_qwen3next_speculative_checkpoints():
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-        beta = mx.sigmoid(b)
-        g = compute_g(self.A_log, a, self.dt_bias)
-        if state is None:
-            Hk, Dk = q.shape[2:]
-            Hv, Dv = v.shape[2:]
-            state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
-        if (repeat_factor := v.shape[2] // q.shape[2]) > 1:
-            q_step = mx.repeat(q, repeat_factor, -2)
-            k_step = mx.repeat(k, repeat_factor, -2)
-        else:
-            q_step, k_step = q, k
-
-        ys, ssm_checkpoints = [], []
-        for i in range(S):
-            y_i, state = _gated_delta_step_ops(
-                q_step[:, i],
-                k_step[:, i],
-                v[:, i],
-                g[:, i],
-                beta[:, i],
-                state,
-                None if mask is None else mask[:, i],
-            )
-            ys.append(y_i)
-            ssm_checkpoints.append(mx.array(state))
-        out = mx.stack(ys, axis=1)
+        # 关键：用 multistate kernel 一次前向算出每个 token 处理后的 ssm 递归态。
+        # 它与 baseline 解码走的上游 gated_delta_kernel 是同一份 kernel、同序、fp32，
+        # 因此 states_out[:, i] 与「逐 token 单步解码」逐 bit 等价（见
+        # tests/test_gated_delta_multistate.py）——这是验证后能直接提交、零 replay 的根基。
+        # 注意：kernel 路径内部处理 GQA（hk_idx 映射），不在 Python 侧 repeat q/k，
+        # 与 baseline kernel 路径对齐（旧 ops 路径的 repeat 会引入数值差异）。
+        out, state, states_out = gated_delta_update_multistate(
+            q, k, v, a, b, self.A_log, self.dt_bias, state, mask
+        )
 
         if cache is not None:
             cache[1] = state
             cache.advance(S)
             cache._spec_checkpoints = [
-                [conv_checkpoints[i], ssm_checkpoints[i]]
+                [conv_checkpoints[i], states_out[:, i]]
                 for i in range(S)
             ]
             cache._capture_spec_checkpoints = False

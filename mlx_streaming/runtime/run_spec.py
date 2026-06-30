@@ -25,7 +25,6 @@ EXPERT_DIR = os.environ.get("EXPERT_DIR", "/tmp/mlx_qwen3_experts_2bit")
 EXPERT_BITS = int(os.environ.get("EXPERT_BITS", "2"))
 EXPERT_GROUP = int(os.environ.get("EXPERT_GROUP", "64"))
 EXPERT_SLOTS = int(os.environ.get("EXPERT_SLOTS", "64"))
-EXPERT_ROT = os.environ.get("EXPERT_ROT", "0") == "1"   # 专家为 Hadamard 旋转重量化版时置 1
 DRAFT = os.environ.get("DRAFT", "/tmp/qwen3_0.6b_4bit")
 NDRAFTS = [int(x) for x in os.environ.get("NDRAFTS", "2,3,4").split(",")]
 MAXTOK = int(os.environ.get("MAXTOK", "128"))
@@ -57,7 +56,7 @@ def _build_target():
             layer_proj_bits = {int(k): v for k, v in ed["per_layer_proj_bits"].items()}
     store = FileExpertStore(EXPERT_DIR, capacity=EXPERT_SLOTS)
     patch_model_filebacked(model, store, dims["hidden"], dims["moe_inter"],
-                           group, bits, rotated=EXPERT_ROT, proj_bits=proj_bits,
+                           group, bits, proj_bits=proj_bits,
                            layer_proj_bits=layer_proj_bits)
     return model, tok, store, {"bits": bits, "group": group, "proj_bits": proj_bits,
                                "layered": layer_proj_bits is not None}

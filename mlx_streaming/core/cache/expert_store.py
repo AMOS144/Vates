@@ -9,15 +9,77 @@
 stacked[layer] = {"weight": (E,O,I) [, "scales", "biases"]}（惰性，未 eval）。
 fetch(layer, expert_ids) 只取这几个专家、堆叠成 (k, ...) 返回。
 """
+import json
 import os
+import struct
 from collections import OrderedDict, Counter
 from typing import Dict, List
 
 import mlx.core as mx
+import numpy as np
 
 from mlx_streaming import config
 from mlx_streaming.core.mem import clear_cache
 from mlx_streaming.core.cache.resident_pool import ResidentExpertPool, _POOL_INIT_SLOTS  # noqa: F401
+
+# macOS fcntl：F_NOCACHE 提示内核不要把读过的页留在 page cache。
+_F_NOCACHE = 48
+# safetensors dtype -> (numpy 读入类型, 需 view 的 mlx 类型)。BF16 numpy 无原生类型,
+# 先读 uint16 原始位再 .view(bfloat16)。其余类型按需补。
+_ST_DTYPE = {
+    "U32": (np.uint32, None),
+    "U16": (np.uint16, None),
+    "I32": (np.int32, None),
+    "F32": (np.float32, None),
+    "F16": (np.float16, None),
+    "BF16": (np.uint16, mx.bfloat16),
+}
+
+
+def _pread_all(fd: int, size: int) -> bytes:
+    """把整文件读出(os.pread 可能短读,循环补齐)。"""
+    chunks = []
+    off = 0
+    while off < size:
+        b = os.pread(fd, size - off, off)
+        if not b:
+            break
+        chunks.append(b)
+        off += len(b)
+    return b"".join(chunks)
+
+
+def load_safetensors_nocache(path: str) -> "Dict[str, mx.array]":
+    """用 F_NOCACHE 读 safetensors,返回与 mx.load 等价的 {name: mx.array}。
+
+    绕过 OS page cache:每次都真实读 NVMe,基准结果可复现(不被页缓存冷热污染)。
+    与 mx.load 的数值/dtype 完全一致(U32 权重、BF16 scales/biases)。
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        try:
+            import fcntl
+            fcntl.fcntl(fd, _F_NOCACHE, 1)
+        except (OSError, ValueError, ImportError):
+            pass
+        size = os.fstat(fd).st_size
+        data = _pread_all(fd, size)
+    finally:
+        os.close(fd)
+    n = struct.unpack("<Q", data[:8])[0]
+    header = json.loads(data[8:8 + n])
+    base = 8 + n
+    out: "Dict[str, mx.array]" = {}
+    for name, info in header.items():
+        if name == "__metadata__":
+            continue
+        np_dt, view_dt = _ST_DTYPE[info["dtype"]]
+        s, e = info["data_offsets"]
+        arr = mx.array(np.frombuffer(data[base + s:base + e], dtype=np_dt).reshape(info["shape"]))
+        if view_dt is not None:
+            arr = arr.view(view_dt)
+        out[name] = arr
+    return out
 
 
 class _PerLayerLru:
@@ -175,8 +237,25 @@ class FileExpertStore:
         self.bundle_loads = 0
         # 连续常驻池后端（acquire 路径用），与 LRU stack 路径共享 _load_one
         # layer_caps：每层独立池容量(profile 驱动的无损省内存)，缺省层用全局 capacity
-        self._resident = ResidentExpertPool(capacity, loader=self._load_one_resident,
-                                            layer_caps=layer_caps)
+        # demand miss 批量加载接线(三选一,acquire 优先 stacked > batch > 逐专家):
+        # - native(默认,且非 async_prefetch):C++ blob_load 直进 MLX 数组、绕 GIL、惰性,返回
+        #   逐专家 {e:{k}} → 走 _place_experts。native 不消费 async prefetch buffer,故 gate 在
+        #   not async_prefetch(async 路径改用 _batch_load_resident,它会先吃 buffer)。
+        # - batch_miss_read(默认):numpy 批量堆叠,每段一次 mx.array(取代逐专家 6N 次构造)。
+        # - 都关:逐专家 loader。
+        if config.native_demand_loader() and not config.async_prefetch():
+            _batch_loader = self._batch_load_native
+            _stacked_loader = None
+        elif config.batch_miss_read():
+            _batch_loader = self._batch_load_resident
+            _stacked_loader = (self._batch_load_stacked
+                               if not config.async_prefetch() else None)
+        else:
+            _batch_loader = None
+            _stacked_loader = None
+        self._resident = ResidentExpertPool(
+            capacity, loader=self._load_one_resident, layer_caps=layer_caps,
+            batch_loader=_batch_loader, stacked_batch_loader=_stacked_loader)
         # 激活频率统计（校准阶段用）
         self.record = record
         self._counts: "Dict[int, Counter]" = {}
@@ -186,6 +265,8 @@ class FileExpertStore:
         self.prefetch_buffer_hits = 0
         self.prefetch_submitted = 0
         self.prefetch_dropped = 0
+        # dual-source：decode 走 staging 双源命中计数（不写池的零拷贝命中）
+        self.staging_hits = 0
         # 可选 blob miss-loader（STREAM_BLOB_LOADER=1，由 model_builder 注入）：
         # miss 时用每专家连续 blob 的并行 pread 取代 per-expert safetensors 的 mx.load，
         # 复用常驻池 GPU-remap 快路径（命中零编排），小 EXPERT_SLOTS 即低内存。
@@ -256,7 +337,12 @@ class FileExpertStore:
             bundle = self._load_layer_bundle(layer)
             keys = self._bundle_key_cache.get(layer, {}).get(int(e), [])
             return {short: bundle[full] for short, full in keys}
-        w = mx.load(self.path(layer, e))
+        # 默认走 F_NOCACHE 读取(绕过 OS page cache):基准每次真实读盘、可复现。
+        # mx.load 用 mmap 会经页缓存,重复跑被缓存命中污染→速度飘。EXPERT_NOCACHE=0 切回 mmap。
+        if config.expert_nocache():
+            w = load_safetensors_nocache(self.path(layer, e))
+        else:
+            w = mx.load(self.path(layer, e))
         # 默认惰性:不在此 eval,让读盘并入 MLX 异步图、与计算重叠,token 末统一 eval。
         # 旧版每专家强制 mx.eval(w) 会每 token 触发 ~42 次同步、打碎流水线(实测 ~2.4× 慢)。
         # 数值完全等价(惰性求值仍精确)。EAGER_EXPERT_LOAD=1 可恢复旧的逐专家强制物化。
@@ -277,6 +363,58 @@ class FileExpertStore:
                 self._resident.misses = max(0, self._resident.misses - 1)
                 return cached
         return self._raw_load_one(layer, e)
+
+    def _batch_load_resident(self, layer: int, ids: List[int]) -> Dict[int, Dict[str, mx.array]]:
+        """批量 resident demand loader：先消费 async prefetch buffer，剩余 miss 一次并行读。
+
+        关键：blob 路径用一次 load_experts(layer, rest)（8-worker 并行 pread），取代逐专家
+        串行 pread（实测串行 6.4GB/s → 并行 8 路 22GB/s）。结果与逐专家加载等价。
+        """
+        ids = [int(e) for e in ids]
+        out: "Dict[int, Dict[str, mx.array]]" = {}
+        rest: List[int] = []
+        for e in ids:
+            if self.async_prefetch:
+                cached = self._prefetch_buffer.pop((int(layer), e), None)
+                if cached is not None:
+                    self.prefetch_buffer_hits += 1
+                    self._resident.misses = max(0, self._resident.misses - 1)
+                    out[e] = cached
+                    continue
+            rest.append(e)
+        if rest:
+            if self._blob_loader is not None:
+                out.update(self._blob_loader.load_experts(int(layer), rest))
+            else:
+                for e in rest:
+                    out[e] = self._raw_load_one(layer, e)
+        return out
+
+    def _batch_load_stacked(self, layer: int, ids: List[int]) -> Dict[str, mx.array]:
+        """批量+预堆叠 demand loader：blob 路径一次 load_experts_stacked（并行 pread + 每段一次
+        物化），返回 {k:(N,*shape)} 按 ids 顺序。无 blob loader 时退化为逐专家物化后堆叠。
+
+        仅在 async_prefetch 关闭时接入（不消费 prefetch buffer），保证不漏 buffer 命中。
+        """
+        ids = [int(e) for e in ids]
+        if self._blob_loader is not None:
+            return self._blob_loader.load_experts_stacked(int(layer), ids)
+        per = {e: self._raw_load_one(layer, e) for e in ids}
+        keys = list(per[ids[0]].keys())
+        return {k: mx.stack([per[e][k] for e in ids], axis=0) for k in keys}
+
+    def _batch_load_native(self, layer: int, ids: List[int]) -> "Dict[int, Dict[str, mx.array]]":
+        """批量 native demand loader:blob 路径用 C++ blob_load 把整批字节 pread 直进 MLX 数组
+        (eval 时在 C++ 跑、绕 GIL、惰性),返回逐专家 {e:{proj.tensor:arr}}(供 _place_experts)。
+
+        相比 numpy 路径(frombuffer+stack+mx.array 同步拷贝),把字节物化从 acquire 挪到 token 末
+        eval、并绕开 GIL。无 blob loader 时退回逐专家 raw 物化(行为等价)。view_bf16=True 以
+        兼容 affine 量化(uint16 scales/biases→bf16);mxfp4 的 uint8 scales 忽略此参数。
+        """
+        ids = [int(e) for e in ids]
+        if self._blob_loader is not None:
+            return self._blob_loader.load_experts_native(int(layer), ids, view_bf16=True)
+        return {e: self._raw_load_one(layer, e) for e in ids}
 
     def note(self, layer: int, expert_ids: List[int]) -> None:
         """记录一次激活（校准阶段调用），用于挑热专家。"""
@@ -364,6 +502,20 @@ class FileExpertStore:
         """测试/诊断用：等待当前所有 async prefetch 完成。"""
         return
 
+    def release_fetch_cache(self) -> int:
+        """释放 fetch/stack 路径（prefill 用）的常驻缓存，返回释放的专家数。
+
+        decode 单 token 走 acquire_gpu/_resident 池，永不再碰 _lru/_stack_cache；
+        prefill 结束后这套缓存（每层 ≤cap 个专家 + 堆叠张量）是纯死重，约占
+        cap×MoE层数 个专家的内存（实测 cap=16 时 ~9.2GB）。在 prefill→decode
+        边界调用一次即可把这块预算还给系统/池。MTP 多 token 会按需重新填充。
+        """
+        freed = self._lru.resident_count()
+        self._lru._caches.clear()
+        self._stack_cache.clear()
+        clear_cache()
+        return freed
+
     def reset_stats(self) -> None:
         self._lru.hits = 0
         self._lru.misses = 0
@@ -377,6 +529,7 @@ class FileExpertStore:
         self.prefetch_buffer_hits = 0
         self.prefetch_submitted = 0
         self.prefetch_dropped = 0
+        self.staging_hits = 0
 
     def acquire(self, layer: int, expert_ids: List[int]):
         """连续常驻池取专家：返回 (pool_arrays, slots)。命中零拷贝，miss 单槽写。"""

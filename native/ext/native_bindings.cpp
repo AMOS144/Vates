@@ -78,9 +78,33 @@ NB_MODULE(native_moe_ext, m) {
       "gen"_a,
       "path"_a,
       "stride"_a,
+      "resident"_a,
+      "cap"_a,
+      "parallel"_a,
       nb::kw_only(),
       "stream"_a = nb::none());
   m.def("prefetch_staging_take", &prefetch_staging_take, "layer"_a);
+  m.def("staging_hprof_enable", &staging_hprof_enable, "on"_a);
+  m.def("staging_hprof_now", &staging_hprof_now);
+  m.def("staging_hprof_get", &staging_hprof_get);
+  m.def("prefetch_pool_sideregion", &prefetch_pool_sideregion,
+        "pool_list"_a, "seg_nbytes"_a, "expert_ids"_a, "layer"_a, "path"_a, "stride"_a,
+        "resident"_a, "spec_slots"_a, "base_row"_a, "gen"_a = 0, nb::kw_only(),
+        "stream"_a = nb::none());
+  m.def("sideregion_contents", &sideregion_contents, "layer"_a, "gen"_a = 0);
+  m.def("sideregion_reset", &sideregion_reset);
+  m.def("materialize_spike", &materialize_spike, "src"_a, "fillval"_a, nb::kw_only(),
+        "stream"_a = nb::none());
+  m.def("bg_reader_start", &bg_reader_start, "workers"_a = 1, "low_cap"_a = 0);
+  m.def("bg_reader_submit", &bg_reader_submit,
+        "dst"_a, "experts"_a, "rows"_a, "path"_a, "stride"_a, "ticket"_a, "prio"_a = 0);
+  m.def("bg_reader_ready", &bg_reader_ready, "ticket"_a);
+  m.def("bg_reader_wait", &bg_reader_wait, "ticket"_a,
+        nb::call_guard<nb::gil_scoped_release>());   // 阻塞等时释放 GIL
+  m.def("bg_reader_stop", &bg_reader_stop);
+  m.def("bg_pread_into_pool", &bg_pread_into_pool,
+        "dst"_a, "seg_off"_a, "seg_nb"_a, "slot"_a, "expert"_a,
+        "path"_a, "stride"_a, "ticket"_a, "prio"_a = 0);
   m.def(
       "fused_moe_slots",
       &fused_moe_slots,

@@ -65,8 +65,8 @@ def build_streaming_model():
                     "group_size": getattr(gp, "group_size", 64),
                     "bits": getattr(gp, "bits", 4)}
             break
-    bits, group, proj_bits, layer_proj_bits, rotated = (
-        dims["bits"], dims["group_size"], None, None, False)
+    bits, group, proj_bits, layer_proj_bits = (
+        dims["bits"], dims["group_size"], None, None)
     meta_path = os.path.join(EXPERT_DIR, "_split_meta.json")
     if os.path.exists(meta_path):
         with open(meta_path) as f:
@@ -75,29 +75,42 @@ def build_streaming_model():
         bits = ed.get("bits", bits)
         group = ed.get("group_size", group)
         proj_bits = ed.get("proj_bits")
-        # 旋转重量化产出在 meta 顶层标 rotated=True;runtime 必须走 Hadamard 旋转前向(RotatedSubGLU),
-        # 否则等于算 W'·x(未旋转输入)→ 数值错误。
-        rotated = bool(meta.get("rotated", False))
         if "per_layer_proj_bits" in ed:
             layer_proj_bits = {int(k): v for k, v in ed["per_layer_proj_bits"].items()}
     # 每层池预算 profile(pool_footprint 产出):默认从 {EXPERT_DIR}/pool_profile.json 自动启用,
     # 无损省内存(命中率/输出/吞吐不变，仅不再为低占用层预留满 capacity)。
     layer_caps = load_pool_profile(EXPERT_DIR)
     store = FileExpertStore(EXPERT_DIR, capacity=EXPERT_SLOTS, layer_caps=layer_caps)
+    if config.zerocopy_dual_source():
+        # 零拷贝双源双缓冲：常驻池换成侧区模式（预分配 cap+2*spec_slots 行、禁 grow），复用原池 loader/cap/profile。
+        from mlx_streaming.core.cache.resident_pool import ResidentExpertPool
+        _old = store._resident
+        store._resident = ResidentExpertPool(
+            _old.capacity, loader=_old.loader, layer_caps=_old.layer_caps,
+            spec_slots=config.pool_spec_slots(),
+            spec_gens=max(2, int(os.environ.get("SPEC_GENS", "2"))))
     if config.stream_blob_loader():
         # blob 接入常驻池 miss-loader：复用 GPU-remap 快路径，小 EXPERT_SLOTS 即低内存。
         store._blob_loader = _make_blob_source(dims, group, bits)
     # 主动预取（native-fused-prefetch miss→hit）：opt-in（NATIVE_FUSED_PREFETCH=1）。
-    # 实测干净交错对比 = 比 demand 慢 ~25%（每层 gate 前向+prefetch+promote 开销 > 命中收益），
-    # 且命中只影响速度不影响质量、还多占 staging 内存 → 默认关，不作默认路径。
+    # 经"promote 只写真实路由命中专家"修正后已是净正：易缓存基座上 +15.5% tok/s
+    # （demand 11.86→13.70，hit 0.731→0.851，读盘 −45%；见 active-prefetch-turnaround-2026-06-17.md）。
+    # 默认关只因收益依赖场景（基座可缓存性/是否磁盘受限）且只影响速度不影响质量、多占少量 staging 内存，
+    # 故作 opt-in 而非默认路径，落地配方见上述报告 §6。
     if config.native_fused_prefetch() and getattr(store, "_blob_loader", None) is not None:
         try:
             import mlx_streaming.native_moe_ext  # noqa: F401  确认扩展已编译
             from mlx_streaming.core.prefetch.native_staging import NativeStagingManager
-            store._staging = NativeStagingManager(
-                store._blob_loader, budget=config.stream_blob_bg_budget(default=8))
+            _budget = (config.pool_spec_slots() if config.zerocopy_dual_source()
+                       else config.stream_blob_bg_budget(default=16))
+            store._staging = NativeStagingManager(store._blob_loader, budget=_budget)
         except Exception:
             store._staging = None   # 扩展不可用 → 关闭，不影响主路径
+    # 零拷贝双源不变量：staging 侧区行数必须等于池 spec_slots，否则 C++ 会越界写池（静默损坏）。
+    if config.zerocopy_dual_source() and getattr(store, "_staging", None) is not None:
+        assert store._staging.budget == store._resident.spec_slots, (
+            f"零拷贝双源要求 staging.budget({store._staging.budget}) "
+            f"== 池 spec_slots({store._resident.spec_slots})")
     if config.stream_blob_bg():
         # 后台预取池预填：bg 在独立 stream 物化预测专家，promote 写进池槽（需 CROSS_LAYER_PREFETCH=1）。
         from mlx_streaming.core.prefetch.bg_prefetch import BackgroundExpertPrefetcher
@@ -106,10 +119,41 @@ def build_streaming_model():
         store._bg = BackgroundExpertPrefetcher(
             src, window=config.stream_blob_window())
     patch_model_filebacked(model, store, dims["hidden"], dims["moe_inter"],
-                           group, bits, rotated=rotated, proj_bits=proj_bits,
+                           group, bits, proj_bits=proj_bits,
                            layer_proj_bits=layer_proj_bits)
+    # 双源双缓冲：构造一个共享 VirtualPool（gen 跨层全局、每前向 +1）挂到每个流式 MoE 块。
+    if config.zerocopy_dual_source() and getattr(store, "_staging", None) is not None:
+        from mlx_streaming.core.cache.virtual_pool import VirtualPool
+        from mlx_streaming.core.moe.block import FileStreamingMoeBlock
+        _vpool = VirtualPool(store._resident, store._staging, config.pool_spec_slots())
+        for layer in model.layers:
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, FileStreamingMoeBlock):
+                mlp._vpool = _vpool
+    # 主动预取（非 zerocopy）：挂 per-layer ahead 调度器 vpool（cutoff），让晚层预读更早发起。
+    if (config.native_fused_prefetch() and not config.zerocopy_dual_source()
+            and getattr(store, "_staging", None) is not None):
+        from mlx_streaming.core.cache.virtual_pool import VirtualPool
+        from mlx_streaming.core.moe.block import FileStreamingMoeBlock
+        _sched = VirtualPool(num_layers=len(model.layers),
+                             cutoff=config.cross_layer_cutoff(),
+                             ahead_lo=config.cross_layer_ahead_lo(),
+                             ahead_hi=config.cross_layer_ahead_hi())
+        for layer in model.layers:
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, FileStreamingMoeBlock):
+                mlp._vpool = _sched
     if config.stream_blob():
         _attach_blob_source(model, dims, group, bits)
+    # KV 量化(IsoQuant K4/V3 + SO(4) 旋转):仅作用于 12 个全注意力层,128k KV 3.0→~0.68 GiB。
+    if config.kv_quant():
+        from mlx_streaming.core.cache.kv_quant_patch import patch_kv_quant
+        patch_kv_quant(model,
+                       group_size=config.kv_group_size(),
+                       k_bits=config.kv_k_bits(),
+                       v_bits=config.kv_v_bits(),
+                       rotate=config.kv_rotate(),
+                       seed=config.kv_rot_seed())
     return model, tok, store
 
 

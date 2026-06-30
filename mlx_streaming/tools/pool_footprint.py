@@ -18,8 +18,9 @@ from mlx_streaming.model_builder import build_streaming_model
 from mlx_lm.models.qwen3_next import ModelArgs
 
 MB_PER_EXPERT = 0.9375
-QN_CONFIG = os.environ.get("QN_CONFIG", "/tmp/qn_orig_config.json")
-MTP_OUT = os.environ.get("MTP_OUT", "/tmp/qn_mtp_weights.safetensors")
+from mlx_streaming import config as _cfg
+QN_CONFIG = _cfg.qn_config()
+MTP_OUT = _cfg.mtp_out()
 PROMPT = os.environ.get("PROMPT", "用三句话解释什么是混合专家模型。")
 MAXTOK = int(os.environ.get("MAXTOK", "96"))
 K = int(os.environ.get("K", "2"))

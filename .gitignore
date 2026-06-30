@@ -19,3 +19,13 @@ native/bench/metal_fused_moe_bench
 native/bench/native_moe_runner
 # 由 `make -C native/ext native_moe_ext` 生成的 MLX 扩展(.so 不入库,需现场编译)
 mlx_streaming/native_moe_ext*.so
+# 模型权重软链与 GPU trace 等大体积产物不入库
+/models
+*.gputrace/
+# 一次性下载/构建暂存脚本与日志(不入库)
+/dl_*.sh
+/dl_*.log
+/build_4bit.sh
+/build_4bit.log
+/extract_mtp.log
+/dl_model.py

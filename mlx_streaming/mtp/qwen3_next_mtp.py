@@ -66,10 +66,13 @@ def mtp_advance(mtp, hidden, token, cache):
     return mtp.norm(x)
 
 
-def load_mtp(args: ModelArgs, weights_path: str, quantize: bool = True) -> Qwen3NextMTP:
+def load_mtp(args: ModelArgs, weights_path: str, quantize: bool = True,
+             bits: int = 4) -> Qwen3NextMTP:
     """加载抽取好的 MTP 权重(已 stack 专家、已 norm +1.0)到模块。
 
-    quantize=True 时按主模型约定做 4-bit 量化(gate/shared_expert_gate 用 8-bit)。
+    quantize=True 时按主模型约定量化:线性层用 `bits`-bit(默认 4),gate/shared_expert_gate
+    恒用 8-bit。quantize=False 保持 bf16 全精度——草稿质量最高、接受率最高,但显存更大。
+    提高 bits(4→8)或 quantize=False 是直接抬升 MTP 草稿接受率的杠杆。
     """
     model = Qwen3NextMTP(args)
     raw = mx.load(weights_path)
@@ -87,6 +90,6 @@ def load_mtp(args: ModelArgs, weights_path: str, quantize: bool = True) -> Qwen3
             if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
                 return {"group_size": 64, "bits": 8}
             return True
-        nn.quantize(model, group_size=64, bits=4, class_predicate=pred)
+        nn.quantize(model, group_size=64, bits=bits, class_predicate=pred)
     mx.eval(model.parameters())
     return model
