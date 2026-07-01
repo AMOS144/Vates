@@ -138,13 +138,16 @@ def predict_use_x() -> bool: return _b("PREDICT_USE_X", "1")  # 默认用本层 
 def predict_agg() -> str: return _s("PREDICT_AGG", "max")  # K+1 token 聚合：max|mean|union
 def predict_union_k() -> int: return _i("PREDICT_UNION_K", 8)  # union 时每 token 取的 top-k（控候选数）
 def native_fused_prefetch() -> bool: return _b("NATIVE_FUSED_PREFETCH", "0")
-# 池侧区零拷贝双源(双缓冲)：opt-in、默认 off。VirtualPool 收口，消掉 promote 拷贝。
-# 实测(80B,cap=32,见 bench_dual_source)：小 spec(=3) 确定正确、省内存(6.6→4.6GB)、更快(+32%)，
-# 但命中反降(0.763→0.709,因 promote 关、侧区不积累热专家)；放大 spec(=32) 命中仅 0.768、内存反涨，
-# 且触发 C++ 并发预取竞态→输出 run-to-run 不确定。故「侧区当二级缓存拿 cap=64 命中@cap=32 内存」不成立，
-# 要容量仍应加持久槽位(EXPERT_SLOTS)，勿放大 POOL_SPEC_SLOTS。
+# 池侧区零拷贝双源(单/双缓冲)：opt-in、默认 off。VirtualPool 收口，消掉 promote 拷贝。
+# 侧区有两种淘汰策略(SIDEREGION_LFU 门控):
+#   - 旧"∉P 全清"(默认):侧区=一次性预取批,不积累→hit 仅 0.709(反低于基线 0.763)。
+#   - 新"持久 LFU"(SIDEREGION_LFU=1,单代 spec_gens=1):跨步累积热专家,只读新增。
+# 实测(80B,cap=32,warmup64,见 report sideregion-lfu-2026-07-01):
+#   LFU spec=8 → hit 0.73 / active 4.76GB(省内存)；LFU spec=32 → hit 0.81 / 6.9GB(提命中,+8% tok/s)。
+#   命中在 ~0.81 饱和(加 warmup 无效),0.85+ 仍需真加常驻槽(cap=64→0.869)。
+#   注:dual on 各 spec 均有 run-to-run token 漂移(良性时序噪声,字节校验 0 BAD),故默认 off。
 def zerocopy_dual_source() -> bool: return _b("ZEROCOPY_DUAL_SOURCE")
-def pool_spec_slots() -> int: return _i("POOL_SPEC_SLOTS", 3)          # 每层侧区投机槽数(勿 >budget/放大触发竞态)
+def pool_spec_slots() -> int: return _i("POOL_SPEC_SLOTS", 3)          # 每层侧区投机槽数(LFU 推荐 8 省内存 / 32 提命中)
 def sideregion_lfu() -> bool: return _b("SIDEREGION_LFU")              # 侧区持久 LFU 二级缓存(默认 off);见 spec 2026-07-01
 def native_no_submit() -> bool: return _b("NATIVE_NO_SUBMIT", "0")
 def native_no_promote() -> bool: return _b("NATIVE_NO_PROMOTE", "0")
