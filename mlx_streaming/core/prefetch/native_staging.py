@@ -196,6 +196,11 @@ class NativeStagingManager:
         flat = _N.sideregion_contents(int(layer), int(gen))
         return {int(flat[i]): int(flat[i + 1]) for i in range(0, len(flat), 2)}
 
+    def sideregion_kv(self, layer, gen=0):
+        """读该层某代侧区为 (keys uint32, vals int32) 两个 device mx.array（C++ 直接建，供快路径合并）。"""
+        import mlx_streaming.native_moe_ext as _N
+        return _N.sideregion_kv(int(layer), int(gen))
+
     def sideregion_reset(self):
         """清空 C++ 侧区缓存（换 prompt/重置统计时调用）。"""
         import mlx_streaming.native_moe_ext as _N
@@ -232,3 +237,7 @@ class _StagingSide:
 
     def contents(self, layer):
         return self._stg.sideregion_contents(layer, self._gen)
+
+    def kv(self, layer):
+        # C++ 直接吐 (keys uint32, vals int32) device 数组，供 acquire_gpu_dual 快路径零 host 胶水合并。
+        return self._stg.sideregion_kv(layer, self._gen)

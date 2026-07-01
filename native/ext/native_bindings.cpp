@@ -92,6 +92,7 @@ NB_MODULE(native_moe_ext, m) {
         "resident"_a, "spec_slots"_a, "base_row"_a, "gen"_a = 0, nb::kw_only(),
         "stream"_a = nb::none());
   m.def("sideregion_contents", &sideregion_contents, "layer"_a, "gen"_a = 0);
+  m.def("sideregion_kv", &sideregion_kv, "layer"_a, "gen"_a = 0);
   m.def("sideregion_reset", &sideregion_reset);
   m.def("materialize_spike", &materialize_spike, "src"_a, "fillval"_a, nb::kw_only(),
         "stream"_a = nb::none());

@@ -608,6 +608,28 @@ std::vector<int> sideregion_contents(int layer, int gen) {
   return out;
 }
 
+// 侧区 e2r → 两个 device mx.array (keys uint32, vals int32),直接在 C++ 从 map 建连续 buffer。
+// 供 acquire_gpu_dual 快路径合并:消掉 Python 侧 dict 构建 + list(...)→mx.array 的每层 host 胶水。
+std::pair<mx::array, mx::array> sideregion_kv(int layer, int gen) {
+  std::vector<uint32_t> keys;
+  std::vector<int32_t> vals;
+  {
+    std::lock_guard<std::mutex> lk(g_side_mutex);
+    auto it = g_side.find({layer, gen});
+    if (it != g_side.end()) {
+      keys.reserve(it->second.e2r.size());
+      vals.reserve(it->second.e2r.size());
+      for (auto& p : it->second.e2r) {
+        keys.push_back(static_cast<uint32_t>(p.first));
+        vals.push_back(static_cast<int32_t>(p.second));
+      }
+    }
+  }
+  int n = static_cast<int>(keys.size());
+  return {mx::array(keys.data(), mx::Shape{n}, mx::uint32),
+          mx::array(vals.data(), mx::Shape{n}, mx::int32)};
+}
+
 void sideregion_reset() {
   std::lock_guard<std::mutex> lk(g_side_mutex);
   g_side.clear();

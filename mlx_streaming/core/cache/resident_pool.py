@@ -517,34 +517,39 @@ class ResidentExpertPool:
     def acquire_gpu_dual(self, layer, inds, num_experts, side):
         """侧区零拷贝双源 decode 取数：真实区表叠加 C++ 侧区条目 → 单次 gather。
 
-        side.contents(layer) -> {expert: 物理侧区行}（纯锁读，无 GPU 同步）。
+        side.kv(layer) -> (keys uint32, vals int32) 两个 device mx.array（C++ 直接从 e2r map 建，
+        避免 Python 侧每层 dict 构建 + list(...)→mx.array 的 host 胶水；快路径零 per-expert host work）。
         """
         base = self._ensure_table(layer, num_experts)   # 真实区表（int32 [E]）
-        sc = side.contents(layer)
-        eff = mx.array(base) if sc else base             # 无侧区条目时直接用 base，省掉每层一次 256-int 拷贝
-        if sc:
-            eff[mx.array(list(sc.keys()), dtype=mx.uint32)] = mx.array(list(sc.values()), dtype=base.dtype)
+        keys, vals = side.kv(layer)
+        has_side = int(keys.size) > 0                    # .size 只读 shape，无 GPU 同步
+        eff = mx.array(base) if has_side else base       # 无侧区条目时直接用 base，省掉每层一次 256-int 拷贝
+        if has_side:
+            eff[keys] = vals                             # vals 为 int32，与 base.dtype 一致
         local = mx.take(eff, inds)
         n_miss = int(mx.sum((local < 0).astype(mx.int32)))   # 唯一同步（与 demand 同）
         if n_miss == 0:
-            if _DUAL_VERIFY and sc:
+            if _DUAL_VERIFY and has_side:
+                sc = {int(k): int(v) for k, v in zip(keys.tolist(), vals.tolist())}
                 self._verify_side_bytes(layer, inds, sc)
             self.gpu_fastpath += 1
             self.hits += int(inds.size)
             if self.eviction_policy == "lfu":
                 self._note_access(layer, [int(i) for i in inds.reshape(-1).tolist()])
             return self._pools[layer], local
-        # 真 miss：回退真实区读盘（侧区命中的不会触发），重算 local（再叠加侧区）
+        # 真 miss：回退真实区读盘（侧区命中的不会触发），重算 local（再叠加侧区）。
+        # 慢路径本就要 .tolist()，此处一次性把侧区 keys 拉成 set 供成员判断。
         self.gpu_fallback += 1
         flat = [int(i) for i in inds.reshape(-1).tolist()]
-        self.hits += sum(1 for e in flat if e in sc)     # 侧区命中计入 hit（与快路径对称），避免 hit_rate 漏计
-        self.acquire(layer, [e for e in flat if e not in sc])   # 仅对非侧区命中的真 miss 读盘(内部已计非侧区频)
+        sk = set(int(k) for k in keys.tolist()) if has_side else set()
+        self.hits += sum(1 for e in flat if e in sk)     # 侧区命中计入 hit（与快路径对称），避免 hit_rate 漏计
+        self.acquire(layer, [e for e in flat if e not in sk])   # 仅对非侧区命中的真 miss 读盘(内部已计非侧区频)
         if self.eviction_policy == "lfu":
-            self._note_access(layer, [e for e in flat if e in sc])   # 补计侧区命中频,避免漏计
+            self._note_access(layer, [e for e in flat if e in sk])   # 补计侧区命中频,避免漏计
         base = self._slot_table[layer]
-        eff = mx.array(base) if sc else base
-        if sc:
-            eff[mx.array(list(sc.keys()), dtype=mx.uint32)] = mx.array(list(sc.values()), dtype=base.dtype)
+        eff = mx.array(base) if has_side else base
+        if has_side:
+            eff[keys] = vals
         local = mx.take(eff, inds)
         return self._pools[layer], local
 

@@ -78,6 +78,25 @@ def test_lfu_evicts_min_freq(monkeypatch):
     assert set(m.keys()) == {5, 7}          # 保留高频 5,淘汰低频 6
 
 
+def test_sideregion_kv_matches_contents(monkeypatch):
+    monkeypatch.setenv("SIDEREGION_LFU", "1")
+    N.sideregion_reset()
+    cap, spec = 4, 4
+    pool = _pool(cap, spec)
+    _fill(pool, [5, 6], 3, cap, spec); _wait_set(3, {5, 6})
+    keys, vals = N.sideregion_kv(3, 0)          # C++ 直接吐 device 版 (uint32 keys, int32 vals)
+    assert keys.dtype == mx.uint32 and vals.dtype == mx.int32
+    kv = {int(k): int(v) for k, v in zip(keys.tolist(), vals.tolist())}
+    assert kv == _contents(3)                   # 与 contents 语义一致
+
+
+def test_sideregion_kv_empty(monkeypatch):
+    monkeypatch.setenv("SIDEREGION_LFU", "1")
+    N.sideregion_reset()
+    keys, vals = N.sideregion_kv(99, 0)         # 空层 → size 0,不崩
+    assert int(keys.size) == 0 and int(vals.size) == 0
+
+
 def test_lfu_off_is_legacy(monkeypatch):
     monkeypatch.delenv("SIDEREGION_LFU", raising=False)
     N.sideregion_reset()

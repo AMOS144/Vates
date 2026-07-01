@@ -2,6 +2,7 @@
 // 实现见 native_prefetch.cpp；跨线程全局态(g_pf_*/g_stg_*)私有于该 TU。
 #pragma once
 #include <tuple>
+#include <utility>
 #include "native_common.h"
 
 // 把一组专家 blob 字节 pread 进新建的 MLX uint8[n,stride] 数组（惰性图节点）。
@@ -43,6 +44,7 @@ mx::array prefetch_pool_sideregion(
     const std::vector<int>& resident, int spec_slots, int base_row, int gen,
     mx::StreamOrDevice s);
 std::vector<int> sideregion_contents(int layer, int gen);   // [expert, phys_row, ...]
+std::pair<mx::array, mx::array> sideregion_kv(int layer, int gen);  // (keys uint32, vals int32) device 数组
 void sideregion_reset();
 
 // Task1 spike：图内 primitive 输出别名输入 buffer，验证下游 gather 依赖边机制。

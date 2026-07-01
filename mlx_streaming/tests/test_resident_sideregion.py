@@ -2,6 +2,12 @@ import mlx.core as mx
 from mlx_streaming.core.cache.resident_pool import ResidentExpertPool
 
 
+def _kv(d):
+    # 模拟 C++ sideregion_kv：dict → (keys uint32, vals int32) device 数组。
+    return (mx.array(list(d.keys()), dtype=mx.uint32),
+            mx.array(list(d.values()), dtype=mx.int32))
+
+
 def _fake(seed):
     mx.random.seed(seed)
     w = mx.random.normal((32, 64))
@@ -25,7 +31,7 @@ def test_acquire_gpu_overlays_sideregion():
     slot10 = p._slot_of[0][10]
 
     class _Side:
-        def contents(self, layer): return {20: 5}   # 物理侧区行 5（∈[4,7)）
+        def kv(self, layer): return _kv({20: 5})     # 物理侧区行 5（∈[4,7)）
 
     inds = mx.array([[[10, 20]]], dtype=mx.uint32)
     pool, local = p.acquire_gpu_dual(0, inds, num_experts=32, side=_Side())
@@ -39,7 +45,7 @@ def test_acquire_gpu_dual_fallback_true_miss():
     p.acquire(0, [10])
 
     class _Side:
-        def contents(self, layer): return {20: 5}   # 20 在侧区
+        def kv(self, layer): return _kv({20: 5})     # 20 在侧区
 
     inds = mx.array([[[10, 20, 30]]], dtype=mx.uint32)   # 30 = 真 miss
     pool, local = p.acquire_gpu_dual(0, inds, num_experts=32, side=_Side())

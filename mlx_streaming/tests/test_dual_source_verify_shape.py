@@ -10,8 +10,9 @@ def _fake(seed):
 
 
 class _Side:
-    def contents(self, layer):
-        return {20: 5}            # 物理侧区行 5（∈[4,7)）
+    def kv(self, layer):
+        # 模拟 C++ sideregion_kv：(keys uint32, vals int32) device 数组。
+        return (mx.array([20], dtype=mx.uint32), mx.array([5], dtype=mx.int32))
 
 
 def test_acquire_gpu_dual_verify_shape_overlay():
