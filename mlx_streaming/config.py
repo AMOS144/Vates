@@ -32,7 +32,7 @@ def model_path() -> str: return _s("MODEL", "models/qwen3_next_80b_4bit")
 def qn_config() -> str: return _s("QN_CONFIG", "models/qwen3_next_80b_4bit/config.json")
 def mtp_out() -> str: return _s("MTP_OUT", "models/qn_mtp_weights.safetensors")
 def expert_dir(default: str = "models/qwen3_next_experts_4bit_g64") -> str: return _s("EXPERT_DIR", default)
-def expert_slots() -> int: return _i("EXPERT_SLOTS", 32)
+def expert_slots() -> int: return _i("EXPERT_SLOTS", 64)
 # 长期运行内存防御:封顶 MLX 可回收缓冲(默认 2GB),防长会话缓存膨胀;
 # wired limit 默认 0=关(opt-in),设 >0 则 wire 该 GB 数的 GPU 缓冲防 macOS 压缩器,
 # 须 < 系统建议工作集(本机 26.8GB)。
@@ -56,7 +56,7 @@ def eager_expert_load() -> bool: return _b("EAGER_EXPERT_LOAD", "0")
 
 
 # ============================ 缓存 / 驱逐 ============================
-def evict_policy() -> str: return _s("EVICT_POLICY", "lru")
+def evict_policy() -> str: return _s("EVICT_POLICY", "lfu")
 # 专家读盘是否绕过 OS page cache(F_NOCACHE):默认开,保证基准每次都是真实 NVMe 读、
 # 结果可复现(不被页缓存冷热污染);EXPERT_NOCACHE=0 恢复 mmap/page-cache(重复跑更快但飘)。
 def expert_nocache() -> bool: return _b("EXPERT_NOCACHE", "1")
@@ -183,6 +183,19 @@ def probe_perlayer_sync() -> bool: return _b("PROBE_PERLAYER_SYNC", "0")
 def prefetch_tprof() -> bool: return _b("PREFETCH_TPROF", "0")
 # 并集专家数探针:按前向 seq 分桶记每层路由专家并集大小(seq=K 即 MTP verify 的专家并集)。默认关。
 def union_prof() -> bool: return _b("UNION_PROF", "0")
+# 接受率 top-k 覆盖探针(>0 且 profile 时):记每个草稿位置 MTP 的 top-k 候选,量模型真实 token
+# 是否落在 top-2/top-3 里 = 树形展开的救回上界。默认 0=关。
+def accept_topk() -> int: return _i("ACCEPT_TOPK", 0)
+# 最小树:位置1 展开 top-2。仅当 A 链首草稿被拒且 B 候选=真实 token 时,额外跑一次 B 链前向救回。
+# 两分支各为独立 batch=1 seq=K 前向(线性层不能批处理树,故不拍平),per-forward union 不变。默认关。
+def tree_top2() -> bool: return _b("TREE_TOP2", "0")
+# 完整树形验证(batch-of-paths):把 P 条候选路径拍到 batch 维,一次 batched 前向并行验证所有路径,
+# 选接受最长的路径提交(提取赢家 row)。每条路径是普通线性序列,故线性层/全注意力层都走成熟的
+# batch 前向(无需改 kernel);单次前向的 batch=P 计算加宽了预取窗口,同时多路径提升接受长度
+# ——一举拿下 accept_len 与 hit_rate 两只鸟。默认关(与 tree_top2/普通链验证互斥,优先级最高)。
+def tree_verify() -> bool: return _b("TREE_VERIFY", "0")
+# 树分支数(候选路径条数 P)。当前 drafter 在位置1 展开 top-P,P=2 即 top-2。
+def tree_branches() -> int: return _i("TREE_BRANCHES", 2)
 
 
 def parse_layers_env(name: str) -> "set[int] | None":

@@ -196,6 +196,71 @@ def commit_verified_prefix(caches, verified_len: int, accepted_len: int) -> bool
     return True
 
 
+# ----------------------------------------------------------- 树形验证 batch 工具
+def _tile_state(st, P: int):
+    """把 cache.state 沿 batch 轴(axis0)复制 P 份((1,...) → (P,...))。"""
+    if st is None:
+        return None
+    if isinstance(st, (list, tuple)):
+        return type(st)(_tile_state(s, P) for s in st)
+    return mx.contiguous(mx.repeat(st, P, axis=0))
+
+
+def _row_state(st, w: int):
+    """取 cache.state 的第 w 行((P,...) → (1,...)),保持 batch 维。"""
+    if st is None:
+        return None
+    if isinstance(st, (list, tuple)):
+        return type(st)(_row_state(s, w) for s in st)
+    return mx.contiguous(st[w:w + 1])
+
+
+def tile_caches(caches, P: int):
+    """把 batch=1 的 cache 全部平铺到 batch=P,供 batch-of-paths 树验证并行前向。
+
+    KVCache 的 state setter 会按数组 shape 复位 offset;ArraysCache 无 offset。两者 meta
+    (lengths/left_padding) 在贪婪解码里恒为 None,tile 后语义不变。前提:所有 cache 当前 batch=1。
+    """
+    for c in caches:
+        c.state = _tile_state(c.state, P)
+
+
+def commit_tree_row(caches, verified_len: int, accepted_len: int, row: int) -> bool:
+    """把 batched(batch=P)验证前向的第 `row` 条路径,按 accepted_len 提交回 batch=1 主 cache。
+
+    等价于「先按接受长度裁剪 rejected 后缀,再抽出赢家路径那一行」:
+    - 可裁剪 cache(KVCache):trim(rejected) 后取第 row 行 KV。
+    - 递归状态 cache(ArraysCache):取 verify 前向捕获的 per-token checkpoint[accepted_len-1]
+      的第 row 行 [conv, ssm]。要求 batched 前向前调过 begin_speculative_checkpoints。
+    提交后主 cache 变回 batch=1,后续解码逐 token 从赢家路径续。
+    """
+    rejected = verified_len - accepted_len
+    if rejected < 0:
+        raise ValueError("accepted_len cannot exceed verified_len")
+
+    def can_commit(c):
+        if c.is_trimmable():
+            return True
+        cks = getattr(c, "_spec_checkpoints", None)
+        return cks is not None and len(cks) >= accepted_len
+
+    if not all(can_commit(c) for c in caches):
+        return False
+    for c in caches:
+        if c.is_trimmable():
+            if rejected:
+                c.trim(rejected)
+            c.state = _row_state(c.state, row)
+        else:
+            ck = c._spec_checkpoints[accepted_len - 1]     # [conv(P,...), ssm(P,...)]
+            c.state = [_row_state(ck[0], row), _row_state(ck[1], row)]
+        if hasattr(c, "_spec_checkpoints"):
+            c._spec_checkpoints = None
+        if hasattr(c, "_capture_spec_checkpoints"):
+            c._capture_spec_checkpoints = False
+    return True
+
+
 def commit_verified_snapshot(caches, snapshots, accepted_len: int,
                              verified_len: int | None = None) -> bool:
     """把 cache 恢复到 stepwise verify 的 accepted_len 后快照。"""

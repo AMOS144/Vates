@@ -68,7 +68,7 @@ class ResidentExpertPool:
         # 每层 pinned 专家集合：预取进 resident pool 后不参与 LRU 驱逐。
         # 用于 K>2 / 小槽位时保住热专家工作集，降低真实 miss。
         self._pinned: "Dict[int, set[int]]" = {}
-        # 可选替换策略：默认 lru；EVICT_POLICY=lfu 时用短窗口频率 + LRU tie-break。
+        # 可选替换策略：默认 lfu（短窗口频率 + LRU tie-break，实测比 lru 命中更高）；EVICT_POLICY=lru 回退纯 LRU。
         self.eviction_policy = config.evict_policy().lower()
         self.lfu_decay_interval = config.lfu_decay_interval()
         self._freq: "Dict[int, Counter[int]]" = {}

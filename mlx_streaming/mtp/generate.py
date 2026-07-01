@@ -16,7 +16,8 @@ from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 from mlx_streaming import config
 from mlx_streaming.mtp.kv_cache import (
     enable_qwen3next_speculative_checkpoints, begin_speculative_checkpoints,
-    _snapshot, _restore, commit_verified_prefix, commit_verified_snapshot)
+    _snapshot, _restore, commit_verified_prefix, commit_verified_snapshot,
+    tile_caches, commit_tree_row)
 
 
 def forward_with_hidden(model, ids, cache, compute_logits: bool = True):
@@ -108,6 +109,56 @@ def accept_prefix(drafts, preds):
     return matched
 
 
+# --------------------------------------------------------- 完整树形验证(batch-of-paths)
+def tree_verify_step(model, drafter, x, H_last, x_ids, mtp_cache, main_cache, K, P, snap_d):
+    """一次 batched 前向并行验证 P 条候选路径,提交接受最长的赢家路径。
+
+    返回 (new_tokens, x_new, rH, accepted_in, matched)。
+
+    原理:每条路径 `[x, d_1..d_{K-1}]` 是普通线性序列,拍到 batch 维后线性层/全注意力层都走成熟
+    batch 前向(逐 row 与 batch=1 等价,见 benchmarks/test_layerwise.py)。batch=P 的计算量加宽了
+    每层预取窗口(hit_rate),多路径又提升接受长度(accept_len)。验证后按赢家 row 提取 checkpoint
+    /trim 提交回 batch=1 主 cache,后续解码逐 token 从赢家路径续,与非投机贪婪等价。
+    """
+    paths = drafter.draft_paths(H_last, x_ids, mtp_cache, K, P)
+    verify_in = mx.array([[x] + p[: K - 1] for p in paths])       # (P, K)
+
+    snap_m = _snapshot(main_cache)                                # tile 前的 batch=1 快照(回退用)
+    tile_caches(main_cache, len(paths))
+    begin_speculative_checkpoints(main_cache)
+    vlogits, vH = forward_with_hidden(model, verify_in, main_cache)
+    mx.eval(vlogits, vH)
+
+    best_w, matched, preds = 0, -1, None
+    for wi, p in enumerate(paths):
+        preds_i = [int(t) for t in mx.argmax(vlogits[wi], axis=-1)]
+        m = accept_prefix(p, preds_i)
+        if m > matched:                                          # 平局取更靠前的路径(top-1 优先)
+            best_w, matched, preds = wi, m, preds_i
+    drafts = paths[best_w]
+    accepted_len = min(matched + 1, K)
+
+    committed = commit_tree_row(main_cache, verified_len=K,
+                                accepted_len=accepted_len, row=best_w)
+    if snap_d is not None:
+        _restore(mtp_cache, snap_d)
+
+    if not committed:
+        # 理论上 checkpoint 齐全不会走到;稳妥回退:恢复 batch=1 主 cache 后重放赢家 accepted prefix。
+        _restore(main_cache, snap_m)
+        accepted_in = mx.array([[x] + drafts[:matched]])
+        rlogits, rH = forward_with_hidden(model, accepted_in, main_cache)
+        mx.eval(rlogits)
+        bonus = int(mx.argmax(rlogits[:, -1, :]))
+        return drafts[:matched] + [bonus], bonus, rH, accepted_in, matched
+
+    rH = vH[best_w:best_w + 1, :accepted_len, :]
+    accepted_in = verify_in[best_w:best_w + 1, :accepted_len]
+    if matched == K:
+        return drafts[:K], drafts[-1], rH, accepted_in, matched
+    return drafts[:matched] + [preds[matched]], preds[matched], rH, accepted_in, matched
+
+
 # ----------------------------------------------------------------- 主循环
 def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
                  profile=False):
@@ -134,7 +185,20 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     t_draft = t_verify = t_replay = t_snap = 0.0
     t_commit = t_sync = t_finalize = 0.0
     direct_commits = fallback_replays = replayed_tokens = 0
+    # matched 直方图:accept_hist[j] = 恰好命中 j 个草稿(j∈0..K)的步数。用于实测每位置接受率,
+    # 不做几何分布假设。emitted/step = min(matched+1,K)，故上限为 K(本实现 verify 只喂 K-1 草稿)。
+    accept_hist = [0] * (K + 1)
+    # top-k 覆盖探针:每位置统计模型真实 token 落在 MTP top-1/2/3 的步数(树形救回上界)。
+    topk_probe = config.accept_topk() if profile else 0
+    tk_n = [0] * K
+    tk_cover1 = [0] * K
+    tk_cover2 = [0] * K
+    tk_cover3 = [0] * K
     verify_mode = config.mtp_verify_mode()
+    tree_mode = config.tree_top2()
+    tree_verify_mode = config.tree_verify()     # 完整树形验证(batch-of-paths),优先级最高
+    tree_P = max(1, config.tree_branches())
+    tree_rescues = 0                            # 位置1 top-2 成功救回(B 链首命中)的步数
 
     while len(produced) < max_tokens:
         x0 = x
@@ -142,9 +206,41 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
 
         snap_d = _snapshot(mtp_cache) if mtp_cache else None
         prev_H_last = H_last
+
+        # 完整树形验证:一次 batched 前向验证 P 条路径,提交赢家。自带 step 尾处理后 continue。
+        if tree_verify_mode and verify_mode != "step":
+            if profile:
+                _tic = time.perf_counter()
+            new_tokens, x, rH, accepted_in, matched = tree_verify_step(
+                model, drafter, x, H_last, x_ids, mtp_cache, main_cache, K, tree_P, snap_d)
+            accept_hist[matched] += 1
+            direct_commits += 1
+            if profile:
+                t_verify += time.perf_counter() - _tic
+                _tic = time.perf_counter()
+            for t in new_tokens:
+                produced.append(t)
+                if len(produced) >= max_tokens:
+                    break
+            H_last = rH[:, -1:, :]
+            if mtp_cache is not None and hasattr(drafter, "sync"):
+                drafter.sync(prev_H_last, rH, accepted_in, mtp_cache)
+            if profile:
+                t_sync += time.perf_counter() - _tic
+            n_steps += 1
+            mx.eval(x, H_last)
+            continue
+
         if profile:
             _tic = time.perf_counter()
-        drafts = drafter.draft(H_last, x_ids, mtp_cache, K)        # 长度 K
+        tree_b = None
+        if tree_mode and verify_mode != "step":
+            drafts, tree_b = drafter.draft_tree(H_last, x_ids, mtp_cache, K)  # chainA, chainB
+            draft_cands = None
+        elif topk_probe > 0:
+            drafts, draft_cands = drafter.draft(H_last, x_ids, mtp_cache, K, topk=topk_probe)
+        else:
+            drafts, draft_cands = drafter.draft(H_last, x_ids, mtp_cache, K), None  # 长度 K
         verify_in = mx.array([[x] + drafts[: K - 1]])              # [x, d_1..d_{K-1}]
         if profile:
             mx.eval(verify_in)
@@ -166,6 +262,30 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             mx.eval(vlogits, vH)
         preds = [int(t) for t in mx.argmax(vlogits[0], axis=-1)]   # 长度 K
         matched = accept_prefix(drafts, preds)
+        # 最小树救回:A 链首草稿被拒(matched==0)且 B 候选=模型真实 token(=preds[0])时,
+        # 恢复 cache、改验 B 链。preds[0] 只依赖 [x],两链一致;故 d1b==preds[0] 即 B 首命中。
+        if tree_b is not None and matched == 0 and tree_b[0] == preds[0]:
+            _restore(main_cache, snap_m)
+            begin_speculative_checkpoints(main_cache)
+            vlogits, vH = forward_with_hidden(model, mx.array([[x] + tree_b[:K - 1]]), main_cache)
+            mx.eval(vlogits, vH)
+            preds = [int(t) for t in mx.argmax(vlogits[0], axis=-1)]
+            drafts = tree_b
+            matched = accept_prefix(drafts, preds)
+            tree_rescues += 1
+        accept_hist[matched] += 1
+        if draft_cands is not None:
+            # preds[i]=模型在位置 i 的真实下一 token;查它是否在 MTP 该位置 top-1/2/3 候选里。
+            for i in range(K):
+                p = preds[i]
+                c = draft_cands[i]
+                tk_n[i] += 1
+                if p == c[0]:
+                    tk_cover1[i] += 1
+                if p in c[:2]:
+                    tk_cover2[i] += 1
+                if p in c[:3]:
+                    tk_cover3[i] += 1
         if profile:
             t_verify += time.perf_counter() - _tic
             _tic = time.perf_counter()
@@ -245,7 +365,14 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
         "direct_commits": direct_commits,
         "fallback_replays": fallback_replays,
         "replayed_tokens": replayed_tokens,
+        "accept_hist": accept_hist,               # [恰好命中0,1,...,K 个草稿的步数]
+        "tree_rescues": tree_rescues,             # 最小树位置1 成功救回步数(tree_top2 开时)
     }
+    if topk_probe > 0:
+        stats["topk_probe"] = {
+            "topk": topk_probe, "n": tk_n,
+            "cover_top1": tk_cover1, "cover_top2": tk_cover2, "cover_top3": tk_cover3,
+        }
     if profile:
         seg = t_draft + t_snap + t_verify + t_commit + t_replay + t_sync + t_finalize
         stats.update({
