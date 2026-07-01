@@ -85,10 +85,12 @@ def build_streaming_model():
         # 零拷贝双源双缓冲：常驻池换成侧区模式（预分配 cap+2*spec_slots 行、禁 grow），复用原池 loader/cap/profile。
         from mlx_streaming.core.cache.resident_pool import ResidentExpertPool
         _old = store._resident
+        # 侧区持久 LFU 用单代(一份工作集,省一半侧区内存);非 LFU 保持双缓冲。
+        _spec_gens = 1 if config.sideregion_lfu() else max(2, int(os.environ.get("SPEC_GENS", "2")))
         store._resident = ResidentExpertPool(
             _old.capacity, loader=_old.loader, layer_caps=_old.layer_caps,
             spec_slots=config.pool_spec_slots(),
-            spec_gens=max(2, int(os.environ.get("SPEC_GENS", "2"))))
+            spec_gens=_spec_gens)
     if config.stream_blob_loader():
         # blob 接入常驻池 miss-loader：复用 GPU-remap 快路径，小 EXPERT_SLOTS 即低内存。
         store._blob_loader = _make_blob_source(dims, group, bits)
@@ -125,7 +127,13 @@ def build_streaming_model():
     if config.zerocopy_dual_source() and getattr(store, "_staging", None) is not None:
         from mlx_streaming.core.cache.virtual_pool import VirtualPool
         from mlx_streaming.core.moe.block import FileStreamingMoeBlock
-        _vpool = VirtualPool(store._resident, store._staging, config.pool_spec_slots())
+        # 双源模式仍需 ahead 调度：block._native_fused_prefetch 靠 target_for 选目标层，
+        # 不传调度参数会让 target_for 恒返回 0（_num_layers=0）→ 预取全跳过、侧区永远空。
+        _vpool = VirtualPool(store._resident, store._staging, config.pool_spec_slots(),
+                             num_layers=len(model.layers),
+                             cutoff=config.cross_layer_cutoff(),
+                             ahead_lo=config.cross_layer_ahead_lo(),
+                             ahead_hi=config.cross_layer_ahead_hi())
         for layer in model.layers:
             mlp = getattr(layer, "mlp", None)
             if isinstance(mlp, FileStreamingMoeBlock):
