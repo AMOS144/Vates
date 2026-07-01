@@ -138,8 +138,14 @@ def predict_use_x() -> bool: return _b("PREDICT_USE_X", "1")  # 默认用本层 
 def predict_agg() -> str: return _s("PREDICT_AGG", "max")  # K+1 token 聚合：max|mean|union
 def predict_union_k() -> int: return _i("PREDICT_UNION_K", 8)  # union 时每 token 取的 top-k（控候选数）
 def native_fused_prefetch() -> bool: return _b("NATIVE_FUSED_PREFETCH", "0")
-def zerocopy_dual_source() -> bool: return _b("ZEROCOPY_DUAL_SOURCE")  # 池侧区零拷贝双源，opt-in
-def pool_spec_slots() -> int: return _i("POOL_SPEC_SLOTS", 3)          # 每层侧区投机槽数（cap=16 时每层 miss≈2.6 → 3 够）
+# 池侧区零拷贝双源(双缓冲)：opt-in、默认 off。VirtualPool 收口，消掉 promote 拷贝。
+# 实测(80B,cap=32,见 bench_dual_source)：小 spec(=3) 确定正确、省内存(6.6→4.6GB)、更快(+32%)，
+# 但命中反降(0.763→0.709,因 promote 关、侧区不积累热专家)；放大 spec(=32) 命中仅 0.768、内存反涨，
+# 且触发 C++ 并发预取竞态→输出 run-to-run 不确定。故「侧区当二级缓存拿 cap=64 命中@cap=32 内存」不成立，
+# 要容量仍应加持久槽位(EXPERT_SLOTS)，勿放大 POOL_SPEC_SLOTS。
+def zerocopy_dual_source() -> bool: return _b("ZEROCOPY_DUAL_SOURCE")
+def pool_spec_slots() -> int: return _i("POOL_SPEC_SLOTS", 3)          # 每层侧区投机槽数(勿 >budget/放大触发竞态)
+def sideregion_lfu() -> bool: return _b("SIDEREGION_LFU")              # 侧区持久 LFU 二级缓存(默认 off);见 spec 2026-07-01
 def native_no_submit() -> bool: return _b("NATIVE_NO_SUBMIT", "0")
 def native_no_promote() -> bool: return _b("NATIVE_NO_PROMOTE", "0")
 def native_materialize() -> bool: return _b("NATIVE_MATERIALIZE", "0")
