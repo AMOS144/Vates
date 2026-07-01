@@ -366,6 +366,7 @@ std::vector<double> staging_hprof_get() {
 struct SideLayer {
   std::map<int, int> e2r;          // expert -> 物理侧区行 [base_row, base_row+spec)
   std::vector<int> free_rows;
+  std::map<int, uint32_t> freq;    // expert -> 预测频次(LFU 分数;仅 SIDEREGION_LFU 用)
   bool inited = false;
 };
 static std::mutex g_side_mutex;
@@ -451,6 +452,8 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
   static std::vector<std::pair<int, int>> reserve(
       const uint32_t* idp, size_t n, int layer, int gen, const std::vector<int>& resident,
       int spec, int base) {
+    const char* lfu_env = std::getenv("SIDEREGION_LFU");   // 每次读,便于测试切换
+    bool lfu = lfu_env && lfu_env[0] == '1';
     std::unordered_set<int> res(resident.begin(), resident.end());
     std::vector<int> P;
     std::unordered_set<int> Pset, seen;
@@ -467,18 +470,51 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
       for (int r = 0; r < spec; ++r) c.free_rows.push_back(base + r);
       c.inited = true;
     }
-    for (auto it = c.e2r.begin(); it != c.e2r.end();) {       // 淘汰 ∉P 的行
-      if (!Pset.count(it->first)) {
-        c.free_rows.push_back(it->second);
-        it = c.e2r.erase(it);
-      } else {
-        ++it;
+    if (!lfu) {
+      // 旧行为:∉P 全弃(一次性预取批)。
+      for (auto it = c.e2r.begin(); it != c.e2r.end();) {
+        if (!Pset.count(it->first)) {
+          c.free_rows.push_back(it->second);
+          it = c.e2r.erase(it);
+        } else {
+          ++it;
+        }
       }
+      for (int e : P) {
+        if (c.e2r.count(e) || c.free_rows.empty()) continue;
+        to_read.emplace_back(e, c.free_rows.back());
+        c.free_rows.pop_back();
+      }
+      return to_read;
     }
-    for (int e : P) {                                         // 只为缺口预留行
-      if (c.e2r.count(e) || c.free_rows.empty()) continue;
-      to_read.emplace_back(e, c.free_rows.back());
-      c.free_rows.pop_back();
+    // LFU 持久:∉P 不清;再预测命中已驻专家 freq+1(越常预测越热)。
+    for (int e : P) {
+      if (c.e2r.count(e)) c.freq[e] += 1;
+    }
+    for (int e : P) {
+      if (c.e2r.count(e)) continue;               // 已驻,跳过(不重读)
+      int row;
+      if (!c.free_rows.empty()) {
+        row = c.free_rows.back();
+        c.free_rows.pop_back();
+      } else {
+        // free 空:LFU 淘汰 e2r 中 freq 最小且 ∉P 者(tie-break:最小 expert id)。
+        int victim = -1;
+        uint32_t best = 0;
+        for (auto& kv : c.e2r) {
+          if (Pset.count(kv.first)) continue;     // 不淘本步要用的
+          uint32_t f = c.freq.count(kv.first) ? c.freq[kv.first] : 0;
+          if (victim < 0 || f < best || (f == best && kv.first < victim)) {
+            victim = kv.first;
+            best = f;
+          }
+        }
+        if (victim < 0) continue;                 // 全是 P 热,无可淘 → 本步不读
+        row = c.e2r[victim];
+        c.e2r.erase(victim);
+        c.freq.erase(victim);
+      }
+      to_read.emplace_back(e, row);
     }
     return to_read;
   }
@@ -516,7 +552,10 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
     {
       std::lock_guard<std::mutex> lk(g_side_mutex);
       SideLayer& c = g_side[{layer, gen}];
-      for (auto& pr : done) c.e2r[pr.first] = pr.second;       // 字节就绪后才发布 e2r
+      for (auto& pr : done) {                                  // 字节就绪后才发布 e2r
+        c.e2r[pr.first] = pr.second;
+        if (!c.freq.count(pr.first)) c.freq[pr.first] = 1;     // 新专家初始 freq
+      }
     }
     g_pf_fires.fetch_add(1);
   }
