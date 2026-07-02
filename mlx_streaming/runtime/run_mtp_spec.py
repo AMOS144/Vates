@@ -156,6 +156,10 @@ def main():
         "spec_prefetch_hits": spec_prefetch_hits,
         "spec_hit_rate": round(spec_hit / max(spec_hit + spec_miss, 1), 3),
         "disk_load_ratio": round(spec_miss / max(base_miss, 1), 2),
+        # 双源 acquire 分路计数:n_miss==0 走全 GPU 快路径;任一路由 miss 则整层落 host 慢路径
+        # (.tolist 全批同步 + demand 读盘)。fallback 占比高 → 即使 hit 高,慢路径仍按"层"频繁触发。
+        "gpu_fastpath": getattr(store._resident, "gpu_fastpath", None),
+        "gpu_fallback": getattr(store._resident, "gpu_fallback", None),
         "pin_hot": PIN_HOT,
         "pin_cal_tok": PIN_CAL_TOK,
         "pinned_experts": store.pinned_count(),

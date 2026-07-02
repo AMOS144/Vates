@@ -103,8 +103,10 @@ def stream_blob_bg() -> bool: return _b("STREAM_BLOB_BG", "0")
 def stream_blob_workers() -> int: return _i("STREAM_BLOB_WORKERS", 8)
 def stream_blob_window() -> int: return _i("STREAM_BLOB_WINDOW", 3)
 def stream_blob_nocache(default: str = "1") -> bool: return _b("STREAM_BLOB_NOCACHE", default)
-# 默认 16:实测 64 槽/K=3 甜点(配合 predict_width=32 满 recall=0.931,promote/内存最省、最快)。
-def stream_blob_bg_budget(default: int = 16) -> int: return _i("STREAM_BLOB_BG_BUDGET", default)
+# 默认 12:双源侧区(cap32+侧区32)K=3 MTP 甜点扫描结果(REPEAT=2)。瓶颈是 SSD 读盘时序而非容量,
+# 加大 budget 只会灌满共享读队列→预取到得更晚(timing miss↑)。W=24/B=12 在 hit(0.901)/disk(3874)/
+# tok·s(11.61)/确定性(nmis=2)全面优于旧 W=32/B=16(10.0 tok·s、nmis=43),tok·s +16%。
+def stream_blob_bg_budget(default: int = 12) -> int: return _i("STREAM_BLOB_BG_BUDGET", default)
 # 按需 miss 批量并行读：把本层所有 miss 专家收成一批，一次 load_experts(8-worker 并行 pread)，
 # 取代逐专家串行 pread（实测串行 6.4GB/s vs 并行 8 路 22GB/s）。仅影响读取调度，结果等价。
 # 默认开：剖析实测 decode 时间 ~92% 花在每层 host 回退路径，其中字节物化是大头；批量堆叠
@@ -129,7 +131,10 @@ def cross_layer_ahead(default: int = 0) -> int: return _i("CROSS_LAYER_PREFETCH_
 def cross_layer_mult() -> int: return max(1, _i("CROSS_LAYER_PREFETCH_MULT", 2))
 # 预测宽度（方案B）：预测 top-N 候选用于"减常驻"，N 大→recall 高且不占内存（只是 gate argpartition）。
 # 真正占 staging 的是过滤常驻后、按分截断到 staging budget 的缺口子集。
-def cross_layer_predict_width() -> int: return _i("CROSS_LAYER_PREDICT_WIDTH", 32)
+# 默认 24:双源侧区 K=3 甜点扫描(REPEAT=2)。realized hit 在 W≥24 就到顶(~0.90),再加宽只抬"名义
+# recall"——多出的候选在 SSD 时序上落不进侧区且抢带宽,W=48→hit 0.85、W=64→0.75、tok·s 一路下滑。
+# 收窄到刚好覆盖可及工作集(W=24)最快最省。详见 benchmarks/reports/prefetch-width-budget-sweep-2026-07-01.md。
+def cross_layer_predict_width() -> int: return _i("CROSS_LAYER_PREDICT_WIDTH", 24)
 # per-layer 自适应 ahead：早层用小 ahead 保召回、晚层用大 ahead 保时序（默认来自 Phase 0 实测）。
 def cross_layer_cutoff() -> int: return _i("CROSS_LAYER_CUTOFF", 6)        # 切点：层号 <cutoff 用 lo，否则 hi
 def cross_layer_ahead_lo() -> int: return _i("CROSS_LAYER_AHEAD_LO", 1)    # 早层 ahead（保召回）
