@@ -190,11 +190,12 @@ class FileStreamingMoeBlock:
                 _rdy = _stg_mgr.last_ready.get(self.layer_idx) if _stg_mgr else None
                 note_miss_attrib(_uniq, _ps, _res, x.shape[1] <= _DECODE_SEQ_MAX, _rdy)
             if config.zerocopy_dual_source():
-                # 双源双缓冲：经 VirtualPool 取读代,真实区表 ∪ 侧区(读代) 单次 gather。
-                rp = self.store._resident
-                pool_arrays, local = self._vpool.acquire(self.layer_idx, inds, gates.shape[-1])
-                y = self._sub.forward(
-                    pool_arrays, layer_cap + rp.spec_gens * rp.spec_slots, x, local)
+                # 双源双缓冲：统一走 VirtualPool.acquire（呈现「所有专家都在」视角，
+                # 内部真实区表 ∪ 侧区(读代) 单次 gather，返回 (pool, local, n_experts)）。
+                pool_arrays, local, n_experts = self._vpool.acquire(
+                    self.layer_idx, inds, gates.shape[-1],
+                    seq_len=x.shape[1], layer_cap=layer_cap)
+                y = self._sub.forward(pool_arrays, n_experts, x, local)
             else:
                 pool_arrays, local = self.store.acquire_gpu(
                     self.layer_idx, inds, gates.shape[-1])
@@ -222,8 +223,15 @@ class FileStreamingMoeBlock:
                         if hasattr(self.store, "resident_experts") else set())
                 _rdy = _stg_mgr.last_ready.get(self.layer_idx) if _stg_mgr else None
                 note_miss_attrib(uniq_set, _ps, _res, x.shape[1] <= _DECODE_SEQ_MAX, _rdy)
-            # 池只能同时容纳 ≤该层容量 个唯一专家；prefill 唯一数超容量时回退 stack
+            # 池只能同时容纳 ≤该层容量 个唯一专家；prefill 唯一数超容量时回退 stack。
+            # dual 模式（_vpool 存在）统一走 VirtualPool.acquire_host 收口 host+fetch；
+            # 非 dual（_vpool 为 None）保留内联逻辑（非目标路径，避免额外依赖）。
             if (config.resident_pool_enabled()
+                    and getattr(self, "_vpool", None) is not None):
+                pool_arrays, local, n_experts = self._vpool.acquire_host(
+                    self.layer_idx, flat, inds.shape, inds.dtype, layer_cap)
+                y = self._sub.forward(pool_arrays, n_experts, x, local)
+            elif (config.resident_pool_enabled()
                     and len(uniq_set) <= layer_cap):
                 pool_arrays, slots = self.store.acquire(self.layer_idx, flat)
                 local = mx.array(slots, dtype=inds.dtype).reshape(inds.shape)

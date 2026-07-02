@@ -70,10 +70,43 @@ class VirtualPool:
     def fill_gen(self) -> int:
         return self._gen % self._gens()         # fill 写本代;单代恒 0
 
-    def acquire(self, layer, inds, num_experts):
-        """真实区表 ∪ 侧区(读代)e2r → 单次 gather。返回 (pool_arrays, local)。"""
-        side = _StagingSide(self._stg, self.read_gen())
-        return self._rp.acquire_gpu_dual(layer, inds, num_experts, side)
+    def acquire(self, layer, inds, num_experts, *, seq_len=None, layer_cap=None):
+        """统一取用入口（GPU-remap 路径）：对外呈现「所有专家都在」的视角。
+
+        返回 (pool_arrays, local, n_experts)，计算侧零分支：
+        - dual（有侧区 staging 且 spec>0）：真实区表 ∪ 侧区(读代) → acquire_gpu_dual；
+          n_experts = layer_cap + spec_gens*spec_slots。
+        - 非 dual GPU-remap：acquire_gpu；n_experts = layer_cap。
+        （host/fetch 路径见 acquire_host，其输入是 host 侧已 .tolist 的 flat，语义不同故分开。）
+        """
+        cap = int(layer_cap) if layer_cap is not None else self._rp.cap_for(layer)
+        if self._stg is not None and self._spec > 0:
+            side = _StagingSide(self._stg, self.read_gen())
+            pool, local = self._rp.acquire_gpu_dual(layer, inds, num_experts, side)
+            n_exp = cap + self._rp.spec_gens * self._rp.spec_slots
+            return pool, local, n_exp
+        pool, local = self._rp.acquire_gpu(layer, inds, num_experts)
+        return pool, local, cap
+
+    def acquire_host(self, layer, flat, inds_shape, inds_dtype, layer_cap):
+        """host/fetch 路径收口（prefill/大 seq 或关 GPU-remap）：flat 为 host 侧路由 id 列表。
+
+        返回 (pool_arrays, local, n_experts)，与 block.py 原 host/fetch 分支逐元素等价：
+        - uniq <= cap：acquire(flat)，local 为槽位；n_experts = layer_cap。
+        - uniq > cap：fetch(uniq_sorted)，local 为 remap 到 [0,uniq) 连续索引；n_experts = uniq 数。
+        """
+        import mlx.core as mx
+        cap = int(layer_cap)
+        uniq_set = set(flat)
+        if len(uniq_set) <= cap:
+            pool, slots = self._rp.acquire(layer, flat)
+            local = mx.array(slots, dtype=inds_dtype).reshape(inds_shape)
+            return pool, local, cap
+        uniq_sorted = sorted(uniq_set)
+        remap = {g: i for i, g in enumerate(uniq_sorted)}
+        local = mx.array([remap[i] for i in flat], dtype=inds_dtype).reshape(inds_shape)
+        fetched = self._rp.fetch(layer, uniq_sorted)
+        return fetched, local, len(uniq_sorted)
 
     def prefetch(self, layer, pred, resident, pool_list):
         """向 fill 代 submit 预读：base_row = cap_for(layer) + fill_gen*spec。"""

@@ -22,6 +22,8 @@ def test_target_for_skip_no_clamp():
 # ---- 双源双缓冲协调器（dual-source coordinator）----
 
 class _FakeRP:
+    spec_gens = 2        # 与真实 ResidentExpertPool 一致（acquire 返回 n_experts 需要）
+    spec_slots = 16
     def __init__(self):
         self.dual_calls = []
     def cap_for(self, layer):
