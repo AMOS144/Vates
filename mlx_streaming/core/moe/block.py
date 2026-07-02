@@ -153,7 +153,16 @@ class FileStreamingMoeBlock:
                 inds = inds + (_dummy.reshape(()).astype(inds.dtype) * 0)
         layer_cap = self.store.cap_for(self.layer_idx)
         # verify(小 seq)可走 GPU 重映射;prefill(大 seq)唯一专家可能超 cap,须留在 host 路径(有超容量 fetch 回退)。
-        _verify_gpu = (config.verify_gpu_remap() and x.shape[1] * k <= layer_cap)
+        if config.zerocopy_dual_source() and getattr(self, "_vpool", None) is not None:
+            # 双源两级缓存本就是为 MTP verify 建的:acquire_gpu_dual 用全专家宽表寻址,任意并集都安全
+            # (miss 走 demand 回退),有效容量 = cap + 侧区行。verify 默认走 dual 路径读侧区,否则
+            # 落 host 路径会白填侧区(预取填了却不读)→ 命中骤降、读盘翻倍。判据用 dual 有效容量,
+            # 避免更大 K 时 (K+1)×top_k 误伤 cap。
+            rp = self.store._resident
+            _dual_cap = layer_cap + rp.spec_gens * rp.spec_slots
+            _verify_gpu = (x.shape[1] * k <= _dual_cap)
+        else:
+            _verify_gpu = (config.verify_gpu_remap() and x.shape[1] * k <= layer_cap)
         if (config.resident_pool_enabled()
                 and config.gpu_remap_enabled()
                 and (x.shape[1] == 1 or _verify_gpu)):
