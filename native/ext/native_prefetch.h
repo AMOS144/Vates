@@ -50,6 +50,11 @@ void sideregion_reset();
 // Task1 spike：图内 primitive 输出别名输入 buffer，验证下游 gather 依赖边机制。
 mx::array materialize_spike(const mx::array& src, uint32_t fillval, mx::StreamOrDevice s);
 
+// Phase 2 方案B 机制探针：eval_gpu body 直接读 GPU 算出的 inds，写 local=inds+offset。
+mx::array demand_probe(const mx::array& inds, int offset, mx::StreamOrDevice s);
+// 探针2：完成回调里写 local，测同前向下游能否读到回调写入。
+mx::array demand_probe_handler(const mx::array& inds, int offset, mx::StreamOrDevice s);
+
 // ---- 自由后台读线程（de-risk）：脱离 GPU 完成回调、零 GIL，pread 进调用方 MLX buffer ----
 void bg_reader_start(int workers, int low_cap = 0);
 long bg_reader_submit(const mx::array& dst, const std::vector<int>& experts,

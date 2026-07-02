@@ -96,6 +96,10 @@ NB_MODULE(native_moe_ext, m) {
   m.def("sideregion_reset", &sideregion_reset);
   m.def("materialize_spike", &materialize_spike, "src"_a, "fillval"_a, nb::kw_only(),
         "stream"_a = nb::none());
+  m.def("demand_probe", &demand_probe, "inds"_a, "offset"_a, nb::kw_only(),
+        "stream"_a = nb::none());
+  m.def("demand_probe_handler", &demand_probe_handler, "inds"_a, "offset"_a, nb::kw_only(),
+        "stream"_a = nb::none());
   m.def("bg_reader_start", &bg_reader_start, "workers"_a = 1, "low_cap"_a = 0);
   m.def("bg_reader_submit", &bg_reader_submit,
         "dst"_a, "experts"_a, "rows"_a, "path"_a, "stride"_a, "ticket"_a, "prio"_a = 0);

@@ -438,40 +438,48 @@ git add -A && git commit -m "chore: 移除 Phase 0 go/no-go throwaway 探针"
 
 ---
 
-## Phase 2：真正消除 per-layer 同步（**待用户对硬问题 3 拍板后补全代码**）
+## Phase 2：真正消除 per-layer 主线程 demand WORK
 
-> 下述为设计级任务骨架；**具体代码在用户选定方案 B/C 后写入本节**。两方案共用「先写
-> demand-spike 单测钉死排序依赖边」这一起点。
+### Task P2-0（已执行）：demand-into-primitive 机制 spike —— **结论：零同步不可行**
 
-### Task P2-0（两方案共用）：demand-into-primitive 排序依赖 spike
+用户选定方案 B（零主线程同步）后，先用最小 C++ 探针钉死其地基机制。**已执行，结论如下**
+（详见 `benchmarks/reports/virtualpool-phase2-spike-2026-07-02.md`、单测
+`mlx_streaming/tests/test_demand_primitive_spike.py`）：
 
-- [ ] 写单测：预分配池（`preallocate`）+ 一个惰性 demand primitive（输入 inds/pool、输出修正
-  local），断言 `mx.take`/matmul 消费该 local 时读到的是 primitive 在 eval 内 pread 落池后的
-  **正确字节**（不是脏字节）。证「Primitive 输出 → 下游 gather」依赖边成立
-  （参考 `test_ingraph_alias_spike.py` + `MaterializeSpikePrimitive`）。native 未编译则 skip。
-- [ ] 若依赖边不成立 → **Phase 2 不可行，停下报告**，回退到 Tier1 路径（Phase 1 抽象保留）。
+- [x] `demand_probe`（eval_gpu body 读 GPU 算出的 inds）：**127/200 错**——inds kernel 未执行，读到脏值。
+- [x] `demand_probe_handler`（完成回调写 local，同前向下游 `mx.take` 读）：**195/200 错**——回调写入对同前向不可见。
+- [x] 正对照 `materialize_spike`（body 写常量 → 下游可见）：**成立**。
+- [x] `demand_probe` 在 **inds 已 eval** 后读值：**正确**——「1 次同步 + C++ 落池」地基成立。
 
-### 方案 C（推荐）：主线程预留槽 + C++ demand primitive 只填字节
+**⇒ 同前向「零主线程同步」demand 不可行**（本 MLX 版本；除非做 spec 明确排除的投机执行）。
+拿 inds 值必须每层一次同步。**这是新的根本性发现，已停下报告，等待用户对 B/C 重新拍板。**
 
-- [ ] Task P2-C1：新增 native `demand_fill(inds, slot_table, side_kv, pool_list, seg_meta, path,
-  stride, plan) -> local`：C++ 在 eval_gpu 主体（非后台）里按主线程给的 `(expert→slot)` 计划
-  pread + memcpy，输出修正 local。plan 由主线程用现有 `_alloc_slot` 预留（一次极小 `.tolist`
-  拿 unique 路由）。
-- [ ] Task P2-C2：`ResidentExpertPool.acquire_gpu_dual` 在 `NATIVE_DEMAND_PRIMITIVE=1` 时，
-  回退分支改为「主线程预留槽 → 调 `demand_fill` → 返回 local」，去掉主线程落池 scatter/eff 重建。
-- [ ] Task P2-C3：LFU 记账降级为「只对 miss bump」（与 Tier1 已接受取舍一致）。
-- [ ] Task P2-C4：字节等价单测（`STG_VERIFY` 风格）+ A/B 实测（目标吃下 11→54 大部分，
-  保守 ≥ +100%）。
+### 影响：方案 B 的定义性优势（零同步）被证伪 → 推荐改回方案 C
 
-### 方案 B：C++ 完全接管真实区槽状态
+- Phase 0 已证：大头收益（+174%）来自**移除主线程 demand WORK**（第二次 `.tolist` + Python
+  落池 scatter + eff 重建），**而非**移除那次同步本身（P2 探针保留同步仍 +174%）。
+- 移除「主线程 demand WORK」B、C 都能做到，且都各需**每层 1 次同步**（不可避免）。方案 B 额外
+  的「C++ 接管槽状态 + 一致性改写」现在**换不到任何额外收益**，只剩风险。
+- **推荐方案 C**：复用 Python `_alloc_slot`（Python 保持槽状态唯一权威，无一致性改写）。
 
-- [ ] Task P2-B1：把 `_slot_of/_free/freq` 真实区版本迁入 C++（仿 `SideLayer`），暴露查询接口
-  给 Python 侧 stats/trace/prefetch_cpp。
-- [ ] Task P2-B2：C++ demand primitive 在 eval/回调线程内完成 membership + 分配/驱逐/pread/
-  memcpy/更新表，输出修正 local，主线程完全不 `.tolist`、不碰槽。
-- [ ] Task P2-B3：C++ 精确复刻 `_choose_victim`（freq + LRU tie-break + pinned/current 保护）；
-  与 `prefetch_cpp` 真实区槽分配统一到一套 C++ 分配器（互斥）。
-- [ ] Task P2-B4：逐段字节校验 + 与 Python 分配器一致性回归 + A/B 实测。
+### 方案 C（推荐，待用户确认后落地）：主线程预留槽 + C++ demand primitive 只填字节
+
+- [ ] Task P2-C1：新增 native `demand_fill(inds_evaluated, side_kv, pool_list, seg_meta, path,
+  stride, plan) -> local`：C++ 在 eval_gpu 主体按主线程给的 `(expert→slot)` 计划 pread + memcpy，
+  输出修正 local。plan 由主线程用现有 `_alloc_slot` 预留（一次极小 `.tolist` 拿 unique 路由）。
+- [ ] Task P2-C2：`acquire_gpu_dual` 在 `NATIVE_DEMAND_PRIMITIVE=1` 时，回退分支改为「主线程预留槽
+  → 调 `demand_fill` → 返回 local」，去掉主线程落池 scatter/eff 重建。native 缺失自动回退现路径。
+- [ ] Task P2-C3：LFU 记账保持 Python 侧现语义（`_note_access` 复用）。
+- [ ] Task P2-C4：字节等价单测（`STG_VERIFY` 风格）+ A/B 实测（保守目标 ≥ +100%）。
+
+### 方案 B（1 次同步版；不推荐——高风险且无额外收益，仅在用户坚持 C++ 拥有槽状态时）
+
+- [ ] Task P2-B1：`_slot_of/_free/freq` 真实区版迁入 C++（仿 `SideLayer`）。
+- [ ] Task P2-B2：C++ demand primitive（仍需 1 次 inds 同步）完成 membership + 分配/驱逐/pread/memcpy/更新表。
+- [ ] Task P2-B3：C++ 精确复刻 `_choose_victim`（freq + LRU tie-break）；与 `prefetch_cpp` 统一分配器。
+- [ ] **Task P2-B4（一致性边界，方案 B 强制）**：`resident_experts`（侧区预取过滤要用）、
+  `resident_count`、prefill host `acquire`、`pin`/`prefetch_cpp` 全部改为查询/经由 C++ g_real，
+  否则 Python 影子态与 C++ 真态不一致 → 预取过滤失效/池损坏。native 未编译或超容量时整层回退现路径。
 
 ---
 

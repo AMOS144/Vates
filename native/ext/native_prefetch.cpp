@@ -663,6 +663,74 @@ mx::array materialize_spike(const mx::array& src, uint32_t fillval, mx::StreamOr
                    std::vector<mx::array>{src});
 }
 
+// ====== Phase 2 方案B 机制探针：eval_gpu BODY 里直接读 GPU 算出的 inds 值 ======
+// 命门：不挂完成回调，直接在 eval_gpu 读 inputs[0] 的数据，写 local = inds + offset。
+// 若 MLX 保证 eval_gpu 调用时输入已算完 → local 正确；否则读到脏值。用于判定
+// 「零主线程同步同前向 demand」是否可行（可行则可在 body 里读 inds→pread→写 local→下游 gather）。
+class DemandProbePrimitive : public mx::Primitive {
+ public:
+  DemandProbePrimitive(mx::Stream s, int offset) : Primitive(s), offset_(offset) {}
+  const char* name() const override { return "DemandProbePrimitive"; }
+  void eval_cpu(const std::vector<mx::array>& in, std::vector<mx::array>& out) override {
+    out[0].set_data(mx::allocator::malloc(out[0].nbytes()));
+    mx::array ids = in[0]; ids.eval();
+    const uint32_t* p = ids.data<uint32_t>();
+    int32_t* o = out[0].data<int32_t>();
+    for (size_t i = 0; i < out[0].size(); ++i) o[i] = static_cast<int32_t>(p[i]) + offset_;
+  }
+  void eval_gpu(const std::vector<mx::array>& in, std::vector<mx::array>& out) override {
+    out[0].set_data(mx::allocator::malloc(out[0].nbytes()));
+    mx::array ids = in[0];
+    const uint32_t* p = ids.data<uint32_t>();     // 命门：此刻 inds 是否已算完？
+    int32_t* o = out[0].data<int32_t>();
+    for (size_t i = 0; i < out[0].size(); ++i) o[i] = static_cast<int32_t>(p[i]) + offset_;
+  }
+ private:
+  int offset_;
+};
+
+mx::array demand_probe(const mx::array& inds, int offset, mx::StreamOrDevice s = {}) {
+  return mx::array(inds.shape(), mx::int32,
+                   std::make_shared<DemandProbePrimitive>(mx::to_stream(s), offset),
+                   std::vector<mx::array>{inds});
+}
+
+// 探针2：完成回调里读 inds、写 local=inds+offset。测「回调写的 output 能否被同前向下游读到」
+// （若不能 → 同前向 demand 无法用回调 → 零同步不可行）。
+class DemandProbeHandlerPrimitive : public mx::Primitive {
+ public:
+  DemandProbeHandlerPrimitive(mx::Stream s, int offset) : Primitive(s), offset_(offset) {}
+  const char* name() const override { return "DemandProbeHandlerPrimitive"; }
+  void eval_cpu(const std::vector<mx::array>& in, std::vector<mx::array>& out) override {
+    out[0].set_data(mx::allocator::malloc(out[0].nbytes()));
+    mx::array ids = in[0]; ids.eval();
+    const uint32_t* p = ids.data<uint32_t>();
+    int32_t* o = out[0].data<int32_t>();
+    for (size_t i = 0; i < out[0].size(); ++i) o[i] = static_cast<int32_t>(p[i]) + offset_;
+  }
+  void eval_gpu(const std::vector<mx::array>& in, std::vector<mx::array>& out) override {
+    out[0].set_data(mx::allocator::malloc(out[0].nbytes()));
+    mx::array ids = in[0];
+    const uint32_t* p = ids.data<uint32_t>();
+    int32_t* o = out[0].data<int32_t>();
+    size_t n = out[0].size();
+    int off = offset_;
+    auto& enc = mx::metal::get_command_encoder(stream());
+    MTL::CommandBuffer* cb = enc.get_command_buffer();
+    cb->addCompletedHandler([ids, out0 = out[0], p, o, n, off](MTL::CommandBuffer*) {
+      for (size_t i = 0; i < n; ++i) o[i] = static_cast<int32_t>(p[i]) + off;
+    });
+  }
+ private:
+  int offset_;
+};
+
+mx::array demand_probe_handler(const mx::array& inds, int offset, mx::StreamOrDevice s = {}) {
+  return mx::array(inds.shape(), mx::int32,
+                   std::make_shared<DemandProbeHandlerPrimitive>(mx::to_stream(s), offset),
+                   std::vector<mx::array>{inds});
+}
+
 // dst: 预分配 uint8 [n, stride] MLX 数组(调用方已 eval)；回调把 n 个专家 pread 进它。
 // 返回 dummy(折进图触发)。
 mx::array prefetch_into(
