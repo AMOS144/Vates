@@ -537,15 +537,25 @@ class ResidentExpertPool:
             if self.eviction_policy == "lfu":
                 self._note_access(layer, [int(i) for i in inds.reshape(-1).tolist()])
             return self._pools[layer], local
-        # 真 miss：回退真实区读盘（侧区命中的不会触发），重算 local（再叠加侧区）。
-        # 慢路径本就要 .tolist()，此处一次性把侧区 keys 拉成 set 供成员判断。
+        # 真 miss：eff 已叠加侧区，故 local<0 恰为真 miss（既不在真实区、也不在侧区）。
+        # 用 GPU 布尔索引只取这几个 miss id 回 host，复用 demand 读盘落真实区、补表；
+        # 砍掉整批 .tolist() + 侧区 keys.tolist() + 两个 Python set/成员循环。
+        # LFU 记账取舍：真实区命中的频次 bump 省略（不为精确 LFU 把全部命中 id 拉回 host），
+        # 属启发式精度损失、不影响正确性（详见 spec 2026-07-02-qwen-dual-fallback-native）。
         self.gpu_fallback += 1
-        flat = [int(i) for i in inds.reshape(-1).tolist()]
-        sk = set(int(k) for k in keys.tolist()) if has_side else set()
-        self.hits += sum(1 for e in flat if e in sk)     # 侧区命中计入 hit（与快路径对称），避免 hit_rate 漏计
-        self.acquire(layer, [e for e in flat if e not in sk])   # 仅对非侧区命中的真 miss 读盘(内部已计非侧区频)
-        if self.eviction_policy == "lfu":
-            self._note_access(layer, [e for e in flat if e in sk])   # 补计侧区命中频,避免漏计
+        flat_local = local.reshape(-1)
+        miss_mask = flat_local < 0
+        # MLX 无布尔索引:用 where 把"miss 位置填专家 id、命中位置填 -1"合成一个数组,单次 .tolist()。
+        # 命中位(含侧区)一律 -1 被过滤 → 不需要侧区 keys.tolist() 与 set 成员判断。
+        miss_or_neg = mx.where(miss_mask,
+                               inds.reshape(-1).astype(mx.int32),
+                               mx.array(-1, dtype=mx.int32))
+        miss_host = miss_or_neg.tolist()                     # 唯一同步
+        n_miss_pos = sum(1 for v in miss_host if v >= 0)
+        self.hits += int(inds.size) - n_miss_pos             # 位置口径，与快路径一致
+        miss_ids = [v for v in miss_host if v >= 0]          # 真 miss 专家 id(带重复,acquire 内 dedup)
+        if miss_ids:
+            self.acquire(layer, miss_ids)                    # dedup+note_access+pread+落池+补表
         base = self._slot_table[layer]
         eff = mx.array(base) if has_side else base
         if has_side:
