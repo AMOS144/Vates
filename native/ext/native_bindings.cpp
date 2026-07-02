@@ -108,6 +108,8 @@ NB_MODULE(native_moe_ext, m) {
         "side_gen"_a, "path"_a, "stride"_a, "cap"_a, "lfu"_a, "decay_interval"_a, nb::kw_only(),
         "stream"_a = nb::none());
   m.def("demand_last_stats", &demand_last_stats);
+  m.def("demand_timings", &demand_timings);
+  m.def("demand_timing_enable", &demand_timing_enable, "on"_a);
   m.def("real_debug_place", &real_debug_place, "layer"_a, "experts_flat"_a, "cap"_a, "lfu"_a,
         "decay_interval"_a);
   m.def("real_freq", &real_freq, "layer"_a, "e"_a);
@@ -120,7 +122,7 @@ NB_MODULE(native_moe_ext, m) {
   m.def("bg_reader_stop", &bg_reader_stop);
   m.def("bg_pread_into_pool", &bg_pread_into_pool,
         "dst"_a, "seg_off"_a, "seg_nb"_a, "slot"_a, "expert"_a,
-        "path"_a, "stride"_a, "ticket"_a, "prio"_a = 0);
+        "path"_a, "stride"_a, "ticket"_a, "prio"_a = 0, "nocache"_a = true);
   m.def(
       "fused_moe_slots",
       &fused_moe_slots,

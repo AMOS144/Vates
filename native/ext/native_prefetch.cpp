@@ -655,6 +655,20 @@ static std::map<int, RealLayer> g_real;
 // demand 统计：累计 + 本次(供 Python 更新 rp.hits/misses/gpu_fastpath/gpu_fallback)。
 static std::mutex g_dstat_mutex;
 static long g_d_last[4] = {0, 0, 0, 0};      // 本次 [hitpos, misspos, loads, fallback01]
+static std::atomic<long> g_demand_ticket{1000000000};   // demand 并行 pread 用的独立 ticket 段
+
+// 诊断计时(DEMAND_TIMING=1)：累计各段主线程微秒，供定位结构性开销。默认关。
+static bool g_dt_on = false;
+static double g_dt[6] = {0, 0, 0, 0, 0, 0};  // [inds_eval, pool_eval, side_snap, real_lock, core, build]
+static inline double dt_now_us() {
+  return std::chrono::duration<double, std::micro>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+std::vector<double> demand_timings() { return {g_dt[0], g_dt[1], g_dt[2], g_dt[3], g_dt[4], g_dt[5]}; }
+void demand_timing_enable(bool on) {
+  g_dt_on = on;
+  for (int i = 0; i < 6; ++i) g_dt[i] = 0;
+}
 
 static void real_ensure_locked(RealLayer& c, int cap) {
   if (c.inited) return;
@@ -740,13 +754,12 @@ static void note_access_locked(RealLayer& c, const std::vector<int>& uniq_access
   }
 }
 
-// 核心状态机：给定 host inds(ip[n]) + 侧区快照(side) + 池指针(ptrs 可空=纯状态推进不落盘)，
-// 算 local、分配 miss 槽、(可选)pread+memcpy 落真实区行。返回 local(int32 vector)。
-// 落盘失败/超容量的 miss 位置 local 兜底为 0。stats: [hitpos, misspos, loads]。
+// 核心状态机（纯 CPU、无 I/O）：给定 host inds(ip[n]) + 侧区快照(side)，算 local、分配 miss 槽，
+// 把需要落盘的新放入 (expert, slot) 追加到 placements（字节由调用方在锁外并行 pread 落池）。
+// 返回 local(int32 vector)。stats: [hitpos, misspos, loads(=placements 数)]。
 static std::vector<int32_t> demand_core_locked(
     RealLayer& c, const uint32_t* ip, size_t n, const std::unordered_map<int, int>& side,
-    const std::vector<uint8_t*>* ptrs, const std::vector<int>& seg, const std::string& path,
-    int stride, bool lfu, int decay_interval, long stats[3]) {
+    bool lfu, int decay_interval, std::vector<std::pair<int, int>>& placements, long stats[3]) {
   std::vector<int32_t> local(n, -1);
   std::vector<int> uniq_miss, access_order;
   std::unordered_set<int> miss_seen, access_seen;
@@ -762,36 +775,15 @@ static std::vector<int32_t> demand_core_locked(
     if (miss_seen.insert(e).second) uniq_miss.push_back(e);
   }
   note_access_locked(c, access_order, lfu, decay_interval);
-  // pass2：miss 分配槽 + (可选)pread+按段 memcpy。
-  // current = 本前向全部唯一路由专家(命中+miss)：绝不驱逐本前向要读的任何专家的槽
-  //（否则真实区命中专家的槽被 miss 复写 → 其 local 读到脏字节。比 Python 仅护 miss 更严格、更正确）。
+  // pass2：miss 分配槽（不落盘）。current = 本前向全部唯一路由专家(命中+miss)：绝不驱逐本前向要读的
+  // 任何专家的槽（否则真实区命中专家的槽被 miss 复写 → 脏字节。比 Python 仅护 miss 更严格、更正确）。
   std::unordered_map<int, int> new_slot;
-  int loads = 0, fd = -1;
-  std::vector<uint8_t> tmp(ptrs ? static_cast<size_t>(stride) : 0);
-  static const bool kSkipIO = []() {                           // 诊断:跳过 pread/memcpy(仅测 I/O 成本)
-    const char* e = std::getenv("DEMAND_SKIP_IO");
-    return e && e[0] == '1';
-  }();
   for (int e : uniq_miss) {
     int slot = alloc_slot_locked(c, e, access_seen);
     if (slot < 0) { new_slot[e] = 0; continue; }               // 超容量兜底
-    if (ptrs && !kSkipIO) {
-      if (fd < 0) { fd = ::open(path.c_str(), O_RDONLY); if (fd < 0) { new_slot[e] = slot; continue; } }
-      if (::pread(fd, tmp.data(), stride, static_cast<off_t>(static_cast<size_t>(e) * stride))
-          == static_cast<ssize_t>(stride)) {
-        size_t off = 0;
-        for (size_t k = 0; k < seg.size(); ++k) {
-          std::memcpy((*ptrs)[k] + static_cast<size_t>(slot) * seg[k], tmp.data() + off, seg[k]);
-          off += static_cast<size_t>(seg[k]);
-        }
-        ++loads;
-      }
-    } else {
-      ++loads;
-    }
     new_slot[e] = slot;
+    placements.emplace_back(e, slot);
   }
-  if (fd >= 0) ::close(fd);
   // pass3：回填 miss 位置。
   int misspos = 0;
   for (size_t i = 0; i < n; ++i) {
@@ -801,7 +793,7 @@ static std::vector<int32_t> demand_core_locked(
       ++misspos;
     }
   }
-  stats[0] = hitpos; stats[1] = misspos; stats[2] = loads;
+  stats[0] = hitpos; stats[1] = misspos; stats[2] = static_cast<long>(placements.size());
   return local;
 }
 
@@ -813,34 +805,70 @@ mx::array demand_dual(
     int stride, int cap, bool lfu, int decay_interval, mx::StreamOrDevice s = {}) {
   if (seg_nbytes.size() != pool_list.size())
     throw std::invalid_argument("demand_dual: seg_nbytes.size() != pool_list.size()");
+  double t0 = g_dt_on ? dt_now_us() : 0;
   mx::array ids = inds;
   ids.eval();                                   // 唯一同步
   size_t n = ids.size();
   const uint32_t* ip = ids.data<uint32_t>();
+  double t1 = g_dt_on ? dt_now_us() : 0;
   std::vector<uint8_t*> ptrs;
   ptrs.reserve(pool_list.size());
   for (auto& a0 : pool_list) { mx::array a = a0; a.eval(); ptrs.push_back(a.data<uint8_t>()); }
+  double t2 = g_dt_on ? dt_now_us() : 0;
   std::unordered_map<int, int> side;            // 侧区快照(该代)
   {
     std::lock_guard<std::mutex> lk(g_side_mutex);
     auto it = g_side.find({layer, side_gen});
     if (it != g_side.end()) for (auto& p : it->second.e2r) side[p.first] = p.second;
   }
+  double ta = g_dt_on ? dt_now_us() : 0;
   long stats[3];
   std::vector<int32_t> local;
+  std::vector<std::pair<int, int>> placements;   // (expert, slot)：锁外并行落盘
+  double tb;
   {
     std::lock_guard<std::mutex> lk(g_real_mutex);
+    tb = g_dt_on ? dt_now_us() : 0;
     RealLayer& c = g_real[layer];
     real_ensure_locked(c, cap);
-    local = demand_core_locked(c, ip, n, side, &ptrs, seg_nbytes, path, stride, lfu,
-                               decay_interval, stats);
+    local = demand_core_locked(c, ip, n, side, lfu, decay_interval, placements, stats);
   }
+  // 锁外：把 miss 专家的字节 pread 落真实区槽。复刻基线并发模型——多 miss 派给 BgReader worker
+  // 并行 pread（高优队列、直写池段行，无主线程 tmp/memcpy），本层等待其完成（并行 → 远快于串行）。
+  static const bool kSkipIO = []() {
+    const char* e = std::getenv("DEMAND_SKIP_IO");
+    return e && e[0] == '1';
+  }();
+  if (!placements.empty() && !kSkipIO) {
+    std::vector<long> seg_off(seg_nbytes.size()), seg_nb(seg_nbytes.size());
+    long acc = 0;
+    for (size_t k = 0; k < seg_nbytes.size(); ++k) {
+      seg_off[k] = acc; seg_nb[k] = seg_nbytes[k]; acc += seg_nbytes[k];
+    }
+    std::vector<long> tickets;
+    tickets.reserve(placements.size());
+    for (auto& pr : placements) {
+      long tk = g_demand_ticket.fetch_add(1);
+      bg_pread_into_pool(pool_list, seg_off, seg_nb, pr.second, pr.first, path,
+                         static_cast<long>(stride), tk, /*prio=*/1,
+                         /*nocache=*/false);          // demand route 读走 cache：段偏移非页对齐
+      tickets.push_back(tk);
+    }
+    for (long tk : tickets) bg_reader_wait(tk);   // 并行 pread 完成 → 池槽字节就绪
+  }
+  double t3 = g_dt_on ? dt_now_us() : 0;
   {
     std::lock_guard<std::mutex> lk(g_dstat_mutex);
     g_d_last[0] = stats[0]; g_d_last[1] = stats[1]; g_d_last[2] = stats[2];
     g_d_last[3] = (stats[1] == 0) ? 0 : 1;
   }
-  return mx::array(local.data(), ids.shape(), mx::int32);
+  mx::array out = mx::array(local.data(), ids.shape(), mx::int32);
+  if (g_dt_on) {
+    double t4 = dt_now_us();
+    g_dt[0] += t1 - t0; g_dt[1] += t2 - t1; g_dt[2] += ta - t2;
+    g_dt[3] += tb - ta; g_dt[4] += t3 - tb; g_dt[5] += t4 - t3;
+  }
+  return out;
 }
 
 // 取本次 demand 统计 [hitpos, misspos, loads, fallback01]（主线程串行，安全）。
@@ -855,13 +883,13 @@ std::vector<int> real_debug_place(int layer, const std::vector<int>& experts_fla
                                   bool lfu, int decay_interval) {
   std::vector<uint32_t> u(experts_flat.begin(), experts_flat.end());
   long stats[3];
+  std::vector<std::pair<int, int>> placements;
   std::lock_guard<std::mutex> lk(g_real_mutex);
   RealLayer& c = g_real[layer];
   real_ensure_locked(c, cap);
   std::unordered_map<int, int> empty_side;
-  std::vector<int> seg;
-  auto local = demand_core_locked(c, u.data(), u.size(), empty_side, nullptr, seg, "", 0,
-                                  lfu, decay_interval, stats);
+  auto local = demand_core_locked(c, u.data(), u.size(), empty_side, lfu, decay_interval,
+                                  placements, stats);
   return std::vector<int>(local.begin(), local.end());
 }
 
@@ -995,6 +1023,8 @@ struct BgJob {
   std::vector<mx::array> keep;     // 持 buffer 引用，保证 dst 指针在读期间存活
   std::function<void()> task;      // 若设置，worker 直接执行它（侧区异步读用），不走 ops/ticket
   int prio = 0;                    // >0=高优(route 读)，=0=低优(投机兜底)
+  bool nocache = true;             // demand（route）读设 false 走 page cache：段偏移非页对齐，
+                                   // F_NOCACHE 下多 MB 非对齐 pread 会短读 → 池槽脏字节（实测）。
 };
 
 // 双队列 + 低优并发上限：高优(route)读永远优先取、且独占大多数 worker；
@@ -1067,11 +1097,19 @@ class BgReader {
       if (job.task) { job.task(); }                    // 通用任务（侧区异步读）：直接执行，无 ticket
       else {
         int fd;
-        auto it = fds.find(job.path);
-        if (it == fds.end()) { fd = open_blob_nocache(job.path.c_str()); fds[job.path] = fd; }
-        else fd = it->second;
+        std::string key = (job.nocache ? "N:" : "C:") + job.path;   // 按 nocache 分别缓存 fd
+        auto it = fds.find(key);
+        if (it == fds.end()) {
+          fd = job.nocache ? open_blob_nocache(job.path.c_str()) : ::open(job.path.c_str(), O_RDONLY);
+          fds[key] = fd;
+        } else fd = it->second;
         if (fd >= 0)
-          for (auto& op : job.ops) ::pread(fd, op.dst, op.nbytes, op.file_off);
+          for (auto& op : job.ops) {
+            ssize_t got = ::pread(fd, op.dst, op.nbytes, op.file_off);
+            if (got != static_cast<ssize_t>(op.nbytes))
+              fprintf(stderr, "[bg pread SHORT] got=%zd want=%zu off=%lld\n",
+                      got, op.nbytes, static_cast<long long>(op.file_off));
+          }
         { std::lock_guard<std::mutex> lk2(dm_); done_.insert(job.ticket); }
         dcv_.notify_all();
       }
@@ -1121,11 +1159,12 @@ long bg_pread_into_pool(
     const std::vector<long>& seg_off,
     const std::vector<long>& seg_nb,
     long slot, long expert,
-    const std::string& path, long stride, long ticket, int prio) {
+    const std::string& path, long stride, long ticket, int prio, bool nocache) {
   BgJob job;
   job.path = path;
   job.ticket = ticket;
   job.prio = prio;
+  job.nocache = nocache;
   for (size_t i = 0; i < dst.size(); ++i) {
     mx::array d = dst[i];
     d.eval();

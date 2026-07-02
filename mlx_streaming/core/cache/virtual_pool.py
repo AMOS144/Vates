@@ -15,7 +15,12 @@
 - 调度器：VirtualPool(num_layers=.., cutoff=.., ahead_lo=.., ahead_hi=..)
 - 协调器：VirtualPool(resident, staging, spec_slots)，dual-source 下再补调度参数即可两职合一。
 """
+import mlx.core as mx
+
 from mlx_streaming.core.prefetch.native_staging import _StagingSide
+
+# 方案B STG_VERIFY 校验累计态（诊断用，默认路径不触及）。
+_stg_verify_state = {"ok": 0, "bad": 0, "printed": 0, "calls": 0}
 
 
 class VirtualPool:
@@ -94,17 +99,37 @@ class VirtualPool:
         pool, local = self._rp.acquire_gpu(layer, inds, num_experts)
         return pool, local, cap
 
+    def _native_meta(self, layer):
+        """缓存每层 demand_dual 的不变入参（pool_list/seg_nbytes/path），避免逐层重建 host 胶水。"""
+        cache = getattr(self, "_nd_meta", None)
+        if cache is None:
+            cache = self._nd_meta = {}
+        m = cache.get(layer)
+        if m is None:
+            stg = self._stg
+            segs = stg.src._segs                             # (proj, tensor, dt, shape, nb)，与池 key 同序
+            pool_list = [self._rp._pools[layer][f"{p}.{t}"] for p, t, *_ in segs]
+            m = (pool_list, [int(nb) for *_, nb in segs],
+                 f"{stg.src.dir}/layer{int(layer):02d}.blob", int(stg.stride))
+            cache[layer] = m
+        return m
+
     def _acquire_native(self, layer, inds, side_gen, cap):
-        """方案B 取用：委派 C++ demand_dual，更新 rp 统计计数（供报告口径一致）。"""
+        """方案B 取用：委派 C++ demand_dual（每层 1 次 inds 同步 + 并行 worker pread 落池），
+        更新 rp 统计计数（供报告口径一致）。"""
         import mlx_streaming.native_moe_ext as N
-        rp, stg = self._rp, self._stg
+        rp = self._rp
+        # 方案B 容量前提：真实区仅 cap 槽，本次唯一路由专家数 ≤ inds.size。若 inds.size > cap，
+        # 会超容量（多余 miss 落槽0/脏字节）→ 逐位不再正确。用 shape 判定(无同步)，一次性告警。
+        if int(inds.size) > int(cap) and not getattr(self, "_overcap_warned", False):
+            self._overcap_warned = True
+            import sys
+            print(f"[NATIVE_DEMAND_DUAL] 警告：inds.size={int(inds.size)} > cap={int(cap)}，"
+                  f"真实区超容量，逐位将不正确。请将 EXPERT_SLOTS 提到 ≥ seq·top_k。", file=sys.stderr, flush=True)
         rp._bootstrap_dual_pool(layer)                       # 首次建池 + real_init（幂等）
-        segs = stg.src._segs                                 # (proj, tensor, dt, shape, nb)，与池 key 同序
-        pool_list = [rp._pools[layer][f"{p}.{t}"] for p, t, *_ in segs]
-        seg_nbytes = [int(nb) for *_, nb in segs]
-        path = f"{stg.src.dir}/layer{int(layer):02d}.blob"
+        pool_list, seg_nbytes, path, stride = self._native_meta(layer)
         local = N.demand_dual(inds, pool_list, seg_nbytes, int(layer), int(side_gen), path,
-                              int(stg.stride), int(cap),
+                              stride, int(cap),
                               rp.eviction_policy == "lfu", int(rp.lfu_decay_interval))
         st = N.demand_last_stats()                           # [hitpos, misspos, loads, fallback01]
         rp.hits += st[0]
@@ -113,7 +138,47 @@ class VirtualPool:
             rp.gpu_fastpath += 1
         else:
             rp.gpu_fallback += 1
+        from mlx_streaming import config
+        if config.stg_verify():                              # 诊断:方案B 池字节逐 key 真值校验(默认关)
+            self._verify_native_bytes(layer, inds, local)
         return rp._pools[layer], local
+
+    def _verify_native_bytes(self, layer, inds, local):
+        """诊断(STG_VERIFY，方案B)：校验「字节落池不变量」——真实区每个占用槽的池字节 == 该槽当前
+        C++ 属主专家(g_real)的 blob 真值。这是 C++ 接管落池的字节等价铁证；发现不一致即池装错字节。
+
+        注：不以 local→expert 为判据（local 可能因跨调用/多模型共享 g_real 而滞后于 g_real，属路由级
+        问题、非落池字节问题；逐位权威信号是 e2e n_mismatch）。
+        """
+        st = _stg_verify_state
+        st["calls"] += 1
+        pool = self._rp._pools.get(layer)
+        if pool is None:
+            return
+        import mlx_streaming.native_moe_ext as N
+        stg = self._stg
+        path = f"{stg.src.dir}/layer{int(layer):02d}.blob"
+        segs = stg.src._segs
+        flat = N.real_region_contents(int(layer))               # [expert0,slot0,expert1,slot1,...]
+        for j in range(0, len(flat), 2):
+            e, slot = flat[j], flat[j + 1]
+            raw = N.blob_load(path, mx.array([e], dtype=mx.uint32), int(stg.stride))[0]
+            bad, off = None, 0
+            for p, t, dt, shape, nb in segs:
+                k = f"{p}.{t}"
+                pv = pool[k][slot].reshape(-1).view(mx.uint8)
+                if not bool(mx.all(pv == raw[off:off + nb])):
+                    bad = k
+                    break
+                off += nb
+            if bad is None:
+                st["ok"] += 1
+            else:
+                st["bad"] += 1
+                if st["printed"] < 12:
+                    st["printed"] += 1
+                    print(f"[STG_VERIFY-DUAL] BAD 落池字节错 call={st['calls']} layer={layer} "
+                          f"expert={e} slot={slot} key={bad} (ok={st['ok']} bad={st['bad']})", flush=True)
 
     def acquire_host(self, layer, flat, inds_shape, inds_dtype, layer_cap):
         """host/fetch 路径收口（prefill/大 seq 或关 GPU-remap）：flat 为 host 侧路由 id 列表。

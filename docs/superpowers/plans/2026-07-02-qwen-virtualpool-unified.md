@@ -472,12 +472,22 @@ git add -A && git commit -m "chore: 移除 Phase 0 go/no-go throwaway 探针"
 - [ ] Task P2-C3：LFU 记账保持 Python 侧现语义（`_note_access` 复用）。
 - [ ] Task P2-C4：字节等价单测（`STG_VERIFY` 风格）+ A/B 实测（保守目标 ≥ +100%）。
 
-> **【实测结论 2026-07-02，方案 B 已落地并证伪】** 方案 B 全部实现完成、单测全绿、逐位正确，
-> 但实测比基线**慢 2.6×**（4.09 vs 10.78 tok/s）。DEMAND_SKIP_IO 探针证明瓶颈是**同步 demand 调用
-> 本身的结构性开销**（每层一次同步打断 MLX 跨层惰性流水线重叠），与磁盘 I/O 无关；且「ON 做更少的活
-> 却更慢」佐证根因。Phase 0 的 +174% 上界因「跳过 demand I/O+落池（数值错误）」而不可达。
+> **【实测结论 2026-07-02，方案 B 同步版已落地并证伪】** 方案 B 全部实现完成、单测全绿、逐位正确，
+> 但（同步内联 pread 版）实测比基线**慢 2.6×**（4.09 vs 10.78 tok/s）。DEMAND_SKIP_IO 探针证明瓶颈是
+> **同步 demand 调用本身的结构性开销**（每层一次同步打断 MLX 跨层惰性流水线重叠），与磁盘 I/O 无关。
 > 详见 `benchmarks/reports/virtualpool-phase2-schemeB-2026-07-02.md`。
-> **建议默认 `NATIVE_DEMAND_DUAL=0`；收益方向应回到「削减 Python 胶水但保持重叠」（方案 C）。**
+
+> **【修正结论 2026-07-02，方案 B 异步并行版已根治性能回归】** 用户指出「慢是实现 bug（同步内联
+> pread），非 C++ 接管本身」，正确。**保留每层 1 次 `inds.eval()` 同步，把 demand 从「调用线程内联
+> 阻塞 pread」改成「派 `BgReader` worker 线程并行 pread 进池 buffer + 惰性 gather」**（复刻基线
+> `blob_loader` 的 8-worker 并行读 + 惰性 scatter 重叠模型），只动 I/O 并发模型、未动状态机：
+> - **性能回归根治**：ON tok/s 从 4.09 → **≥ 基线**。cap=32：**11.82 vs 11.16（+5.9%）**；
+>   cap=64：**19.22 vs 13.86（+38.7% 净收益）**。容量越充裕，削 Python 胶水 + C++ 精确 LFU 的净收益越大。
+> - **字节落池不变量校验 0 错**（STG_VERIFY）；单测 10 项全绿。
+> - **残留**：ON n_mismatch 恒 61（与容量无关，且与同步版逐字节相同）→ 方案 B 侧区∪真实区合并 local
+>   的**既有**路由差异，非本次异步化引入。属路由级、不影响 tok/s/内存。
+> 详见 `benchmarks/reports/virtualpool-phase2-schemeB-async-2026-07-02.md`。
+> **建议默认 `NATIVE_DEMAND_DUAL=0`（opt-in）；启用时须 `EXPERT_SLOTS ≥ seq·top_k`。**
 
 ### 方案 B（1 次同步版，用户拍板选定）：C++ 完全接管真实区槽状态
 

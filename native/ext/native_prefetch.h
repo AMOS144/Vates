@@ -66,6 +66,8 @@ mx::array demand_dual(
     const std::vector<int>& seg_nbytes, int layer, int side_gen, const std::string& path,
     int stride, int cap, bool lfu, int decay_interval, mx::StreamOrDevice s);
 std::vector<long> demand_last_stats();                    // [hitpos, misspos, loads, fallback01]
+std::vector<double> demand_timings();                     // [inds_eval, pool_eval, state, build] us
+void demand_timing_enable(bool on);
 // 测试壳：纯状态推进(不 pread/不侧区)，返回 local 槽位；供 LFU 驱逐等价对拍。
 std::vector<int> real_debug_place(int layer, const std::vector<int>& experts_flat, int cap,
                                   bool lfu, int decay_interval);
@@ -84,4 +86,4 @@ long bg_pread_into_pool(
     const std::vector<long>& seg_off,
     const std::vector<long>& seg_nb,
     long slot, long expert,
-    const std::string& path, long stride, long ticket, int prio = 0);
+    const std::string& path, long stride, long ticket, int prio = 0, bool nocache = true);

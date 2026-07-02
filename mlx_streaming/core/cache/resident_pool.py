@@ -90,6 +90,20 @@ class ResidentExpertPool:
                 self._native_demand = hasattr(_N, "demand_dual")
             except Exception:
                 self._native_demand = False
+        if self._native_demand:
+            # 复刻基线 8-worker 并行读：demand miss 的 pread 派给 BgReader 并行执行（高优队列）。
+            import mlx_streaming.native_moe_ext as _N
+            try:
+                _N.bg_reader_start(int(os.environ.get("DEMAND_WORKERS", "8")), 0)
+            except Exception:
+                pass
+        if self._native_demand and os.environ.get("DEMAND_TIMING") == "1":
+            import atexit
+            import mlx_streaming.native_moe_ext as _N
+            _N.demand_timing_enable(True)
+            atexit.register(lambda: print(
+                "[DEMAND_TIMING ms] inds/pool/side_snap/real_lock/core/build =",
+                [round(x / 1e3, 1) for x in _N.demand_timings()], flush=True))
 
     def cap_for(self, layer: int) -> int:
         """该层池容量：profile 指定则用之(上限 capacity)，否则用全局 capacity。"""
