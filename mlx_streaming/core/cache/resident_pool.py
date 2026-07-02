@@ -527,7 +527,21 @@ class ResidentExpertPool:
         if has_side:
             eff[keys] = vals                             # vals 为 int32，与 base.dtype 一致
         local = mx.take(eff, inds)
+        if config.probe_all_hit_lazy() and layer in self._pools:
+            # Phase 0 上界探针(throwaway):池已建时跳过 n_miss 同步与 demand 回退,全当命中、
+            # 整前向惰性搭图,量「零 per-layer 同步」的 tok/s 上界(缺失专家读脏字节 → 数值错,仅测速)。
+            # 池未建(首 token 预热)则落到下面正常路径先把池建起来。
+            self.gpu_fastpath += 1
+            return self._pools[layer], local
         n_miss = int(mx.sum((local < 0).astype(mx.int32)))   # 唯一同步（与 demand 同）
+        if config.probe_no_demand() and layer in self._pools:
+            # Phase 0 探针2(throwaway):保留上面的 n_miss 同步 barrier,但跳过 demand 读盘+落池,
+            # miss 位置返回脏 local(仅测速)。与探针1 对比可拆分「barrier」vs「demand I/O+落池」成本。
+            if n_miss == 0:
+                self.gpu_fastpath += 1
+            else:
+                self.gpu_fallback += 1
+            return self._pools[layer], local
         if n_miss == 0:
             if _DUAL_VERIFY and has_side:
                 sc = {int(k): int(v) for k, v in zip(keys.tolist(), vals.tolist())}
