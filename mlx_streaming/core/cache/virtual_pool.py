@@ -81,12 +81,39 @@ class VirtualPool:
         """
         cap = int(layer_cap) if layer_cap is not None else self._rp.cap_for(layer)
         if self._stg is not None and self._spec > 0:
-            side = _StagingSide(self._stg, self.read_gen())
-            pool, local = self._rp.acquire_gpu_dual(layer, inds, num_experts, side)
+            side_gen = self.read_gen()
+            # 方案B：C++ demand_dual 全接管真实区（每层 1 次 inds 同步、零主线程落池/记账）。
+            # pinned 非空的层不支持（方案B 假设 PIN_HOT=0），退回 Python 权威路径。
+            if getattr(self._rp, "_native_demand", False) and not self._rp._pinned.get(layer):
+                pool, local = self._acquire_native(layer, inds, side_gen, cap)
+            else:
+                side = _StagingSide(self._stg, side_gen)
+                pool, local = self._rp.acquire_gpu_dual(layer, inds, num_experts, side)
             n_exp = cap + self._rp.spec_gens * self._rp.spec_slots
             return pool, local, n_exp
         pool, local = self._rp.acquire_gpu(layer, inds, num_experts)
         return pool, local, cap
+
+    def _acquire_native(self, layer, inds, side_gen, cap):
+        """方案B 取用：委派 C++ demand_dual，更新 rp 统计计数（供报告口径一致）。"""
+        import mlx_streaming.native_moe_ext as N
+        rp, stg = self._rp, self._stg
+        rp._bootstrap_dual_pool(layer)                       # 首次建池 + real_init（幂等）
+        segs = stg.src._segs                                 # (proj, tensor, dt, shape, nb)，与池 key 同序
+        pool_list = [rp._pools[layer][f"{p}.{t}"] for p, t, *_ in segs]
+        seg_nbytes = [int(nb) for *_, nb in segs]
+        path = f"{stg.src.dir}/layer{int(layer):02d}.blob"
+        local = N.demand_dual(inds, pool_list, seg_nbytes, int(layer), int(side_gen), path,
+                              int(stg.stride), int(cap),
+                              rp.eviction_policy == "lfu", int(rp.lfu_decay_interval))
+        st = N.demand_last_stats()                           # [hitpos, misspos, loads, fallback01]
+        rp.hits += st[0]
+        rp.misses += st[2]
+        if st[3] == 0:
+            rp.gpu_fastpath += 1
+        else:
+            rp.gpu_fallback += 1
+        return rp._pools[layer], local
 
     def acquire_host(self, layer, flat, inds_shape, inds_dtype, layer_cap):
         """host/fetch 路径收口（prefill/大 seq 或关 GPU-remap）：flat 为 host 侧路由 id 列表。

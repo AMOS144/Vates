@@ -80,6 +80,16 @@ class ResidentExpertPool:
         # GPU remap 路径取证:命中层走纯 GPU 快路径次数 vs 有 miss 回退 host 次数
         self.gpu_fastpath = 0
         self.gpu_fallback = 0
+        # 方案B(1 次同步版)：dual 路径真实区槽状态由 C++ demand_dual 全接管。仅当开关开、spec 模式、
+        # native 已编译时启用；否则保持 Python 权威路径。启用后 _slot_of/_free/_freq 在 dual 路径
+        # 不再维护(死影子)，resident_experts/_count 改查 C++ g_real（预取过滤要用）。
+        self._native_demand = False
+        if int(spec_slots) > 0 and config.native_demand_dual():
+            try:
+                import mlx_streaming.native_moe_ext as _N
+                self._native_demand = hasattr(_N, "demand_dual")
+            except Exception:
+                self._native_demand = False
 
     def cap_for(self, layer: int) -> int:
         """该层池容量：profile 指定则用之(上限 capacity)，否则用全局 capacity。"""
@@ -170,11 +180,37 @@ class ResidentExpertPool:
             pool[k][idx] = mx.stack([e[k] for e in experts], axis=0)
 
     def resident_count(self, layer: int) -> int:
+        if self._native_demand:                      # 方案B：C++ g_real 为真实区权威
+            import mlx_streaming.native_moe_ext as N
+            return int(N.real_region_count(int(layer)))
         return len(self._slot_of.get(layer, ()))
 
     def resident_experts(self, layer: int) -> set[int]:
-        """返回该层 resident pool 里当前已有的专家 id 集合（trace/probe 用）。"""
+        """返回该层 resident pool 里当前已有的专家 id 集合（trace/probe + 侧区预取过滤用）。"""
+        if self._native_demand:                      # 方案B：查 C++ g_real，保预取过滤一致
+            import mlx_streaming.native_moe_ext as N
+            flat = N.real_region_contents(int(layer))
+            return {int(flat[i]) for i in range(0, len(flat), 2)}
         return set(self._slot_of.get(layer, {}).keys())
+
+    def _bootstrap_dual_pool(self, layer: int) -> None:
+        """方案B：首次为该层预分配满(cap+spec_gens*spec)池、eval 固定 data 指针 + C++ real_init。幂等。
+
+        池结构(per-key typed 数组)由 Python 从一个样本专家的 shape 建；字节后续由 C++ demand pread 写入。
+        Python 侧 _slot_of/_free 在方案B dual 路径不再使用（真实区状态归 C++ g_real）。
+        """
+        self._ensure_layer(layer)
+        if layer not in self._pools:
+            sample = self.loader(layer, 0)           # 仅取 shape/dtype，不写入池
+            cap = self.cap_for(layer)
+            n = cap + self.spec_gens * self.spec_slots
+            self._pools[layer] = {
+                k: mx.zeros((n,) + v.shape, dtype=v.dtype) for k, v in sample.items()
+            }
+            mx.eval(list(self._pools[layer].values()))   # 固定 data 指针，供 C++ memcpy
+            self._alloc[layer] = n
+            import mlx_streaming.native_moe_ext as N
+            N.real_init(int(layer), int(cap))
 
     def resident_lru_scores(self, layer: int) -> dict[int, float]:
         """返回 resident 专家的 LRU 新近度分数：0=最久未用，1=最近使用。"""

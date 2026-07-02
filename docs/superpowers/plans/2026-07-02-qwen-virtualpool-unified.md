@@ -472,14 +472,63 @@ git add -A && git commit -m "chore: 移除 Phase 0 go/no-go throwaway 探针"
 - [ ] Task P2-C3：LFU 记账保持 Python 侧现语义（`_note_access` 复用）。
 - [ ] Task P2-C4：字节等价单测（`STG_VERIFY` 风格）+ A/B 实测（保守目标 ≥ +100%）。
 
-### 方案 B（1 次同步版；不推荐——高风险且无额外收益，仅在用户坚持 C++ 拥有槽状态时）
+> **【实测结论 2026-07-02，方案 B 已落地并证伪】** 方案 B 全部实现完成、单测全绿、逐位正确，
+> 但实测比基线**慢 2.6×**（4.09 vs 10.78 tok/s）。DEMAND_SKIP_IO 探针证明瓶颈是**同步 demand 调用
+> 本身的结构性开销**（每层一次同步打断 MLX 跨层惰性流水线重叠），与磁盘 I/O 无关；且「ON 做更少的活
+> 却更慢」佐证根因。Phase 0 的 +174% 上界因「跳过 demand I/O+落池（数值错误）」而不可达。
+> 详见 `benchmarks/reports/virtualpool-phase2-schemeB-2026-07-02.md`。
+> **建议默认 `NATIVE_DEMAND_DUAL=0`；收益方向应回到「削减 Python 胶水但保持重叠」（方案 C）。**
 
-- [ ] Task P2-B1：`_slot_of/_free/freq` 真实区版迁入 C++（仿 `SideLayer`）。
-- [ ] Task P2-B2：C++ demand primitive（仍需 1 次 inds 同步）完成 membership + 分配/驱逐/pread/memcpy/更新表。
-- [ ] Task P2-B3：C++ 精确复刻 `_choose_victim`（freq + LRU tie-break）；与 `prefetch_cpp` 统一分配器。
-- [ ] **Task P2-B4（一致性边界，方案 B 强制）**：`resident_experts`（侧区预取过滤要用）、
-  `resident_count`、prefill host `acquire`、`pin`/`prefetch_cpp` 全部改为查询/经由 C++ g_real，
-  否则 Python 影子态与 C++ 真态不一致 → 预取过滤失效/池损坏。native 未编译或超容量时整层回退现路径。
+### 方案 B（1 次同步版，用户拍板选定）：C++ 完全接管真实区槽状态
+
+> 用户已知悉「零同步不可行」结论，仍选方案 B：每层 1 次 inds 同步（不可避免，替换现有
+> `int(mx.sum)`+`.tolist` 两次同步为一次），但真实区 `_slot_of/_free/freq` 全由 C++ 拥有。
+
+**语义基线（必须复刻，取自 `acquire_gpu_dual` + `acquire`/`_alloc_slot`/`_choose_victim`）：**
+- 成员优先级：`eff=base∪side` 且 `eff[keys]=vals` → **侧区覆盖真实区**（同 expert 两处都有时用侧区行）。
+- 槽分配：free 优先（`free.pop(0)`，spec 模式 free 初始 `[0..cap)`）；free 空 → LFU 驱逐，
+  受害者槽**直接复用**（不回 free）。
+- `_choose_victim`：candidates = `slot_of` 插入序中「非 pinned 且非 current(本步 miss 集)」者；
+  victim = `min(freq, 候选下标)` → freq 最小、并列取插入序最早。驱逐**不删 freq**（与 Python 一致）。
+- LRU 序：dual 模式真实区命中**不** move_to_end（快路径不过 `acquire`）；只有新放入的 miss 追加到序尾。
+- freq bump（LFU）：canonical 策略统一为「本次 inds 全部唯一专家各 +1」（对齐快路径 `_note_access(all)`，
+  比基线「快路径 bump 全部 / 回退仅 bump miss uniq」的不一致更正确；由 n_mismatch/hit 不劣化验证）。
+- decay：累计访问达 `lfu_decay_interval` 则 `freq//=2`、去 0（同 `_note_access`）。
+- 统计口径：`hits += 命中位置数`、`misses += 本次新读入唯一专家数(=disk_loads)`；
+  无 miss 位 → `gpu_fastpath+1`，否则 `gpu_fallback+1`。
+
+**一致性边界（P2-B4，方案 B 强制）：** 开 `NATIVE_DEMAND_DUAL=1` 后，dual 路径真实区状态由 C++
+`g_real` 唯一拥有，Python `_slot_of/_free/_freq/_slot_table` 在该路径**不再维护**（成为死影子）。
+- `resident_experts(layer)`（侧区预取 `submit_pool_sideregion` 的常驻过滤要用）→ 改查 C++
+  `real_region_contents`；`resident_count` 同。否则预取会把已在真实区的专家重复填侧区。
+- 本仓当前配置（PREFILL_CHUNK=2、top_k≈10、dual_cap=cap+spec_gens·spec=96）下 prefill(seq2)/
+  decode(seq1)/verify(seq4) 的 `seq·k ≤ 96` **恒走 dual 路径**，host `acquire`/`fetch` 分支不触达 →
+  真实区单一写者（demand），无 Python/C++ 双写分歧。
+- **失效自动回退（默认关，opt-in）**：native 未编译、`pinned` 非空、或某层被判定走 host 路径
+  （`seq·k>dual_cap`）→ 该层整层回退现有 Python 权威 `acquire_gpu_dual`（Python 状态仍在，安全）。
+  一旦回退发生即视为「方案 B 前提被打破」，日志告警。
+
+**Bite-sized 步骤（TDD，每步先红后绿 + 跑单测）：**
+- [ ] Task P2-B1（native 状态 + 只读接口）：C++ 加 `RealLayer{order,e2r,free_rows,freq,cap}` +
+  `g_real`；`real_init(layer,cap)` / `real_region_contents(layer)` / `real_region_count(layer)` /
+  `real_reset()` + 绑定。单测：init→contents 空、越界安全。
+- [ ] Task P2-B2（`_choose_victim` 端口）：C++ `choose_victim(layer,current)` 复刻 freq+插入序 tie-break；
+  暴露测试壳 `real_debug_place(layer,experts,cap,lfu,decay)`（纯状态推进，不 pread）+ `real_freq(layer,e)`。
+  单测(b)：对同一 (order,freq,current) 序列，C++ 选的 victim 与 Python `_choose_victim` 逐步一致。
+- [ ] Task P2-B3（demand 全接管 primitive）：`demand_dual(inds,pool_list,seg_nbytes,layer,side_gen,
+  path,stride,cap,lfu,decay)->local`：`inds.eval()`（1 次同步）→ 读 inds → 侧区(g_side[side_gen])∪
+  真实区算 local、收集 miss → 分配槽(free/LFU)+pread+按段 memcpy 落真实区行 → 补 e2r/order/freq →
+  返回 int32 local。计数进 `g_demand_*`，`demand_last_stats()` 取本次 [hitpos,misspos,loads,fallback]。
+  单测(a)：小 blob 造池，demand 后 local 指向的池行字节 == 磁盘真值（复用 sideregion 单测风格）。
+- [ ] Task P2-B4（Python 接线 + 一致性 + 回退）：`config.native_demand_dual()`；
+  `NativeStagingManager.demand_pool_dual(...)` 包 `demand_dual`；`ResidentExpertPool` 加 `_native_demand`
+  开关、`_bootstrap_dual_pool(layer,sample)`（预分配 cap+spec 池并 eval 固定指针 + `real_init`）、
+  `resident_experts/`_count` 在开关下改查 C++；`acquire_gpu_dual` 开关命中则委派 native、
+  否则/回退条件走原路径并告警。单测(c/d)：native 缺失自动回退、pinned 非空回退、
+  `resident_experts` 与 C++ 内容一致、超容量层不启用。
+- [ ] Task P2-B5（字节等价 + A/B 实测）：开 `STG_VERIFY=1` 跑一轮 `run_mtp_spec` 验证池槽字节 == 磁盘真值；
+  记录前后 tok/s / hit / fallback% / disk_loads / n_mismatch / peak_gb 到 `benchmarks/reports/`。
+  收益目标 ≥ +100%。
 
 ---
 

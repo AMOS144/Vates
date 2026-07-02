@@ -100,6 +100,17 @@ NB_MODULE(native_moe_ext, m) {
         "stream"_a = nb::none());
   m.def("demand_probe_handler", &demand_probe_handler, "inds"_a, "offset"_a, nb::kw_only(),
         "stream"_a = nb::none());
+  m.def("real_init", &real_init, "layer"_a, "cap"_a);
+  m.def("real_region_contents", &real_region_contents, "layer"_a);
+  m.def("real_region_count", &real_region_count, "layer"_a);
+  m.def("real_reset", &real_reset);
+  m.def("demand_dual", &demand_dual, "inds"_a, "pool_list"_a, "seg_nbytes"_a, "layer"_a,
+        "side_gen"_a, "path"_a, "stride"_a, "cap"_a, "lfu"_a, "decay_interval"_a, nb::kw_only(),
+        "stream"_a = nb::none());
+  m.def("demand_last_stats", &demand_last_stats);
+  m.def("real_debug_place", &real_debug_place, "layer"_a, "experts_flat"_a, "cap"_a, "lfu"_a,
+        "decay_interval"_a);
+  m.def("real_freq", &real_freq, "layer"_a, "e"_a);
   m.def("bg_reader_start", &bg_reader_start, "workers"_a = 1, "low_cap"_a = 0);
   m.def("bg_reader_submit", &bg_reader_submit,
         "dst"_a, "experts"_a, "rows"_a, "path"_a, "stride"_a, "ticket"_a, "prio"_a = 0);
