@@ -183,6 +183,18 @@ def main():
     if os.environ.get("DUMP_IDS"):
         print("DUMP_BASE_IDS " + json.dumps(list(base)))
         print("DUMP_SPEC_IDS " + json.dumps(list(ids)))
+    # 字节真值校验自证口径:开 STG_VERIFY / DUAL_VERIFY 时,把三处校验器的累计计数
+    # (ok/bad/calls)打进日志。关键:让「0 BAD」可判真伪——若 calls==0 说明本配置根本
+    # 没触发该校验器(如 STG_VERIFY 在 zerocopy_dual 路径不接线),此时 0 BAD 是空结论。
+    if os.environ.get("STG_VERIFY") or os.environ.get("DUAL_VERIFY"):
+        from mlx_streaming.core.cache import resident_pool as _rp_mod
+        from mlx_streaming.core.cache import virtual_pool as _vp_mod
+        _vsum = {
+            "STG_VERIFY.resident(verify_acquire_bytes)": dict(_rp_mod._stg_verify_state),
+            "STG_VERIFY.virtual(_verify_native_bytes)": dict(_vp_mod._stg_verify_state),
+            "DUAL_VERIFY.resident(_verify_side_bytes)": dict(_rp_mod._dual_verify_state),
+        }
+        print("VERIFY_SUMMARY " + json.dumps(_vsum, ensure_ascii=False))
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if _hprof:
         # dump (gen, layer, t_fire) 原始日志,供离线分析回调触发时刻分布。
