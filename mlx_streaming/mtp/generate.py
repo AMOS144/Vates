@@ -191,6 +191,8 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     drafter 需提供 draft(H_last(1,1,H), x_ids(1,1), mtp_cache, K) -> list[int](长度 K);
     可选 make_cache()->list 与 sync(rH, replay_in, mtp_cache)。
     ids_mode=True 时 prompt 已是 ids(1,L) 且返回 token id 列表(测试用)。
+    on_tokens:可选流式钩子,每步用「本步真正写入 produced 的 token id 列表」回调一次
+    (prefill 的首 token 作为第一次回调);返回 True 表示请求尽快停止生成。
     """
     enable_qwen3next_speculative_checkpoints()
     main_cache = model.make_cache()
@@ -249,11 +251,14 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
                 t_verify += time.perf_counter() - _tic
                 _tic = time.perf_counter()
             _stop = False
+            _n_before = len(produced)
             for t in new_tokens:
                 produced.append(t)
                 if len(produced) >= max_tokens:
                     break
-            if on_tokens is not None and on_tokens(list(new_tokens)):
+            # 只把「本步真正写入 produced」的 token 交给回调:多 token 步命中 max_tokens
+            # 上限时,截断掉的尾巴不应上报给流式消费者(避免超报被丢弃的 token)。
+            if on_tokens is not None and on_tokens(produced[_n_before:]):
                 _stop = True
             H_last = rH[:, -1:, :]
             if mtp_cache is not None and hasattr(drafter, "sync"):
@@ -377,11 +382,14 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             t_replay += time.perf_counter() - _tic
             _tic = time.perf_counter()
 
+        _n_before = len(produced)
         for t in new_tokens:
             produced.append(t)
             if len(produced) >= max_tokens:
                 break
-        _stop = on_tokens is not None and on_tokens(list(new_tokens))
+        # 只把「本步真正写入 produced」的 token 交给回调:多 token 步命中 max_tokens
+        # 上限时,截断掉的尾巴不应上报给流式消费者(避免超报被丢弃的 token)。
+        _stop = on_tokens is not None and on_tokens(produced[_n_before:])
 
         H_last = rH[:, -1:, :]
         if mtp_cache is not None and hasattr(drafter, "sync"):
