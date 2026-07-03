@@ -239,22 +239,54 @@ def _mem_breakdown(model, store, mtp):
 
 
 def _union_prof():
-    """按 seq 分桶汇报每层路由专家并集大小(avg/max);seq=K 桶即 MTP verify 的专家并集。
+    """按 seq 分桶汇报每层路由专家并集大小(avg/max/p99/分层);seq=K 桶即 MTP verify 的专家并集。
 
-    需 UNION_PROF=1 才有数据。返回 {seq: {avg, max?, n}};另给 by_phase 便捷视图:
-    decode(seq=1)/ verify(seq=K)/ prefill(seq=chunk)。
+    需 UNION_PROF=1 才有数据。返回 {seq: {avg_union, max_union, p99_union, per_layer...}};
+    verify 桶 = seq==K(verify_in=[x, d_1..d_{K-1}] 恰 K 个 token,见 mtp/generate.py)。
+    U_max 即该桶各层并集的全局最大值,是池 cap 下限的正确性依据(cap 必须 ≥ U_max 才保证不溢出)。
     """
-    from mlx_streaming.core.profiling import UNION_PROF as U
+    from mlx_streaming.core.profiling import UNION_PROF as U, UNION_SAMPLES as S
     if not U:
         return None
+
+    def _p(vals, q):
+        # 最近秩法分位数(vals 已升序):q∈[0,1]。样本少时直接给保守上界。
+        if not vals:
+            return None
+        idx = max(0, min(len(vals) - 1, int(round(q * (len(vals) - 1)))))
+        return vals[idx]
+
     out = {}
     for seq in sorted(U):
         s, n = U[seq]
-        out[f"seq{seq}"] = {"avg_union": round(s / max(1, n), 2), "n_layer_calls": n}
-    # 便捷:verify 桶 = seq==K
-    verify = out.get(f"seq{K}")
-    return {"by_seq": out, "verify_seq": K,
-            "verify_avg_union": (verify or {}).get("avg_union")}
+        rec = {"avg_union": round(s / max(1, n), 2), "n_layer_calls": n}
+        # 由分层原始样本汇总出该 seq 桶的 U_max / p99（cap 下限的正确性依据）。
+        layer_map = S.get(seq)
+        if layer_map:
+            flat = sorted(v for lst in layer_map.values() for v in lst)
+            rec["max_union"] = flat[-1]
+            rec["p99_union"] = _p(flat, 0.99)
+            rec["p50_union"] = _p(flat, 0.50)
+            rec["n_samples"] = len(flat)
+            # 分层分布：每层的 max / avg / 样本数（按层号排序）。
+            per_layer = {}
+            for li in sorted(layer_map):
+                lst = layer_map[li]
+                per_layer[li] = {
+                    "max": max(lst),
+                    "avg": round(sum(lst) / len(lst), 2),
+                    "n": len(lst),
+                }
+            rec["per_layer"] = per_layer
+            rec["max_layer_idx"] = max(per_layer, key=lambda li: per_layer[li]["max"])
+        out[f"seq{seq}"] = rec
+    # 便捷:verify 桶 = seq==K(verify_in=[x, d_1..d_{K-1}] 恰 K 个 token)
+    verify_seq = K
+    verify = out.get(f"seq{verify_seq}")
+    return {"by_seq": out, "verify_seq": verify_seq,
+            "verify_avg_union": (verify or {}).get("avg_union"),
+            "verify_max_union": (verify or {}).get("max_union"),
+            "verify_p99_union": (verify or {}).get("p99_union")}
 
 
 def _miss_attrib():

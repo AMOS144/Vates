@@ -171,7 +171,8 @@ class FileStreamingMoeBlock:
             # 专家总数 = gate 输出维(gates 末维),无需依赖 gate.weight。
             if UNION_ON:
                 # GPU 路径本不 .tolist 真实路由;仅 UNION_PROF=1 时付一次同步取并集大小。
-                note_union(x.shape[1], len({int(i) for i in inds.reshape(-1).tolist()}))
+                note_union(x.shape[1], len({int(i) for i in inds.reshape(-1).tolist()}),
+                           self.layer_idx)
             # decode/verify GPU 重映射路径:host 无现成真实路由。开关开时用 GPU membership 仅对
             # 预读候选现算 used(drain≤budget)过滤假阳性;关时退回整批写入(回退/对照基线)。
             if _do_promote:
@@ -210,7 +211,7 @@ class FileStreamingMoeBlock:
             flat = [int(i) for i in inds.reshape(-1).tolist()]
             uniq_set = set(flat)
             if UNION_ON:
-                note_union(x.shape[1], len(uniq_set))   # 本层路由专家并集(零额外同步,uniq_set 已算)
+                note_union(x.shape[1], len(uniq_set), self.layer_idx)  # 本层路由专家并集(零额外同步,uniq_set 已算)
             # promote 只写"预读好 ∩ 本层真实路由"的专家：复用已算的 uniq_set，零额外同步，
             # 假阳性不进池 → 省 scatter、不污染池（acquire 前完成，命中转化生效）。
             if _do_promote:

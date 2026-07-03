@@ -99,17 +99,26 @@ def note_miss_attrib(uniq, predicted, resident, is_decode: bool, ready=None) -> 
 # seq=K(MTP verify,如 K=3)的桶即"K 个 token 的专家并集",决定池 cap 下限;seq=1 为 decode、
 # seq=chunk 为分块 prefill。值为 {seq: [sum_union, n_layer_calls]}。默认关、零开销。
 UNION_PROF: "dict[int, list]" = {}
+# 分层原始样本(UNION_PROF=1)：{seq: {layer_idx: [本层每次前向的并集大小...]}}。
+# 仅聚合 [sum,n] 无法给出 cap 下限所需的 U_max/p99/分层分布，故额外留每层每次前向的原始值。
+# 样本量极小(≤层数×token数)，仅采集期占用，退出前汇总。
+UNION_SAMPLES: "dict[int, dict[int, list]]" = {}
 UNION_ON = config.union_prof()
 
 
-def note_union(seq: int, union_count: int) -> None:
-    e = UNION_PROF.setdefault(int(seq), [0, 0])
-    e[0] += int(union_count)
+def note_union(seq: int, union_count: int, layer_idx: int = -1) -> None:
+    seq = int(seq)
+    union_count = int(union_count)
+    e = UNION_PROF.setdefault(seq, [0, 0])
+    e[0] += union_count
     e[1] += 1
+    if layer_idx >= 0:
+        UNION_SAMPLES.setdefault(seq, {}).setdefault(int(layer_idx), []).append(union_count)
 
 
 def union_reset() -> None:
     UNION_PROF.clear()
+    UNION_SAMPLES.clear()
 
 
 def prof_reset():
