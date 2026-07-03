@@ -17,23 +17,25 @@ def test_fake_backend_load_reports_status():
 def test_fake_backend_streams_full_text_incrementally():
     b = FakeBackend(reply="你好世界")
     fulls = []
+    ns = []
 
-    def on_text(full):
+    def on_text(full, n):
         fulls.append(full)
+        ns.append(n)
         return False
 
     res = b.generate([{"role": "user", "content": "hi"}], on_text)
     assert isinstance(res, GenResult)
     assert res.text == "你好世界"
     assert res.stopped is False
-    assert fulls[-1] == "你好世界"
     assert fulls == ["你", "你好", "你好世", "你好世界"]
+    assert ns == [1, 2, 3, 4]   # 每步回传已生成 token 数(假后端用字符数近似)
 
 
 def test_fake_backend_stop_via_callback():
     b = FakeBackend(reply="abcdef")
 
-    def on_text(full):
+    def on_text(full, n):
         return len(full) >= 2  # 收到 2 个字符后请求中断
 
     res = b.generate([{"role": "user", "content": "hi"}], on_text)
@@ -44,7 +46,7 @@ def test_fake_backend_stop_via_callback():
 def test_fake_backend_records_seen_messages():
     b = FakeBackend(reply="x")
     msgs = [{"role": "user", "content": "问题"}]
-    b.generate(msgs, lambda full: False)
+    b.generate(msgs, lambda full, n: False)
     assert b.seen_messages[-1] == [{"role": "user", "content": "问题"}]
 
 
@@ -88,7 +90,7 @@ def test_mlx_backend_stops_generation_on_eos(monkeypatch):
     b._model = object()
     b._drafter = object()
 
-    res = b.generate([{"role": "user", "content": "hi"}], lambda full: False)
+    res = b.generate([{"role": "user", "content": "hi"}], lambda full, n: False)
 
     assert fed == [10, 11, 99]      # 命中 EOS 即止,未继续喂 12/13
     assert res.stopped is False     # EOS 是正常完成,不算用户中断

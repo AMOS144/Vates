@@ -120,10 +120,18 @@ _HELP = """可用命令:
 
 
 def cmd_chat(args):
-    """默认启动全屏 TUI;--plain 走纯文本 REPL。"""
+    """默认启动全屏 TUI;--plain 走纯文本 REPL;--demo 用假后端免模型预览界面。"""
     if getattr(args, "plain", False):
         return _chat_repl(args)
     from mlx_streaming.tui import run_tui
+    if getattr(args, "demo", False):
+        # 免模型预览:秒开 TUI,假流式回答,用于验证界面/占位符/状态栏
+        from mlx_streaming.tui.backend import FakeBackend
+        demo = FakeBackend(
+            reply="这是 --demo 演示回答:界面、逐字流式、状态栏(token 数 / tok·s)"
+                  "均为模拟,不加载模型。按 Esc 可中断,/help 看命令。",
+            delay=0.03)
+        return run_tui(demo, args)
     from mlx_streaming.tui.backend import MLXBackend
     return run_tui(MLXBackend(args), args)
 
@@ -205,6 +213,8 @@ def _add_chat_args(p):
                    help="每轮结束在 stderr 打印 token 数 / tok·s / 接受长度")
     p.add_argument("--plain", action="store_true",
                    help="用纯文本 REPL,不启动全屏 TUI(终端不兼容/调试时用)")
+    p.add_argument("--demo", action="store_true",
+                   help="免模型预览:用假后端秒开 TUI,验证界面/流式/状态栏")
     p.set_defaults(func=cmd_chat)
 
 

@@ -29,18 +29,22 @@ class ChatBackend(Protocol):
     def generate(
         self,
         messages: list[dict],
-        on_text: Callable[[str], bool],
+        on_text: Callable[[str, int], bool],
     ) -> GenResult:
-        """跑一轮生成。每步把「累计完整文本」传给 on_text;on_text 返回 True 表示请求中断。"""
+        """跑一轮生成。每步把「累计完整文本, 已生成 token 数」传给 on_text;返回 True 表示请求中断。"""
         ...
 
 
 @dataclass
 class FakeBackend:
-    """测试/演示用假后端:不加载模型,把预设回答按字符流式吐出。"""
+    """测试/演示用假后端:不加载模型,把预设回答按字符流式吐出。
+
+    delay > 0 时每字符间 sleep,用于 --demo 模式模拟真实吐字节奏;测试默认 0(不拖慢)。
+    """
 
     reply: str = "你好，这是一个测试回答。"
     status_msgs: list[str] = field(default_factory=lambda: ["加载中(模拟)…"])
+    delay: float = 0.0
     seen_messages: list[list[dict]] = field(default_factory=list)
 
     def load(self, on_status: Callable[[str], None]) -> None:
@@ -48,11 +52,16 @@ class FakeBackend:
             on_status(m)
 
     def generate(self, messages, on_text) -> GenResult:
+        import time
+
         self.seen_messages.append([dict(m) for m in messages])
         acc = ""
         for ch in self.reply:
             acc += ch
-            if on_text(acc):
+            if self.delay:
+                time.sleep(self.delay)
+            # 用字符数近似 token 数(假后端无真实分词)
+            if on_text(acc, len(acc)):
                 return GenResult(acc, len(acc), 0.0, stopped=True)
         return GenResult(acc, len(self.reply), 0.0, stopped=False)
 
@@ -92,7 +101,7 @@ class MLXBackend:
             produced_all.extend(new_ids)
             truncated = _truncate_eos(produced_all, eos)
             text = tok.decode(truncated)
-            if on_text(text):          # 用户按 Esc 请求中断
+            if on_text(text, len(truncated)):   # 用户按 Esc 请求中断
                 stopped["v"] = True
                 return True
             # 命中 EOS(截断后短于累计产出):完整回答已生成,提前停止,

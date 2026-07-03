@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Optional
 
 from rich.console import Group
@@ -92,6 +93,7 @@ class VatesApp(App):
         self._busy = False
         self._stop = False
         self._cur: Optional[ChatMessage] = None
+        self._gen_t0 = 0.0  # 本轮生成起始时刻,用于实时 tok/s
 
     def compose(self) -> ComposeResult:
         yield Static(self._top_text(), id="top")
@@ -134,10 +136,14 @@ class VatesApp(App):
             self.call_from_thread(self._on_load_done)
 
     def _enable_input(self) -> None:
-        """重新启用并聚焦输入框(加载完成/一轮生成结束后统一调用)。"""
+        """重新启用并聚焦输入框(加载完成/一轮生成结束后统一调用)。
+
+        刚把 disabled 置 False 时 can_focus 状态可能还没刷新,直接 focus 偶发无效
+        (表现为输入框失焦时占位提示不消失);故延到下一次刷新后再聚焦,确保稳定拿到焦点。
+        """
         inp = self.query_one("#prompt", Input)
         inp.disabled = False
-        inp.focus()
+        self.call_after_refresh(inp.focus)
 
     def _on_load_done(self) -> None:
         self._set_status("就绪")
@@ -182,6 +188,7 @@ class VatesApp(App):
         self._cur = self._add("assistant", "", final=False)
         self._busy = True
         self._stop = False
+        self._gen_t0 = time.monotonic()
         self.query_one("#prompt", Input).disabled = True
         self._set_status("思考中…")
         self._generate(list(self._messages))
@@ -189,12 +196,12 @@ class VatesApp(App):
     @work(thread=True, exclusive=True, group="gen")
     def _generate(self, messages: list[dict]) -> None:
         # 生成在 worker 线程运行;on_text 返回 self._stop 让后端可提前中断
-        def on_text(full: str) -> bool:
+        def on_text(full: str, n_tokens: int) -> bool:
             # 应用已退出时,call_from_thread 会抛错;此时直接请求停止,避免 worker 线程未捕获异常。
             if not self.is_running:
                 return True
             try:
-                self.call_from_thread(self._on_stream, full)
+                self.call_from_thread(self._on_stream, full, n_tokens)
             except Exception:  # noqa: BLE001
                 return True
             return self._stop
@@ -208,10 +215,14 @@ class VatesApp(App):
         if self.is_running:
             self.call_from_thread(self._on_done, result)
 
-    def _on_stream(self, full: str) -> None:
+    def _on_stream(self, full: str, n_tokens: int) -> None:
         if self._cur is not None:
             self._cur.stream(full)
             self._scroll_end()
+        # 实时刷新状态栏:token 数 + 即时吞吐(按本轮墙钟计算)
+        dt = time.monotonic() - self._gen_t0
+        tps = n_tokens / dt if dt > 0 else 0.0
+        self._set_status(f"思考中 · {n_tokens} tok · {tps:.1f} tok/s")
 
     def _on_done(self, result: GenResult) -> None:
         if self._cur is not None:

@@ -156,3 +156,21 @@ async def test_load_failed_shows_error_and_status():
         assert "加载失败" in status
         msgs = list(app.query(ChatMessage))
         assert any("模型文件缺失" in m.text for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_stream_updates_status_with_live_tokens_and_speed():
+    """流式过程中状态栏应实时显示 token 数与 tok/s,而非等结束才显示。"""
+    import time
+    app = VatesApp(FakeBackend(), _args())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app._cur = app._add("assistant", "", final=False)
+        app._gen_t0 = time.monotonic() - 1.0   # 假装已过 1 秒,tok/s 可算
+        app._on_stream("你好世", 3)
+        await pilot.pause()
+        status = str(app.query_one("#status").content)
+        assert "思考中" in status
+        assert "3 tok" in status
+        assert "tok/s" in status
