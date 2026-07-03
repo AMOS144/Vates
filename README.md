@@ -13,7 +13,8 @@ uv pip install -e .
 
 ## 命令行:交互式对话
 
-装好后直接用 `vates` 命令进入多轮对话(默认走 MTP 自投机快路径):
+装好后直接用 `vates` 命令进入多轮对话(默认走 MTP 自投机快路径)。默认进入
+全屏 TUI(opencode 风格):`vates` 或 `vates chat`。
 
 ```bash
 vates                       # 进入交互式对话
@@ -40,17 +41,10 @@ vates --system "你是一个简洁的助手"
 | `--system` | 可选 system 提示词 | 无 |
 | `--stats` | 每轮打印 token 数 / tok·s / 接受长度 | 关 |
 
-交互期间命令:`/exit` 退出、`/reset` 清空历史、`/help` 帮助。
+交互方式:回车发送、`Esc` 中断当前生成、`Ctrl+C` 退出;斜杠命令 `/help`、
+`/reset`(清历史)、`/clear`(清屏)、`/exit`。
 
-## 交互式对话(TUI)
-
-默认进入全屏 TUI(仿 opencode):
-
-    uv run vates chat
-
-- 回车发送,`Esc` 中断当前生成,`Ctrl+C` 退出。
-- 斜杠命令:`/help`、`/reset`(清历史)、`/clear`(清屏)、`/exit`。
-- 终端不兼容或需要纯文本时:`uv run vates chat --plain`(走旧版逐行 REPL)。
+终端不兼容或需要纯文本时,用 `vates chat --plain`(旧版逐行 REPL)。
 
 ## 基准测试
 

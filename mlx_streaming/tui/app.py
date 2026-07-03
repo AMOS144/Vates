@@ -120,14 +120,18 @@ class VatesApp(App):
     def _load(self) -> None:
         # 在 worker 线程执行阻塞加载,回调需经 call_from_thread 回到 UI 线程
         def on_status(msg: str):
-            self.call_from_thread(self._set_status, f"加载中 · {msg}")
+            # 应用已退出时不再回推,避免 call_from_thread 抛错
+            if self.is_running:
+                self.call_from_thread(self._set_status, f"加载中 · {msg}")
 
         try:
             self.backend.load(on_status)
         except Exception as e:  # noqa: BLE001
-            self.call_from_thread(self._on_load_failed, str(e))
+            if self.is_running:
+                self.call_from_thread(self._on_load_failed, str(e))
             return
-        self.call_from_thread(self._on_load_done)
+        if self.is_running:
+            self.call_from_thread(self._on_load_done)
 
     def _enable_input(self) -> None:
         """重新启用并聚焦输入框(加载完成/一轮生成结束后统一调用)。"""
@@ -186,15 +190,23 @@ class VatesApp(App):
     def _generate(self, messages: list[dict]) -> None:
         # 生成在 worker 线程运行;on_text 返回 self._stop 让后端可提前中断
         def on_text(full: str) -> bool:
-            self.call_from_thread(self._on_stream, full)
+            # 应用已退出时,call_from_thread 会抛错;此时直接请求停止,避免 worker 线程未捕获异常。
+            if not self.is_running:
+                return True
+            try:
+                self.call_from_thread(self._on_stream, full)
+            except Exception:  # noqa: BLE001
+                return True
             return self._stop
 
         try:
             result = self.backend.generate(messages, on_text)
         except Exception as e:  # noqa: BLE001
-            self.call_from_thread(self._on_error, str(e))
+            if self.is_running:
+                self.call_from_thread(self._on_error, str(e))
             return
-        self.call_from_thread(self._on_done, result)
+        if self.is_running:
+            self.call_from_thread(self._on_done, result)
 
     def _on_stream(self, full: str) -> None:
         if self._cur is not None:

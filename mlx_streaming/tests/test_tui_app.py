@@ -120,3 +120,39 @@ def test_cmd_chat_launches_tui_by_default(monkeypatch):
     assert rc == 0
     assert called["backend_type"] == "MLXBackend"
     assert called["plain"] is False
+
+
+@pytest.mark.asyncio
+async def test_on_done_stopped_shows_interrupted_status():
+    """被中断的一轮:finalize 已生成文本,状态栏出现「已中断」,输入框重新可用。"""
+    from mlx_streaming.tui.backend import GenResult
+    app = VatesApp(FakeBackend(), _args())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app._cur = app._add("assistant", "", final=False)
+        app._busy = True
+        app._on_done(GenResult(text="ab", n_tokens=2, tok_per_s=0.0, stopped=True))
+        await pilot.pause()
+        from textual.widgets import Input
+        assert app._busy is False
+        assert app.query_one("#prompt", Input).disabled is False
+        status = str(app.query_one("#status").content)
+        assert "已中断" in status
+        msgs = list(app.query(ChatMessage))
+        assert msgs[-1].text == "ab" and msgs[-1].final is True
+
+
+@pytest.mark.asyncio
+async def test_load_failed_shows_error_and_status():
+    """加载失败:对话区出现错误消息,状态栏为「加载失败」。"""
+    app = VatesApp(FakeBackend(), _args())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app._on_load_failed("模型文件缺失")
+        await pilot.pause()
+        status = str(app.query_one("#status").content)
+        assert "加载失败" in status
+        msgs = list(app.query(ChatMessage))
+        assert any("模型文件缺失" in m.text for m in msgs)
