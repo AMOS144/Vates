@@ -90,9 +90,14 @@ class MLXBackend:
 
         def on_tokens(new_ids):
             produced_all.extend(new_ids)
-            text = tok.decode(_truncate_eos(produced_all, eos))
-            if on_text(text):
+            truncated = _truncate_eos(produced_all, eos)
+            text = tok.decode(truncated)
+            if on_text(text):          # 用户按 Esc 请求中断
                 stopped["v"] = True
+                return True
+            # 命中 EOS(截断后短于累计产出):完整回答已生成,提前停止,
+            # 避免引擎空跑到 max_tokens 让界面长时间卡在「思考中」。EOS 属正常完成,不算中断。
+            if len(truncated) < len(produced_all):
                 return True
             return False
 
