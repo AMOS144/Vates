@@ -178,6 +178,11 @@ def main():
         "prefetch_tprof": _prefetch_tprof(stats.get("wall_s")),
         "union_experts": _union_prof(),
     }
+    # 噪声地板测量口径:DUMP_IDS=1 时把 baseline greedy 与 spec 的完整 token 序列打进日志,
+    # 供跨进程 run-to-run 逐位对比(默认关闭,不污染常规输出)。
+    if os.environ.get("DUMP_IDS"):
+        print("DUMP_BASE_IDS " + json.dumps(list(base)))
+        print("DUMP_SPEC_IDS " + json.dumps(list(ids)))
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if _hprof:
         # dump (gen, layer, t_fire) 原始日志,供离线分析回调触发时刻分布。
