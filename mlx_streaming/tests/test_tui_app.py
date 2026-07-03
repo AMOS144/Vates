@@ -96,3 +96,27 @@ async def test_interrupt_sets_stop_flag():
         app._stop = False
         app.action_interrupt()
         assert app._stop is True
+
+
+def test_cmd_chat_launches_tui_by_default(monkeypatch):
+    """默认(非 --plain)应构造 MLXBackend 并调用 run_tui,不进旧 REPL。"""
+    import types as _t
+
+    from mlx_streaming import cli
+
+    called = {}
+
+    def fake_run_tui(backend, args):
+        called["backend_type"] = type(backend).__name__
+        called["plain"] = getattr(args, "plain", None)
+        return 0
+
+    monkeypatch.setattr("mlx_streaming.tui.run_tui", fake_run_tui)
+    args = _t.SimpleNamespace(model="m", k=3, max_tokens=512, system=None,
+                              plain=False, expert_dir="e", mtp_out="o",
+                              qn_config="q", expert_slots=32, spec_slots=None,
+                              stats=False)
+    rc = cli.cmd_chat(args)
+    assert rc == 0
+    assert called["backend_type"] == "MLXBackend"
+    assert called["plain"] is False
