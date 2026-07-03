@@ -1,0 +1,40 @@
+Screen {
+    background: #0b0e14;
+}
+
+#top {
+    height: auto;
+    padding: 1 2;
+    background: #11151f;
+    color: #e6e6e6;
+    border-bottom: solid #2a2f3a;
+}
+
+#chat {
+    padding: 1 2;
+    height: 1fr;
+}
+
+.msg {
+    margin: 1 0;
+    padding: 0 1;
+    height: auto;
+}
+
+.msg.assistant {
+    border-left: solid #2dd4bf;
+    padding-left: 2;
+}
+
+#prompt {
+    margin: 0 2;
+    border: round #2dd4bf;
+    background: #11151f;
+}
+
+#status {
+    height: 1;
+    padding: 0 2;
+    background: #11151f;
+    color: #8b93a7;
+}
