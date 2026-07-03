@@ -74,6 +74,19 @@ async def test_reset_clears_history():
 
 
 @pytest.mark.asyncio
+async def test_reset_ignored_while_busy():
+    """生成中执行 /reset 应被拒绝且不清历史(避免卸载正在流式的组件)。"""
+    app = VatesApp(FakeBackend(reply="ok"), _args())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app._busy = True                      # 模拟生成中
+        before = len(app._messages)
+        app._command("/reset")
+        assert len(app._messages) == before   # 历史未被清空
+
+
+@pytest.mark.asyncio
 async def test_interrupt_sets_stop_flag():
     app = VatesApp(FakeBackend(), _args())
     async with app.run_test() as pilot:

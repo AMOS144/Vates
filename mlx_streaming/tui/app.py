@@ -129,11 +129,15 @@ class VatesApp(App):
             return
         self.call_from_thread(self._on_load_done)
 
-    def _on_load_done(self) -> None:
-        self._set_status("就绪")
+    def _enable_input(self) -> None:
+        """重新启用并聚焦输入框(加载完成/一轮生成结束后统一调用)。"""
         inp = self.query_one("#prompt", Input)
         inp.disabled = False
         inp.focus()
+
+    def _on_load_done(self) -> None:
+        self._set_status("就绪")
+        self._enable_input()
 
     def _on_load_failed(self, err: str) -> None:
         self._add("assistant", f"模型加载失败:{err}\n\n请检查路径后用 /exit 退出重试。")
@@ -156,6 +160,9 @@ class VatesApp(App):
             self.exit()
         elif cmd == "/help":
             self._add("assistant", _HELP)
+        elif cmd in ("/reset", "/clear") and self._busy:
+            # 生成中改动历史/移除正在流式的 _cur 会让 _on_stream/_on_done 操作已卸载组件,故拒绝
+            self._add("assistant", "生成中,请等本轮结束或按 Esc 中断后再执行该命令。")
         elif cmd == "/reset":
             # 只清空 system 之后的历史
             del self._messages[self._base_len:]
@@ -203,9 +210,7 @@ class VatesApp(App):
         suffix = " · 已中断" if result.stopped else ""
         self._set_status(
             f"就绪 · {result.n_tokens} tok · {result.tok_per_s:.1f} tok/s{suffix}")
-        inp = self.query_one("#prompt", Input)
-        inp.disabled = False
-        inp.focus()
+        self._enable_input()
 
     def _on_error(self, err: str) -> None:
         if self._cur is not None:
@@ -213,9 +218,7 @@ class VatesApp(App):
         self._busy = False
         self._cur = None
         self._set_status("就绪(上一轮出错)")
-        inp = self.query_one("#prompt", Input)
-        inp.disabled = False
-        inp.focus()
+        self._enable_input()
 
     def action_interrupt(self) -> None:
         # 仅在生成中时置位中断标志,由 on_text 闭包读取
