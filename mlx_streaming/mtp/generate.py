@@ -185,7 +185,7 @@ def tree_verify_step(model, drafter, x, H_last, x_ids, mtp_cache, main_cache, K,
 
 # ----------------------------------------------------------------- 主循环
 def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
-                 profile=False):
+                 profile=False, on_tokens=None):
     """贪婪 MTP 自投机。
 
     drafter 需提供 draft(H_last(1,1,H), x_ids(1,1), mtp_cache, K) -> list[int](长度 K);
@@ -202,6 +202,7 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     x = int(mx.argmax(logits[:, -1, :]))
     H_last = H[:, -1:, :]
     produced = [x]
+    _stop_from_initial = on_tokens is not None and on_tokens([x])
     mx.eval(H_last)
     t0 = time.perf_counter()
     n_steps = 0
@@ -229,7 +230,7 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     _skip_snap = (verify_mode != "step") and (not tree_mode) and (not tree_verify_mode) \
         and _batch_direct_commit_guaranteed(model)
 
-    while len(produced) < max_tokens:
+    while len(produced) < max_tokens and not _stop_from_initial:
         x0 = x
         x_ids = mx.array([[x]])
 
@@ -247,10 +248,13 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             if profile:
                 t_verify += time.perf_counter() - _tic
                 _tic = time.perf_counter()
+            _stop = False
             for t in new_tokens:
                 produced.append(t)
                 if len(produced) >= max_tokens:
                     break
+            if on_tokens is not None and on_tokens(list(new_tokens)):
+                _stop = True
             H_last = rH[:, -1:, :]
             if mtp_cache is not None and hasattr(drafter, "sync"):
                 drafter.sync(prev_H_last, rH, accepted_in, mtp_cache)
@@ -258,6 +262,8 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
                 t_sync += time.perf_counter() - _tic
             n_steps += 1
             mx.eval(x, H_last)
+            if _stop:
+                break
             continue
 
         if profile:
@@ -375,6 +381,7 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             produced.append(t)
             if len(produced) >= max_tokens:
                 break
+        _stop = on_tokens is not None and on_tokens(list(new_tokens))
 
         H_last = rH[:, -1:, :]
         if mtp_cache is not None and hasattr(drafter, "sync"):
@@ -386,6 +393,8 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
         mx.eval(x, H_last)
         if profile:
             t_finalize += time.perf_counter() - _tic
+        if _stop:
+            break
 
     produced = produced[:max_tokens]
     wall = time.perf_counter() - t0
