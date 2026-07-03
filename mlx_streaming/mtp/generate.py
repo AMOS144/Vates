@@ -20,6 +20,30 @@ from mlx_streaming.mtp.kv_cache import (
     tile_caches, commit_tree_row)
 
 
+def _batch_direct_commit_guaranteed(model) -> bool:
+    """判断该模型的 batch verify 是否「必定」能直接提交(commit_verified_prefix 恒成功)。
+
+    commit 成功的充要条件是每个 cache 都满足:可裁剪(KVCache)或已捕获 per-token checkpoint。
+    - 非线性层 → KVCache,可裁剪,必成功;
+    - 线性层 → 必须是被 patch 过的 Qwen3NextGatedDeltaNet,verify 前向才会写 `_spec_checkpoints`。
+    全部满足才返回 True——此时每步的 `snap_m` 回退快照永远用不上,可安全省略以压低在途峰值。
+    通用/玩具递归层(未 patch)返回 False,保留 snap_m 走安全 replay 兜底(与原行为逐 token 等价)。
+    """
+    import mlx_streaming.mtp.kv_cache as _kv
+    if not getattr(_kv, "_QWEN3NEXT_CHECKPOINTS_PATCHED", False):
+        return False
+    try:
+        from mlx_lm.models.qwen3_next import Qwen3NextGatedDeltaNet
+        layers = model.model.layers
+    except (ImportError, AttributeError):
+        return False
+    for l in layers:
+        if getattr(l, "is_linear", False) and not isinstance(
+                getattr(l, "linear_attn", None), Qwen3NextGatedDeltaNet):
+            return False
+    return True
+
+
 def forward_with_hidden(model, ids, cache, compute_logits: bool = True):
     """跑主模型层循环 + 最终 norm,返回 (logits(1,L,V), hidden(1,L,H))。
 
@@ -199,6 +223,11 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     tree_verify_mode = config.tree_verify()     # 完整树形验证(batch-of-paths),优先级最高
     tree_P = max(1, config.tree_branches())
     tree_rescues = 0                            # 位置1 top-2 成功救回(B 链首命中)的步数
+    # 纯 batch 直接提交路径 + 模型保证 commit 恒成功时,跳过每步一次「全 cache 深拷贝 + eval」
+    # (snap_m 只用于 tree 救回 / step / replay 回退,这些路径都不满足下方条件)。省 ~72MiB 在途
+    # 峰值和一次同步栅栏,数值完全不变(bit-exact,只改内存调度)。模型结构恒定,循环外算一次即可。
+    _skip_snap = (verify_mode != "step") and (not tree_mode) and (not tree_verify_mode) \
+        and _batch_direct_commit_guaranteed(model)
 
     while len(produced) < max_tokens:
         x0 = x
@@ -247,7 +276,7 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             t_draft += time.perf_counter() - _tic
             _tic = time.perf_counter()
 
-        snap_m = _snapshot(main_cache)
+        snap_m = None if _skip_snap else _snapshot(main_cache)
         if profile:
             t_snap += time.perf_counter() - _tic
             _tic = time.perf_counter()
@@ -325,6 +354,10 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
                 x = preds[matched]
         else:
             fallback_replays += 1
+            if snap_m is None:
+                # 理论不可达:batch 直接提交路径 checkpoint 齐全,commit 必成功。若真走到这里,
+                # 说明前提被破坏(如未捕获 checkpoint),此时无快照可回退,直接抛错定位而非静默错算。
+                raise RuntimeError("batch verify commit failed but snapshot was skipped")
             # fallback:回滚到验证前,重放 accepted prefix,保证 ArraysCache 正确。
             _restore(main_cache, snap_m)
             accepted_in = mx.array([[x0] + drafts[:matched]])
