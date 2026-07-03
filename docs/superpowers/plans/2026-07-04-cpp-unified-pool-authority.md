@@ -10,6 +10,8 @@
 
 **关联 spec:** `docs/superpowers/specs/2026-07-04-cpp-unified-pool-authority-design.md`
 
+> **Phase 0 实测结论回填（2026-07-04）**：MTP verify 前向实际喂 **K=3** 个 token（`verify_in=[x, d_1..d_{K-1}]`，`mtp/generate.py:296`），非早前假设的 K+1=4。故单前向并集理论上界 = `K×top_k = 3×10 = 30`；**实测 U_max=30（恰触顶、零裕度）、p99=29、均值≈19.5**（详见 `benchmarks/reports/union-cap-floor-2026-07-04.md`）。**正确性下限：cap（真实区+侧区可寻址）≥ 30**。→ 后续所有实测/测试的 cap 一律取 ≥ 30；`EXPERT_SLOTS=32` 满足但仅 2 裕度，`cap<30` 必然溢出错槽。
+
 ---
 
 ## 前置约定（所有 Phase 通用）
@@ -46,13 +48,15 @@ UNION_PROF=1 STREAM_BLOB_LOADER=1 NATIVE_FUSED_PREFETCH=1 EXPERT_SLOTS=64 \
 ```
 Expected: 日志含 UNION_PROF 分桶输出（按 seq 分桶记每层路由专家并集大小）。用 cap=64 避免采集期本身溢出污染。
 
-- [ ] **Step 2: 提取每层 verify(seq=K+1) 桶的最大并集**
+- [ ] **Step 2: 提取每层 verify(seq=K) 桶的最大并集**
 
-从 `/tmp/union_prof.log` 读出 seq=4 桶各层并集的 **max** 与 **p99**。记录：全 48 层里的最大值 `U_max`、以及分层分布。
+从 `/tmp/union_prof.log` 读出 seq=3（K=3）桶各层并集的 **max** 与 **p99**。记录：全 48 层里的最大值 `U_max`、以及分层分布。
 
 - [ ] **Step 3: 写结论报告**
 
-在 `benchmarks/reports/union-cap-floor-2026-07-04.md` 记录：`U_max`、p99、分层分布，结论「正确性要求 cap（真实区+侧区可寻址）≥ `U_max`」。预期 `U_max` 在 ~19-25（远小于理论 40）。
+在 `benchmarks/reports/union-cap-floor-2026-07-04.md` 记录：`U_max`、p99、分层分布，结论「正确性要求 cap（真实区+侧区可寻址）≥ `U_max`」。**实测 `U_max=30`（= 理论上界 `K×top_k=3×10`，零裕度）**。
+
+> ✅ 已完成（commit 49fe63b + 6b2c1b5）：U_max=30、p99=29、均值≈19.5，浅层并集最大（L0/L2 触顶 30）。附带修正了 UNION_PROF 探针（原只给均值→现出 max/p99/per_layer）与 verify=K 口径注释。
 
 - [ ] **Step 4: Commit**
 
