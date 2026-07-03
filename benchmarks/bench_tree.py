@@ -20,7 +20,7 @@ from mlx_streaming.mtp.generate import mtp_generate
 from mlx_streaming.mtp.qwen3_next_mtp import load_mtp
 from mlx_streaming.model_builder import build_streaming_model
 from mlx_streaming.core.profiling import (
-    MISS_ATTRIB, PREDICT_RECALL_PROF, UNION_PROF, tprof_reset)
+    MISS_ATTRIB, PREDICT_RECALL_PROF, UNION_PROF, tprof_reset, union_reset)
 from mlx_streaming import config as _cfg
 
 PROMPT = os.environ.get("PROMPT", "用三句话解释什么是混合专家模型。")
@@ -33,7 +33,7 @@ def _reset():
         MISS_ATTRIB[k] = 0
     for k in PREDICT_RECALL_PROF:
         PREDICT_RECALL_PROF[k] = 0
-    UNION_PROF.clear()
+    union_reset()          # 同时清 UNION_PROF 与 UNION_SAMPLES，避免跨迭代陈旧样本/无界增长
     tprof_reset()
 
 

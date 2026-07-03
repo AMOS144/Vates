@@ -17,7 +17,7 @@ from mlx_streaming.core.profiling import (
     PROF, WINDOW_PROF, PREDICT_RECALL_PROF, MISS_ATTRIB, note_miss_attrib,
     note_tprof, TPROF_ON, _PROF_ON, _tick, note_union, UNION_ON)
 
-# decode/verify 热路径判据:seq 短(单 token decode=1、MTP verify=K+1≤几)，与 prefill 长 seq 区分。
+# decode/verify 热路径判据:seq 短(单 token decode=1、MTP verify=K≤几)，与 prefill 长 seq 区分。
 _DECODE_SEQ_MAX = 8
 from mlx_streaming.core.moe.gate import _effective_top_k
 from mlx_streaming.core.moe.compute import (
@@ -139,10 +139,10 @@ class FileStreamingMoeBlock:
                     if hasattr(self.store, "resident_lru_scores") else {})
             route_trace.record(
                 self.layer_idx, flat_trace, set(flat_trace) - resident, resident, rank)
-        # native-fused-prefetch：在 seq 分支**之前**提交，使 decode(seq=1) 与 MTP verify(seq=K+1)
+        # native-fused-prefetch：在 seq 分支**之前**提交，使 decode(seq=1) 与 MTP verify(seq=K)
         # 两条路径都触发预取。dummy 折进 inds(加 0)：GPU 路径靠 acquire_gpu 的 n_miss eval、
-        # host 路径靠后面的 .tolist() eval，都会触发完成回调里的 pread。verify 时 x 为 K+1 个
-        # token，预测的是"下一层这 K+1 token 的专家并集"（recall≈0.96 的口径）。
+        # host 路径靠后面的 .tolist() eval，都会触发完成回调里的 pread。verify 时 x 为 K 个
+        # token（verify_in=[x, d_1..d_{K-1}]），预测的是"下一层这 K 个 token 的专家并集"（recall≈0.96 的口径）。
         # 双源双缓冲：每块开头先推进/检测前向边界（必须在本块预取提交之前，保证同前向内 fill_gen/read_gen 恒定）。
         if config.zerocopy_dual_source() and getattr(self, "_vpool", None) is not None:
             self._vpool.begin_forward(self.layer_idx)
@@ -157,7 +157,7 @@ class FileStreamingMoeBlock:
             # 双源两级缓存本就是为 MTP verify 建的:acquire_gpu_dual 用全专家宽表寻址,任意并集都安全
             # (miss 走 demand 回退),有效容量 = cap + 侧区行。verify 默认走 dual 路径读侧区,否则
             # 落 host 路径会白填侧区(预取填了却不读)→ 命中骤降、读盘翻倍。判据用 dual 有效容量,
-            # 避免更大 K 时 (K+1)×top_k 误伤 cap。
+            # 避免更大 K 时 K×top_k 误伤 cap。
             rp = self.store._resident
             _dual_cap = layer_cap + rp.spec_gens * rp.spec_slots
             _verify_gpu = (x.shape[1] * k <= _dual_cap)
@@ -290,7 +290,7 @@ class FileStreamingMoeBlock:
             g = tmlp.gate(h)
         else:
             g = tmlp.gate(layers[tgt].post_attention_layernorm(h))
-        # 按 seq 维聚合成"该批 K+1 token 的专家并集"近似。聚合方式 PREDICT_AGG：
+        # 按 seq 维聚合成"该批 K 个 token 的专家并集"近似。聚合方式 PREDICT_AGG：
         # - max（默认）：任一 token 强烈想要即入选；mean：各 token 平均偏好；
         # - union：每 token 各取 top-kk 再并集（与真实路由"并集"结构最一致，候选更多，由 handler 去重+截断）。
         _agg = config.predict_agg()

@@ -11,7 +11,7 @@ import mlx.core as mx
 from mlx_streaming.mtp.generate import forward_with_hidden, prefill_chunked
 from mlx_streaming.mtp.kv_cache import _snapshot, _restore
 from mlx_streaming.model_builder import build_streaming_model
-from mlx_streaming.core.profiling import UNION_PROF
+from mlx_streaming.core.profiling import UNION_PROF, union_reset
 
 PROMPT = "请写一段关于人工智能发展历史的详细介绍,尽量长一些。"
 
@@ -32,7 +32,7 @@ def main():
     print(f"{'N':>4} {'union/layer':>12} {'experts/token':>14} {'tokens/expert':>14}")
     for N in [1, 2, 4, 6, 8, 16, 32, 64, 128]:
         _restore(cache, snap)
-        UNION_PROF.clear()
+        union_reset()          # 同时清 UNION_PROF 与 UNION_SAMPLES，避免跨迭代陈旧样本/无界增长
         seq = mx.array([toks[:N]])
         l, _ = forward_with_hidden(model, seq, cache); mx.eval(l)
         # UNION_PROF[N] = [sum_union_over_layers, num_layers]
