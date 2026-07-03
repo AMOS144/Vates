@@ -139,6 +139,36 @@ gate → inds(lazy) ─┐
 主线程每层只付 1 次 `inds.eval()`；「合并 / 分配 / pread / 落池」全在 C++（worker 线程），
 不再回主线程 `.tolist` + Python scatter + eff 重建 → 不打断 MLX 跨层流水线。
 
+### 5.3 耦合审计结论：`block.py` 是耦合枢纽
+
+只读审计（2026-07-04）发现，`block.py` 计算段有 **5 条 acquire 分支**（dual / 非 dual GPU-remap /
+host / 超 cap fetch / stream_blob），并**直接窥探 10+ 处他人私有内部**：
+`store._staging`、`store._resident`、`_stg_mgr.promote`、`_stg_mgr.last_ready`、`stg.src._segs`、
+`rp._pools[tgt]`、`store._bg`、`self._blob`、`_slot_of` 等。这些「跨抽象边界摸内部」是耦合的真正来源。
+
+**降耦合总纲**：给 `block.py` 一个干净的单一接口，把内部窥探全收进 C++ `PoolManager` 背后。
+目标塌缩形态：
+
+```python
+# 目标：block.py 计算段（去掉所有内部窥探与分支）
+pool_arrays, local, n_experts = pm.acquire(layer, inds, num_experts, seq_len)   # 命中/miss/侧区/promote 全内聚
+y = self._sub.forward(pool_arrays, n_experts, x, local)
+# 预取（搭车式，保留 Python 预测 gate 搭图，只把候选交给 C++）：
+pm.prefetch(target_layer, pred_inds)                                            # resident 过滤/落槽在 C++ 内
+```
+
+### 5.4 `PoolManager` 对外接口（Python 侧零内部窥探）
+
+| 方法 | 语义 | 替代掉的现状 |
+|------|------|-------------|
+| `acquire(layer, inds, num_experts, seq_len) -> (pool, local, n_experts)` | 呈现「所有专家都在」视角：side∪real 合并 + demand 补齐 + LFU 记账，内部完成 | `_vpool.acquire` / `acquire_gpu(_dual)` / `acquire_host` / `store.acquire` / `fetch` 五条分支 |
+| `prefetch(target_layer, pred_inds) -> dummy` | 按候选预取到侧区：resident 过滤 + reserve + 并行 pread 落槽，全在 C++ | `stg.submit` + Python `resident_experts` 快照传参 + `route_used_subset` |
+| `begin_forward(layer)` | 前向边界 / gen 推进 | `_vpool.begin_forward`（内聚进 PoolManager） |
+| `resident_snapshot(layer)`（只读诊断） | 返回常驻集合，仅供 trace/校验 | `resident_experts` 作为**权威读**的用法取消 |
+
+**关键原则**：`prefetch` / `promote` **不再从 Python 传 resident list**——C++ 内部直接读 `g_real` 过滤。
+Python 的 `_slot_of / _free / _freq / _slot_table` 在该路径删除（不再是权威、也不做死影子）。
+
 ---
 
 ## 6. 分阶段（TDD，每阶段独立可验证、开关可回退）
@@ -159,10 +189,26 @@ gate → inds(lazy) ─┐
 - 修复后：`NATIVE_DEMAND_DUAL` 在 cap ≥ 实测并集下**通过容量不变性 + STG_VERIFY 0 错**。
 - 交付物：现有异步方案 B 变成 **exact** → 直接兑现 cap 充裕时的净收益（实测 +38.7%@cap64 / +5.9%@cap32）。
 
-**Phase 3 —— 统一权威**
-- 把侧区 reserve/落字节 + prefetch 落槽收进同一套 C++ `PoolManager` 分配器（统一锁与 LFU）。
-- 删 Python 死影子槽状态；`resident_experts` 等只读路径改查 C++。
-- 全程保持 Phase 1 的容量不变性 + STG_VERIFY 绿。
+**Phase 3 —— 统一权威 + 降耦合**（按子项收益排序，每子项独立可验证）
+把侧区 reserve/落字节 + prefetch 落槽收进同一套 C++ `PoolManager` 分配器（统一锁与 LFU），
+并按审计结论逐项消除 `block.py` 的内部窥探。全程保持 Phase 1 的容量不变性 + STG_VERIFY 绿。
+
+- **P3-a promote 落真实区迁 C++**：Python `_place_expert` + `_slice` 逐专家 scatter
+  （`native_staging.py:143-177`）→ C++ `promote_to_real(route_inds)` 直写 `g_real`，与侧区预取对称。
+- **P3-b `route_used_subset` 并入 C++ promote**：消掉 GPU 路径每层 ≤16 int 的 `.tolist()`
+  （`native_staging.py:46`），改为 C++ 内用 GPU membership 现算过滤假阳性。
+- **P3-c 侧区∪真实区 overlay 迁 C++**：`acquire_gpu_dual` 的 Python `eff[keys]=vals` 搭图
+  （`resident_pool.py:576-578`）→ C++ 单次 gather 合并（`sideregion_kv` 已是 device 数组，基础在）。
+- **P3-d 统一并行读（大头）**：`blob_loader` 的 Python `ThreadPoolExecutor(8)` 与 C++ `BgReader`
+  是重复的两套并行 pread。→ **BgReader 作为唯一 IO 线程池**，Python demand/host 只提交 ticket + wait。
+  风险稍高（涉及物化 numpy→mx.array 的归属），排在本 Phase 末尾、单独开关灰度。
+- **P3-e 删 resident 快照跨界**：submit/promote 不再从 Python 传 `resident_experts` list，C++ 内读 `g_real`。
+- **P3-f Python 读 C++ 状态降级为只读诊断**：`real_region_contents/_count/real_freq/sideregion_contents/`
+  `demand_last_stats/last_ready` 统一为只读 API；删 Python `_slot_of/_free/_freq/_slot_table` 死影子。
+
+> 留在 Python（不迁）：gate + argpartition（已在 GPU、无 host 往返）、`_native_fused_prefetch` 的
+> 预测 gate 搭图（要访问下层 gate/norm 权重，迁 C++ 收益有限）、`PersistentSubGLU` 计算、
+> MTP `generate.py` 块级调度、配置接线、诊断（route_trace/miss_attrib/STG_VERIFY）。
 
 **Phase 4 —— 收尾**
 - oracle 干净后，把统一 C++ 路径设为默认（评估 `NATIVE_DEMAND_DUAL` 默认值翻转）。
@@ -187,6 +233,7 @@ gate → inds(lazy) ─┐
 | 侧区 gen 新鲜度错槽（即 61 的疑犯） | Phase 2 专门 root-cause；STG_VERIFY 逐槽字节校验 |
 | 迁移引入回归 | 全程 config 开关门控（默认 off 直到 oracle 干净），可秒回退 Python 路径 |
 | C++ 状态与 Python 只读路径不一致 | Python 只读查询统一改查 C++（单一权威），不维护双份 |
+| P3-d 统一并行读：物化（numpy→mx.array）归属与 GIL | BgReader 只统一 pread；物化保留 lazy 切片；单独开关灰度、排 Phase 3 末尾 |
 
 ---
 
@@ -215,5 +262,8 @@ gate → inds(lazy) ─┐
 
 1. **走全量迁移（方案 B 全量）**：真实区+侧区+demand+prefetch 收进一套 C++ 分配器、单一权威、canonical LFU。
 2. **正确性口径 = 容量不变性 + 字节真值**（非「全常驻」）。
-3. **顺序**：先修现有方案 B 到 oracle 干净（Phase 2，直接兑现 exact 收益），再统一侧区/prefetch 权威（Phase 3）。
+3. **顺序**：先修现有方案 B 到 oracle 干净（Phase 2，直接兑现 exact 收益），再统一侧区/prefetch 权威 + 降耦合（Phase 3）。
 4. **cap**：不作 40 硬约束；Phase 0 用 `union_prof` 实测下限（预期 cap=32 已够）。
+5. **降耦合范围（2026-07-04 审计后并入 Phase 3）**：promote/route_used_subset/overlay 迁 C++、
+   统一 BgReader 并行读、删 resident 快照跨界与 Python 死影子；目标是 `block.py` 塌缩为
+   「gate → 一次 `PoolManager.acquire` / 一次 `prefetch`」。gate/预测搭图/计算 kernel/MTP 调度留 Python。
