@@ -77,6 +77,30 @@ def _build_engine(args, on_status=None):
     return model, tok, drafter
 
 
+def _warmup(model, tok, drafter, args):
+    """跑一次生成做预热:首轮的明显卡顿主要来自现编译 Metal kernel + 填 MoE 专家 resident 池,
+    提前把这部分一次性开销移到加载阶段。
+
+    覆盖增强:用一段**较长、token id 跨大跨度词表分散**的合成 prompt——MoE 路由依赖 token 内容,
+    分散的 id 会命中更多专家、更充分地预填专家池;较长 prompt 又能走通多块分块 prefill。
+    合成 id 直接走 ids_mode(不依赖 tokenizer),分块 prefill(chunk=2)保证长 prompt 也不抬高显存峰值。
+    预热失败不致命(直接吞掉异常),不影响后续真实生成。
+    """
+    import mlx.core as mx
+
+    from mlx_streaming.mtp.generate import mtp_generate
+
+    try:
+        vocab = int(model.model.embed_tokens.weight.shape[0])
+        n = min(64, vocab)                       # 预热 prompt 长度(兼顾覆盖与耗时)
+        step = max(1, vocab // n)                 # 在词表内均匀取样,最大化专家覆盖
+        ids = [(1 + i * step) % vocab for i in range(n)]
+        mtp_generate(model, drafter, tok, mx.array([ids]), 8,
+                     K=args.k, ids_mode=True)
+    except Exception:  # noqa: BLE001  预热仅为压首轮延迟,失败不应中断启动
+        pass
+
+
 def _encode_chat(tok, messages):
     """把多轮对话按聊天模板编码成 token id 列表。"""
     tmpl = getattr(tok, "chat_template", None)
@@ -142,16 +166,20 @@ def _chat_repl(args):
     import mlx.core as mx
 
     from mlx_streaming.mtp.generate import mtp_generate
+    from mlx_streaming.tui.backend import _reuse_prefix_len
 
     eos = _eos_set(tok)
     base_messages = []
     if args.system:
         base_messages.append({"role": "system", "content": args.system})
     messages = list(base_messages)
+    # 跨轮复用:持久化上一轮 main_cache 及其对应的 token 序列(与 MLXBackend 同机制)。
+    main_cache = None
+    cached_ids: list[int] = []
 
-    print("\n模型已就绪。首轮生成会因编译 Metal kernel + 补专家池而明显偏慢,属正常现象。",
-          file=sys.stderr, flush=True)
-    print("输入 /help 查看命令,/exit 退出。", file=sys.stderr, flush=True)
+    print("\n正在预热(编译 kernel + 填专家池)…", file=sys.stderr, flush=True)
+    _warmup(model, tok, drafter, args)
+    print("模型已就绪。输入 /help 查看命令,/exit 退出。", file=sys.stderr, flush=True)
 
     while True:
         try:
@@ -165,6 +193,7 @@ def _chat_repl(args):
             break
         if user == "/reset":
             messages = list(base_messages)
+            main_cache, cached_ids = None, []       # 清历史同时弃用旧 cache
             print("对话历史已清空。", file=sys.stderr)
             continue
         if user == "/help":
@@ -174,11 +203,33 @@ def _chat_repl(args):
         messages.append({"role": "user", "content": user})
         ids = _encode_chat(tok, messages)
 
+        # 旧 cache 是本轮 prompt 的严格前缀时只 prefill 新增后缀,否则全量重建。
+        cached_len = (_reuse_prefix_len(cached_ids, ids)
+                      if main_cache is not None else 0)
+        cur_cache = main_cache if cached_len else model.make_cache()
+
+        # EOS 提前停止:否则会空跑到 max_tokens,且 produced 会含 EOS 后垃圾 token,
+        # 使 cached_ids 与下轮编码前缀断裂、复用永不触发。
+        produced_all: list[int] = []
+
+        def _on_tokens(new_ids):
+            produced_all.extend(new_ids)
+            truncated = _truncate_eos(produced_all, eos)
+            return len(truncated) < len(produced_all)
+
         t0 = time.perf_counter()
         produced, stats = mtp_generate(
             model, drafter, tok, mx.array([ids]),
-            args.max_tokens, K=args.k, ids_mode=True, profile=args.stats)
+            args.max_tokens, K=args.k, ids_mode=True, profile=args.stats,
+            on_tokens=_on_tokens, main_cache=cur_cache, cached_len=cached_len)
         dt = time.perf_counter() - t0
+
+        # offset 对账:仅无 over-commit 时记录 cache 供下轮复用(见 MLXBackend.generate)。
+        if stats.get("resident_tokens") == len(ids) + len(produced) - 1:
+            main_cache = cur_cache
+            cached_ids = list(ids) + list(produced[:-1])
+        else:
+            main_cache, cached_ids = None, []
 
         out_ids = _truncate_eos(produced, eos)
         text = tok.decode(out_ids)
@@ -202,8 +253,8 @@ def _add_chat_args(p):
     p.add_argument("--qn-config", default=config.qn_config(),
                    help="Qwen3-Next 配置 JSON")
     p.add_argument("-k", "--k", type=int, default=3, help="MTP 投机宽度(默认 3)")
-    p.add_argument("-n", "--max-tokens", type=int, default=512,
-                   help="每轮最多生成的新 token 数(默认 512)")
+    p.add_argument("-n", "--max-tokens", type=int, default=4096,
+                   help="每轮最多生成的新 token 数(默认 4096)")
     p.add_argument("--expert-slots", type=int, default=32,
                    help="常驻专家池容量(默认 32,同时作为侧区行数默认)")
     p.add_argument("--spec-slots", type=int, default=None,

@@ -17,6 +17,10 @@ native/bench/compute_buffer_bench
 native/bench/metal_staging_bench
 native/bench/metal_fused_moe_bench
 native/bench/native_moe_runner
+native/bench/mmap_global_gather_spike
+# benchmark 一次性运行产物(JSON/日志):报告 .md 仍入库,原始跑数不入库
+benchmarks/reports/*.json
+benchmarks/reports/*.log
 # 由 `make -C native/ext native_moe_ext` 生成的 MLX 扩展(.so 不入库,需现场编译)
 mlx_streaming/native_moe_ext*.so
 # 模型权重软链与 GPU trace 等大体积产物不入库

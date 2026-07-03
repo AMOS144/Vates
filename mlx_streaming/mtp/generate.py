@@ -185,7 +185,7 @@ def tree_verify_step(model, drafter, x, H_last, x_ids, mtp_cache, main_cache, K,
 
 # ----------------------------------------------------------------- 主循环
 def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
-                 profile=False, on_tokens=None):
+                 profile=False, on_tokens=None, main_cache=None, cached_len=0):
     """贪婪 MTP 自投机。
 
     drafter 需提供 draft(H_last(1,1,H), x_ids(1,1), mtp_cache, K) -> list[int](长度 K);
@@ -193,14 +193,26 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     ids_mode=True 时 prompt 已是 ids(1,L) 且返回 token id 列表(测试用)。
     on_tokens:可选流式钩子,每步用「本步真正写入 produced 的 token id 列表」回调一次
     (prefill 的首 token 作为第一次回调);返回 True 表示请求尽快停止生成。
+
+    跨轮复用(main_cache/cached_len):传入已持有前 cached_len 个 prompt token 的 main_cache,
+    则只 prefill `prompt[:, cached_len:]`(等价于一次多 token decode,复用历史 KV/递归态,不重算)。
+    调用方须保证 prompt[:cached_len] 与 cache 中已有 token 完全一致(否则结果错误)。
+    不变式:返回时 main_cache 恰好持有 `prompt + produced[:-1]`(produced[-1] 为 pending,未入 cache),
+    调用方可据此拼下轮的 cached prefix。main_cache=None 时内部新建(默认,整段 prefill)。
     """
     enable_qwen3next_speculative_checkpoints()
-    main_cache = model.make_cache()
+    if main_cache is None:
+        main_cache = model.make_cache()
+        cached_len = 0
     mtp_cache = drafter.make_cache() if hasattr(drafter, "make_cache") else None
     ids = prompt if ids_mode else mx.array([tok.encode(prompt)])
+    if cached_len < 0 or cached_len >= ids.shape[1]:
+        raise ValueError(
+            f"cached_len={cached_len} 必须落在 [0, prompt_len={ids.shape[1]}) 内,至少留 1 个 token 供 prefill")
 
-    # prefill(分块):得到第 1 个 pending token x 与其 hidden;分块把激活峰值压到与 decode 同稳态。
-    logits, H = prefill_chunked(model, ids, main_cache)
+    # prefill(分块):只喂尚未在 cache 中的后缀 ids[:, cached_len:](cached_len==0 即整段);
+    # 得到第 1 个 pending token x 与其 hidden;分块把激活峰值压到与 decode 同稳态。
+    logits, H = prefill_chunked(model, ids[:, cached_len:], main_cache)
     x = int(mx.argmax(logits[:, -1, :]))
     H_last = H[:, -1:, :]
     produced = [x]
@@ -406,9 +418,17 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
 
     produced = produced[:max_tokens]
     wall = time.perf_counter() - t0
+    # cache 实际驻留 token 数(以可裁剪 cache 的 offset 为准),供跨轮复用精确对账:
+    # 末步多 token 跨 max_tokens 会 over-commit(cache 领先于 produced),据此识别并禁用复用。
+    resident_tokens = None
+    for c in main_cache:
+        if getattr(c, "is_trimmable", None) and c.is_trimmable() and hasattr(c, "offset"):
+            resident_tokens = int(c.offset)
+            break
     stats = {
         "steps": n_steps,
         "tokens": len(produced),
+        "resident_tokens": resident_tokens,
         "avg_accept_len": round(len(produced) / max(n_steps, 1), 3),
         "wall_s": round(wall, 3),
         "verify_mode": verify_mode,

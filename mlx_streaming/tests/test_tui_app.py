@@ -158,19 +158,73 @@ async def test_load_failed_shows_error_and_status():
         assert any("模型文件缺失" in m.text for m in msgs)
 
 
+def test_window_tps_uses_recent_samples_only():
+    """滑动窗口瞬时速度:只按最近 ~窗口 内的采样算,旧采样被丢弃。"""
+    app = VatesApp(FakeBackend(), _args())
+    app._tps_window = 1.0
+    # 前 1 秒 20 token → 窗口内 (100.0,0)→(101.0,20),瞬时 20 tok/s
+    app._record_sample(100.0, 0)
+    app._record_sample(100.5, 10)
+    app._record_sample(101.0, 20)
+    assert app._window_tps(101.0) == 20.0
+    # 之后一段变慢:now=102.5,窗口(1s)内应丢掉 100.0/100.5,基准变成 (101.0,20)
+    app._record_sample(102.5, 40)
+    assert app._samples[0] == (101.0, 20)
+    # (40-20)/(102.5-101.0) = 20/1.5 ≈ 13.33,反映当前速度而非历史平均
+    assert abs(app._window_tps(102.5) - (20 / 1.5)) < 1e-6
+
+
+def test_window_tps_needs_two_samples():
+    """采样不足两点时不出速度(避免除零/瞎猜)。"""
+    app = VatesApp(FakeBackend(), _args())
+    app._record_sample(100.0, 5)
+    assert app._window_tps(100.0) is None
+
+
 @pytest.mark.asyncio
-async def test_stream_updates_status_with_live_tokens_and_speed():
-    """流式过程中状态栏应实时显示 token 数与 tok/s,而非等结束才显示。"""
-    import time
+async def test_stream_status_shows_tokens_then_windowed_speed():
+    """生成中状态栏:首次回调只显示 token 数,拿到第二个采样后显示瞬时 tok/s。"""
     app = VatesApp(FakeBackend(), _args())
     async with app.run_test() as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
         app._cur = app._add("assistant", "", final=False)
-        app._gen_t0 = time.monotonic() - 1.0   # 假装已过 1 秒,tok/s 可算
-        app._on_stream("你好世", 3)
+        app._gen_t0 = 0.0
+        app._n0 = 0
+        app._samples.clear()
+        # 首次回调:只记基准,尚无法算窗口速度
+        app._on_stream("你好世界呀", 5)
+        assert app._gen_t0 != 0.0 and app._n0 == 5
+        s1 = str(app.query_one("#status").content)
+        assert "5 tok" in s1
+        assert "tok/s" not in s1
+        # 制造一个时间差,第二次回调应显示滑动窗口瞬时速度
+        app._samples[0] = (app._samples[0][0] - 1.0, 5)
+        app._on_stream("你好世界呀又三字", 8)
+        s2 = str(app.query_one("#status").content)
+        assert "8 tok" in s2
+        assert "tok/s" in s2
+
+
+@pytest.mark.asyncio
+async def test_final_status_uses_cumulative_decode_average():
+    """结束时的最终数字用累计解码平均(排除 prefill),而非后端上报值或瞬时窗口。"""
+    import time
+    from mlx_streaming.tui.backend import GenResult
+    app = VatesApp(FakeBackend(), _args())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
         await pilot.pause()
+        app._cur = app._add("assistant", "", final=False)
+        # 首 token 在 ~2 秒前到达,基准 2 token;本轮共产出 22 token
+        app._gen_t0 = time.monotonic() - 2.0
+        app._n0 = 2
+        app._on_done(GenResult(text="回答", n_tokens=22, tok_per_s=999.0, stopped=False))
         status = str(app.query_one("#status").content)
-        assert "思考中" in status
-        assert "3 tok" in status
-        assert "tok/s" in status
+        assert "就绪" in status
+        assert "22 tok" in status
+        assert "999" not in status  # 不用后端上报值
+        # (22-2)/≈2s ≈ 10 tok/s(考虑真实墙钟略大于 2s,给个范围)
+        import re
+        m = re.search(r"([\d.]+) tok/s", status)
+        assert m is not None and 9.0 <= float(m.group(1)) <= 10.0

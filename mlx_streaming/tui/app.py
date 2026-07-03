@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections import deque
 from typing import Optional
 
 from rich.console import Group
@@ -21,6 +22,9 @@ from mlx_streaming.tui.backend import ChatBackend, GenResult
 from mlx_streaming.tui.banner import LOGO
 
 _ACCENT = "#2dd4bf"
+
+# 生成中状态栏用滑动窗口算「瞬时」tok/s 的时间窗(秒);越小越灵敏、越大越平滑。
+_TPS_WINDOW = 1.0
 
 _HELP = (
     "可用命令:\n"
@@ -93,19 +97,35 @@ class VatesApp(App):
         self._busy = False
         self._stop = False
         self._cur: Optional[ChatMessage] = None
-        self._gen_t0 = 0.0  # 本轮生成起始时刻,用于实时 tok/s
+        # 首 token 到达时刻与基准 token 数,用于结束时计算「累计解码平均」tok/s
+        # (排除 prefill)。_gen_t0 为 0.0 表示本轮尚未收到首 token。
+        self._gen_t0 = 0.0
+        self._n0 = 0
+        # 生成中「瞬时」tok/s 的滑动窗口采样:每项为 (时刻, 累计 token 数)。
+        self._tps_window = _TPS_WINDOW
+        self._samples: deque[tuple[float, int]] = deque()
 
     def compose(self) -> ComposeResult:
         yield Static(self._top_text(), id="top")
         yield VerticalScroll(id="chat")
-        yield Input(placeholder="输入消息，回车发送，/help 查看命令", id="prompt")
+        # 提示放到边框标题里,不用文本区的 placeholder:
+        # 长占位符在部分终端增量重绘时不会被擦除,打字后会残留「后面还有字」,
+        # 直到全量重绘(Enter/截图/resize)才消失;边框标题在边框上,不受此影响。
+        yield Input(id="prompt")
         yield Static("", id="status")
 
     def on_mount(self) -> None:
+        inp = self.query_one("#prompt", Input)
+        inp.border_title = "输入消息 · Enter 发送 · Esc 中断 · /help"
         # 加载完成前禁用输入框,避免用户在模型就绪前发消息
-        self.query_one("#prompt", Input).disabled = True
+        inp.disabled = True
         self._set_status("加载模型中…")
         self._load()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # 兜底:强制整屏重绘,清除个别终端增量重绘遗留的输入残影
+        # (等价于截图/resize 触发的全量刷新)。
+        self.refresh()
 
     def _top_text(self) -> Text:
         t = Text()
@@ -188,7 +208,10 @@ class VatesApp(App):
         self._cur = self._add("assistant", "", final=False)
         self._busy = True
         self._stop = False
-        self._gen_t0 = time.monotonic()
+        # 置 0 表示还没收到首 token;真正的计时起点推迟到第一次 _on_stream。
+        self._gen_t0 = 0.0
+        self._n0 = 0
+        self._samples.clear()
         self.query_one("#prompt", Input).disabled = True
         self._set_status("思考中…")
         self._generate(list(self._messages))
@@ -215,14 +238,41 @@ class VatesApp(App):
         if self.is_running:
             self.call_from_thread(self._on_done, result)
 
+    def _record_sample(self, now: float, n_tokens: int) -> None:
+        """记录一次采样,并丢弃早于滑动窗口的旧点(保留跨越窗口边界的那一个)。"""
+        self._samples.append((now, n_tokens))
+        w = self._tps_window
+        # 当第二个点仍比窗口还老时,第一个点已冗余,可丢弃;
+        # 循环后 _samples[0] 恰好是刚跨过窗口边界的采样,窗口长度 ≈ w。
+        while len(self._samples) >= 2 and now - self._samples[1][0] >= w:
+            self._samples.popleft()
+
+    def _window_tps(self, now: float) -> Optional[float]:
+        """按滑动窗口算瞬时 tok/s;样本不足(不够两点或时间差为 0)时返回 None。"""
+        if len(self._samples) < 2:
+            return None
+        t0, n0 = self._samples[0]
+        dt = now - t0
+        if dt <= 0:
+            return None
+        return (self._samples[-1][1] - n0) / dt
+
     def _on_stream(self, full: str, n_tokens: int) -> None:
         if self._cur is not None:
             self._cur.stream(full)
             self._scroll_end()
-        # 实时刷新状态栏:token 数 + 即时吞吐(按本轮墙钟计算)
-        dt = time.monotonic() - self._gen_t0
-        tps = n_tokens / dt if dt > 0 else 0.0
-        self._set_status(f"思考中 · {n_tokens} tok · {tps:.1f} tok/s")
+        now = time.monotonic()
+        # 首次回调:prefill 刚结束,记下计时起点与基准 token 数,供结束时算累计解码平均。
+        if self._gen_t0 == 0.0:
+            self._gen_t0 = now
+            self._n0 = n_tokens
+        # 生成中显示滑动窗口「瞬时」速度:一直在动,能反映后期变慢,不被历史平均拖住。
+        self._record_sample(now, n_tokens)
+        tps = self._window_tps(now)
+        if tps is None:
+            self._set_status(f"思考中 · {n_tokens} tok")
+        else:
+            self._set_status(f"思考中 · {n_tokens} tok · {tps:.1f} tok/s")
 
     def _on_done(self, result: GenResult) -> None:
         if self._cur is not None:
@@ -231,8 +281,15 @@ class VatesApp(App):
         self._busy = False
         self._cur = None
         suffix = " · 已中断" if result.stopped else ""
+        # 与流式状态栏同口径:从首 token 起、按解码 token 数算,避免结束瞬间数字回落。
+        # 若本轮没触发过流式(_gen_t0 仍为 0),退回后端上报的 tok/s。
+        dt = time.monotonic() - self._gen_t0
+        if self._gen_t0 > 0.0 and dt > 0:
+            tps = (result.n_tokens - self._n0) / dt
+        else:
+            tps = result.tok_per_s
         self._set_status(
-            f"就绪 · {result.n_tokens} tok · {result.tok_per_s:.1f} tok/s{suffix}")
+            f"就绪 · {result.n_tokens} tok · {tps:.1f} tok/s{suffix}")
         self._enable_input()
 
     def _on_error(self, err: str) -> None:

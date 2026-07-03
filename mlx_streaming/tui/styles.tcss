@@ -29,6 +29,7 @@ Screen {
 #prompt {
     margin: 0 2;
     border: round #2dd4bf;
+    border-title-color: #8b93a7;
     background: #11151f;
 }
 
