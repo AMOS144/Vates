@@ -20,12 +20,12 @@ _HAS_MODEL = os.path.exists(_cfg.qn_config()) and os.path.exists(_cfg.mtp_out())
 pytestmark = pytest.mark.skipif(not _HAS_MODEL, reason="需真实 80B 模型权重")
 
 _DV_KEY = "DUAL_VERIFY.resident(_verify_side_bytes)"
+_SV_KEY = "STG_VERIFY.virtual(_verify_native_bytes)"
 
 
-def test_pool_bytes_are_disk_truth():
+def _run(env_extra, maxtok):
     env = dict(os.environ)
     env.update(
-        DUAL_VERIFY="1",
         STREAM_BLOB_LOADER="1",
         NATIVE_FUSED_PREFETCH="1",
         ZEROCOPY_DUAL_SOURCE="1",
@@ -33,16 +33,15 @@ def test_pool_bytes_are_disk_truth():
         EXPERT_SLOTS="48",
         POOL_SPEC_SLOTS="32",
         K="3",
-        MAXTOK="32",
+        MAXTOK=str(maxtok),
         WARMUP_TOK="0",
         REPEAT="1",
     )
+    env.update(env_extra)
     r = subprocess.run(
         [sys.executable, "-m", "mlx_streaming.runtime.run_mtp_spec"],
         env=env, capture_output=True, text=True, timeout=1800,
     )
-    assert "[DUAL_VERIFY] BAD" not in r.stdout, f"检测到池槽字节污染:\n{r.stdout[-3000:]}"
-
     summary = None
     for line in r.stdout.splitlines():
         if line.startswith("VERIFY_SUMMARY "):
@@ -51,6 +50,23 @@ def test_pool_bytes_are_disk_truth():
         f"未捕获 VERIFY_SUMMARY (rc={r.returncode})\n"
         f"stdout尾:\n{r.stdout[-2000:]}\nstderr尾:\n{r.stderr[-2000:]}"
     )
+    return r, summary
+
+
+def test_python_path_bytes_are_disk_truth():
+    # Python 权威路径(NATIVE_DEMAND_DUAL=0)：DUAL_VERIFY 校验 acquire_gpu_dual 侧区字节真值。
+    r, summary = _run({"DUAL_VERIFY": "1", "NATIVE_DEMAND_DUAL": "0"}, maxtok=32)
+    assert "[DUAL_VERIFY] BAD" not in r.stdout, f"检测到池槽字节污染:\n{r.stdout[-3000:]}"
     dv = summary.get(_DV_KEY, {})
     assert dv.get("bad", -1) == 0, f"DUAL_VERIFY 检出坏字节：{dv}"
     assert dv.get("ok", 0) > 0, f"DUAL_VERIFY 未实际校验（ok=0），oracle 失效：{dv}"
+
+
+def test_demand_dual_bytes_are_disk_truth():
+    # 生产默认路径(demand_dual)：STG_VERIFY 校验 C++ 真实区每槽字节 == 属主专家 blob 真值。
+    # 逐槽 pread 较慢,故用较短 MAXTOK(仍足以覆盖多轮驱逐/落池)。
+    r, summary = _run({"STG_VERIFY": "1", "NATIVE_DEMAND_DUAL": "1"}, maxtok=16)
+    assert "[STG_VERIFY-DUAL] BAD" not in r.stdout, f"检测到 demand_dual 落池字节错:\n{r.stdout[-3000:]}"
+    sv = summary.get(_SV_KEY, {})
+    assert sv.get("bad", -1) == 0, f"STG_VERIFY 检出坏字节：{sv}"
+    assert sv.get("ok", 0) > 0, f"STG_VERIFY 未实际校验（ok=0），oracle 失效：{sv}"

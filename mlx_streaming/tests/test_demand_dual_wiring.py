@@ -18,7 +18,7 @@ def _rp(spec=8, native=None):
 
 
 def test_flag_off_keeps_python_authority(monkeypatch):
-    # 默认(未开 NATIVE_DEMAND_DUAL)：_native_demand=False → Python 权威路径。
+    # 显式关(NATIVE_DEMAND_DUAL=0)：_native_demand=False → 回退 Python 权威路径。
     monkeypatch.setattr(config, "native_demand_dual", lambda: False)
     rp = _rp(spec=8)
     assert rp._native_demand is False
