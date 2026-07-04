@@ -13,6 +13,7 @@
 #include <utility>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -379,7 +380,8 @@ static std::map<std::pair<int, int>, SideLayer> g_side;   // 键 (layer, gen)：
 
 // C++ 拥有的稳定字节缓冲：键 (layer, gen)，大小 spec*stride，按 (row-base)*stride 索引。
 // 侧区字节写进这里（永不被 MLX 迁移），consume 时由 Python 用 MLX 追踪的 scatter 落池。
-static std::map<std::pair<int, int>, std::vector<uint8_t>> g_side_bytes;
+// 用 shared_ptr：在途 bg 读任务拷一份 shared_ptr 保活其旧 buffer，reset/换代时新建替换互不影响 → 杜绝 UAF。
+static std::map<std::pair<int, int>, std::shared_ptr<std::vector<uint8_t>>> g_side_bytes;
 
 // 临时诊断：只追踪指定 (layer,row) 的所有账本/字节事件（SIDE_TRACE_LAYER/ROW）。
 static inline bool side_trace_hit(int layer, int row) {
@@ -587,20 +589,20 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
     (void)ptrs;   // 不再旁路写 MLX 池 buffer：字节改写进 C++ 稳定缓冲
     (void)seg;    // 段拆分推迟到 sideregion_publish（消费时用 MLX scatter 落池）
     int base = 0;
+    std::shared_ptr<std::vector<uint8_t>> buf_sp;
     {
-      // 确保稳定字节缓冲已按 spec*stride 分配好（首次或 stride 变化时重置）。
+      // 单锁作用域：get-or-create 稳定缓冲，按需整体替换（新建 shared_ptr，不动在途旧 buffer），
+      // 并拷一份 shared_ptr 到局部保活 → reset/换代都不会让 bufp 悬垂。
       std::lock_guard<std::mutex> lk(g_side_mutex);
       SideLayer& c = g_side[{layer, gen}];
       base = c.base;
-      auto& buf = g_side_bytes[{layer, gen}];
       size_t want = static_cast<size_t>(c.spec) * stride;
-      if (buf.size() != want) buf.assign(want, 0);
+      auto& slot = g_side_bytes[{layer, gen}];
+      if (!slot || slot->size() != want)
+        slot = std::make_shared<std::vector<uint8_t>>(want, 0);   // 换代/首次：新建，不动在途旧 buffer
+      buf_sp = slot;                                              // 拷贝 shared_ptr 保活到本任务结束
     }
-    uint8_t* bufp;
-    {
-      std::lock_guard<std::mutex> lk(g_side_mutex);
-      bufp = g_side_bytes[{layer, gen}].data();
-    }
+    uint8_t* bufp = buf_sp->data();                              // buf_sp 在函数栈上保活，reset/换代不影响
     int fd = open_blob_nocache(path.c_str());
     if (fd < 0) {                                             // 失败则把预留行还回 free
       std::lock_guard<std::mutex> lk(g_side_mutex);
@@ -736,9 +738,9 @@ std::pair<mx::array, std::vector<mx::array>> sideregion_publish(
     std::lock_guard<std::mutex> lk(g_side_mutex);
     auto it = g_side.find({layer, gen});
     auto bit = g_side_bytes.find({layer, gen});
-    if (it != g_side.end() && bit != g_side_bytes.end() && !it->second.dirty.empty()) {
+    if (it != g_side.end() && bit != g_side_bytes.end() && bit->second && !it->second.dirty.empty()) {
       SideLayer& c = it->second;
-      const std::vector<uint8_t>& buf = bit->second;
+      const std::vector<uint8_t>& buf = *bit->second;   // 解引用 shared_ptr
       int m = static_cast<int>(c.dirty.size());
       rows.reserve(m);
       for (size_t k = 0; k < seg_nbytes.size(); ++k)
