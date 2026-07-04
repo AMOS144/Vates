@@ -193,16 +193,6 @@ def route_trace_enabled() -> bool: return _b("ROUTE_TRACE", "0")
 def stream_prof() -> bool: return _b("STREAM_PROF", "0")
 def probe_predict_only() -> bool: return _b("PROBE_PREDICT_ONLY", "0")
 def probe_perlayer_sync() -> bool: return _b("PROBE_PERLAYER_SYNC", "0")
-# Phase 0 上界探针(throwaway,实测后删):acquire_gpu_dual 跳过 n_miss 同步与 demand 回退,
-# 全当命中、整前向惰性搭图,量「零 per-layer 同步」的 tok/s 上界(输出数值会错,仅测速)。
-def probe_all_hit_lazy() -> bool: return _b("PROBE_ALL_HIT_LAZY", "0")
-# Phase 0 探针2(throwaway):保留每层 n_miss 同步(barrier 仍在),但回退层跳过 demand 读盘+落池,
-# 用于把「per-layer 同步 barrier」与「demand I/O+落池」两块成本拆开。
-def probe_no_demand() -> bool: return _b("PROBE_NO_DEMAND", "0")
-# 方案B：dual 路径真实区槽状态由 C++ demand_dual 全接管(每层 1 次 inds 同步、零主线程落池/记账)。
-# 默认 on=生产路径(已验证:容量不变性 PASS + 字节落池 0 BAD + tok/s +8%,见 schemeB 报告);
-# NATIVE_DEMAND_DUAL=0 回退 Python 权威路径。native 未编译/非 spec 模式也自动回退。
-def native_demand_dual() -> bool: return _b("NATIVE_DEMAND_DUAL", "1")
 # 预取 host 墙钟探针：量 predict/submit/promote 各段主线程不可重叠的 CPU 时间。默认关、零开销。
 def prefetch_tprof() -> bool: return _b("PREFETCH_TPROF", "0")
 # 并集专家数探针:按前向 seq 分桶记每层路由专家并集大小(seq=K 即 MTP verify 的专家并集)。默认关。

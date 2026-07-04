@@ -17,8 +17,6 @@
 """
 import mlx.core as mx
 
-from mlx_streaming.core.prefetch.native_staging import _StagingSide
-
 # 方案B STG_VERIFY 校验累计态（诊断用，默认路径不触及）。
 _stg_verify_state = {"ok": 0, "bad": 0, "printed": 0, "calls": 0}
 
@@ -85,7 +83,7 @@ class VirtualPool:
         """统一取用入口（GPU-remap 路径）：对外呈现「所有专家都在」的视角。
 
         返回 (pool_arrays, local, n_experts)，计算侧零分支：
-        - dual（有侧区 staging 且 spec>0）：真实区表 ∪ 侧区(读代) → acquire_gpu_dual；
+        - dual（有侧区 staging 且 spec>0）：C++ demand_dual 唯一权威（真实区 ∪ 侧区读代单次 gather）；
           n_experts = layer_cap + spec_gens*spec_slots。
         - 非 dual GPU-remap：acquire_gpu；n_experts = layer_cap。
         （host/fetch 路径见 acquire_host，其输入是 host 侧已 .tolist 的 flat，语义不同故分开。）
@@ -93,13 +91,12 @@ class VirtualPool:
         cap = int(layer_cap) if layer_cap is not None else self._rp.cap_for(layer)
         if self._stg is not None and self._spec > 0:
             side_gen = self.read_gen()
-            # 方案B：C++ demand_dual 全接管真实区（每层 1 次 inds 同步、零主线程落池/记账）。
-            # pinned 非空的层不支持（方案B 假设 PIN_HOT=0），退回 Python 权威路径。
-            if getattr(self._rp, "_native_demand", False) and not self._rp._pinned.get(layer):
-                pool, local = self._acquire_native(layer, inds, side_gen, cap)
-            else:
-                side = _StagingSide(self._stg, side_gen)
-                pool, local = self._rp.acquire_gpu_dual(layer, inds, num_experts, side)
+            # C++ demand_dual 是双源 decode 真实区的唯一权威（每层 1 次 inds 同步、零主线程落池/记账）。
+            # 无 Python 退路：native 未编译 demand_dual → 明确报错（decode 依赖 native 全套能力）。
+            if not getattr(self._rp, "_native_demand", False):
+                raise RuntimeError(
+                    "双源 decode 需要 native demand_dual（已成唯一权威），但未检出。请编译 native_moe_ext。")
+            pool, local = self._acquire_native(layer, inds, side_gen, cap)
             n_exp = cap + self._rp.spec_gens * self._rp.spec_slots
             return pool, local, n_exp
         pool, local = self._rp.acquire_gpu(layer, inds, num_experts)
@@ -130,7 +127,7 @@ class VirtualPool:
         if int(inds.size) > int(cap) and not getattr(self, "_overcap_warned", False):
             self._overcap_warned = True
             import sys
-            print(f"[NATIVE_DEMAND_DUAL] 警告：inds.size={int(inds.size)} > cap={int(cap)}，"
+            print(f"[DEMAND_DUAL] 警告：inds.size={int(inds.size)} > cap={int(cap)}，"
                   f"真实区超容量，逐位将不正确。请将 EXPERT_SLOTS 提到 ≥ seq·top_k。", file=sys.stderr, flush=True)
         rp._bootstrap_dual_pool(layer)                       # 首次建池 + real_init（幂等）
         pool_list, seg_nbytes, path, stride = self._native_meta(layer)

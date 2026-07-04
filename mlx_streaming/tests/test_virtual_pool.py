@@ -24,13 +24,11 @@ def test_target_for_skip_no_clamp():
 class _FakeRP:
     spec_gens = 2        # 与真实 ResidentExpertPool 一致（acquire 返回 n_experts 需要）
     spec_slots = 16
+    _native_demand = True   # demand_dual 唯一权威
     def __init__(self):
         self.dual_calls = []
     def cap_for(self, layer):
         return 32
-    def acquire_gpu_dual(self, layer, inds, num_experts, side):
-        self.dual_calls.append((layer, side._gen))     # 记录读代
-        return ("POOL", "LOCAL")
 
 
 class _FakeStg:
@@ -59,10 +57,13 @@ def test_read_fill_gen_disjoint():
     assert vp.read_gen() != vp.fill_gen()
 
 
-def test_acquire_uses_read_gen_prefetch_uses_fill_gen_base():
+def test_acquire_uses_read_gen_prefetch_uses_fill_gen_base(monkeypatch):
     rp, stg = _FakeRP(), _FakeStg()
     vp = VirtualPool(rp, stg, spec_slots=16)
     vp.begin_forward(0)                                  # gen=0：read_gen=1, fill_gen=0
+    monkeypatch.setattr(vp, "_acquire_native",
+                        lambda layer, inds, side_gen, cap: rp.dual_calls.append((layer, side_gen))
+                        or ("POOL", "LOCAL"))
     vp.acquire(5, "INDS", 128)
     vp.prefetch(6, "PRED", [1, 2], ["A", "B"])
     assert rp.dual_calls == [(5, vp.read_gen())]         # 取用走读代
@@ -73,8 +74,8 @@ def test_acquire_uses_read_gen_prefetch_uses_fill_gen_base():
 def test_single_gen_read_equals_fill():
     class _RP1:
         spec_gens = 1
+        _native_demand = True
         def cap_for(self, layer): return 32
-        def acquire_gpu_dual(self, layer, inds, num_experts, side): return None
     class _Stg:
         def submit_pool_sideregion(self, *a, **k): return None
     vp = VirtualPool(_RP1(), _Stg(), spec_slots=16)
@@ -87,8 +88,8 @@ def test_single_gen_read_equals_fill():
 def test_double_gen_still_alternates():
     class _RP2:
         spec_gens = 2
+        _native_demand = True
         def cap_for(self, layer): return 32
-        def acquire_gpu_dual(self, layer, inds, num_experts, side): return None
     class _Stg:
         def submit_pool_sideregion(self, *a, **k): return None
     vp = VirtualPool(_RP2(), _Stg(), spec_slots=16)

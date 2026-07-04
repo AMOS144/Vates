@@ -13,10 +13,6 @@ from typing import Dict, List
 
 import mlx.core as mx
 
-# 诊断门控：侧区命中字节级真值校验（systematic-debugging 取证用，默认关）。
-_DUAL_VERIFY = os.environ.get("DUAL_VERIFY") == "1"
-_dual_verify_state = {"ok": 0, "bad": 0, "printed": 0}
-
 # 诊断门控：staging/acquire_gpu 路径消费侧字节级真值校验（混合 ahead 损坏取证用，默认关）。
 # 在 acquire_gpu 全命中快路径返回前，对本层真实路由命中的每个专家，把池槽字节与磁盘真值
 # 逐 key 比对；不一致即「池槽装错字节」铁证。受 STG_VERIFY=1 控制，对主路径零影响（默认 off）。
@@ -104,11 +100,11 @@ class ResidentExpertPool:
         # GPU remap 路径取证:命中层走纯 GPU 快路径次数 vs 有 miss 回退 host 次数
         self.gpu_fastpath = 0
         self.gpu_fallback = 0
-        # 方案B(1 次同步版)：dual 路径真实区槽状态由 C++ demand_dual 全接管。仅当开关开、spec 模式、
-        # native 已编译时启用；否则保持 Python 权威路径。启用后 _slot_of/_free/_freq 在 dual 路径
-        # 不再维护(死影子)，resident_experts/_count 改查 C++ g_real（预取过滤要用）。
+        # dual 路径真实区槽状态由 C++ demand_dual 唯一权威(无 opt-out)。spec 模式 + native 已编译即启用;
+        # 非 spec(spec_slots==0)或 native 缺失时保持 Python 权威路径(仅 prefill/host/非双源用)。
+        # 启用后 _slot_of/_free/_freq 在 dual 路径不再维护,resident_experts/_count 改查 C++ g_real(预取过滤要用)。
         self._native_demand = False
-        if int(spec_slots) > 0 and config.native_demand_dual():
+        if int(spec_slots) > 0:
             try:
                 import mlx_streaming.native_moe_ext as _N
                 self._native_demand = hasattr(_N, "demand_dual")
@@ -426,6 +422,12 @@ class ResidentExpertPool:
 
         pin 是显式预取，不计入 hit/miss 统计；后续 acquire/acquire_gpu 命中才计 hit。
         """
+        # dual 模式(demand_dual 唯一权威)已弃用 PIN_HOT:真实区归 C++ g_real,Python pinned 不再生效。
+        # 明确报错而非静默无效——请设 PIN_HOT=0。
+        if self._native_demand and list(expert_ids):
+            raise RuntimeError(
+                "PIN_HOT 在 demand_dual(dual 模式)下已弃用:真实区由 C++ g_real 权威、不支持 pin。"
+                "请设 PIN_HOT=0。")
         loaded = {int(e): self.loader(layer, int(e)) for e in expert_ids}
         self.pin_loaded(layer, loaded)
 
@@ -550,84 +552,6 @@ class ResidentExpertPool:
         local = mx.take(self._slot_table[layer], inds)
         return pool_arrays, local
 
-    def _verify_side_bytes(self, layer, inds, sc):
-        """诊断：侧区命中专家 E→行 R，把 pool[R] 各段与 loader(layer,E) 真值逐段比对。
-        不一致即「侧区行装错字节」的铁证（与 timing/gen 无关）。"""
-        pool = self._pools[layer]
-        flat = {int(i) for i in inds.reshape(-1).tolist()}
-        for e in flat:
-            if e not in sc:
-                continue
-            row = int(sc[e])
-            try:
-                truth = self.loader(layer, e)
-            except Exception:
-                continue
-            bad_key = None
-            for k in pool:
-                if k not in truth:
-                    continue
-                a = pool[k][row]
-                b = truth[k]
-                if a.shape != b.shape or not bool(mx.all(a == b)):
-                    bad_key = k
-                    break
-            if bad_key is None:
-                _dual_verify_state["ok"] += 1
-            else:
-                _dual_verify_state["bad"] += 1
-                if _dual_verify_state["printed"] < 12:
-                    _dual_verify_state["printed"] += 1
-                    print(f"[DUAL_VERIFY] BAD layer={layer} expert={e} row={row} "
-                          f"key={bad_key} (ok={_dual_verify_state['ok']} bad={_dual_verify_state['bad']})",
-                          flush=True)
-                # ===== 临时诊断插桩（DUAL_DIAG=1）：辨识 row 实际占用专家（全专家 + 跨层扫描）=====
-                if os.environ.get("DUAL_DIAG") == "1" and _dual_verify_state.get("diag", 0) < 8:
-                    _dual_verify_state["diag"] = _dual_verify_state.get("diag", 0) + 1
-                    seg = pool[bad_key][row]
-                    is_zero = bool(mx.all(seg == 0))
-                    same_row = [int(k2) for k2, v2 in sc.items() if int(v2) == row]
-                    # 占用者辨识：本层全专家扫描（找 pool[row] 到底装的是谁）
-                    occ_same_layer = None
-                    for c in range(512):
-                        try:
-                            t = self.loader(layer, c)
-                        except Exception:
-                            continue
-                        if bad_key in t and t[bad_key].shape == seg.shape and bool(mx.all(seg == t[bad_key])):
-                            occ_same_layer = c
-                            break
-                    # 跨层扫描：若本层找不到，检查相邻层是否装了别层的专家字节（跨层污染）
-                    occ_cross = None
-                    if occ_same_layer is None:
-                        for lyr in range(max(0, layer - 2), layer + 3):
-                            if lyr == layer:
-                                continue
-                            for c in range(512):
-                                try:
-                                    t = self.loader(lyr, c)
-                                except Exception:
-                                    continue
-                                if bad_key in t and t[bad_key].shape == seg.shape and bool(mx.all(seg == t[bad_key])):
-                                    occ_cross = (lyr, c)
-                                    break
-                            if occ_cross:
-                                break
-                    # 对拍 buffer 指针：C++ 侧区 memcpy 写的 ptrs[0]=第一段池数组基址；
-                    # 这里取同一「第一段」池数组的当前基址。若不同即证明 MLX 重分配了池 buffer。
-                    pool_ptr0 = None
-                    try:
-                        import mlx_streaming.native_moe_ext as _N
-                        first_key = next(iter(pool))
-                        pool_ptr0 = hex(_N.array_data_ptr(pool[first_key]))
-                    except Exception as _e:
-                        pool_ptr0 = f"err:{_e}"
-                    print(f"[DUAL_DIAG] layer={layer} e2r_says={e}->row{row} bad_key={bad_key} "
-                          f"row_is_zero={is_zero} occ_same_layer={occ_same_layer} "
-                          f"occ_cross_layer={occ_cross} experts_mapped_to_row={same_row} "
-                          f"e2r_size={len(sc)} routed_this_e={e in flat} "
-                          f"pool_ptr0(first_key={next(iter(pool))})={pool_ptr0}", flush=True)
-
     def verify_acquire_bytes(self, layer, inds, stg=None):
         """诊断(STG_VERIFY)：acquire 后把本层真实路由命中专家的池槽字节与磁盘真值逐 key 比对。
 
@@ -674,79 +598,6 @@ class ResidentExpertPool:
                     print(f"[STG_VERIFY] BAD call={call} layer={layer} expert={e} "
                           f"slot={slot} gen={gen} key={bad_key} "
                           f"(ok={st['ok']} bad={st['bad']})", flush=True)
-
-    def acquire_gpu_dual(self, layer, inds, num_experts, side):
-        """侧区零拷贝双源 decode 取数：真实区表叠加 C++ 侧区条目 → 单次 gather。
-
-        side.kv(layer) -> (keys uint32, vals int32) 两个 device mx.array（C++ 直接从 e2r map 建，
-        避免 Python 侧每层 dict 构建 + list(...)→mx.array 的 host 胶水；快路径零 per-expert host work）。
-        """
-        base = self._ensure_table(layer, num_experts)   # 真实区表（int32 [E]）
-        # ===== 临时诊断（POOL_PTR_TRACE=层号）：辨识池数组对象是否被换 + buffer 是否漂移 =====
-        if os.environ.get("POOL_PTR_TRACE") is not None and layer == int(os.environ["POOL_PTR_TRACE"]) \
-                and layer in self._pools:
-            try:
-                import mlx_streaming.native_moe_ext as _N
-                _p = self._pools[layer]
-                _fk = next(iter(_p))
-                print(f"[POOL_PTR] consume layer={layer} key={_fk} obj_id={id(_p[_fk])} "
-                      f"ptr={hex(_N.array_data_ptr(_p[_fk]))}", flush=True)
-            except Exception as _e:
-                print(f"[POOL_PTR] err {_e}", flush=True)
-        keys, vals = side.kv(layer)
-        has_side = int(keys.size) > 0                    # .size 只读 shape，无 GPU 同步
-        # Route 3 底座：侧区字节已由 C++ 后台直写进 C++-owned 池 buffer（地址恒定不迁移），
-        # 无需消费侧 MLX scatter 发布；e2r 叠加即寻址到已就绪的侧区行。
-        eff = mx.array(base) if has_side else base       # 无侧区条目时直接用 base，省掉每层一次 256-int 拷贝
-        if has_side:
-            eff[keys] = vals                             # vals 为 int32，与 base.dtype 一致
-        local = mx.take(eff, inds)
-        if config.probe_all_hit_lazy() and layer in self._pools:
-            # Phase 0 上界探针(throwaway):池已建时跳过 n_miss 同步与 demand 回退,全当命中、
-            # 整前向惰性搭图,量「零 per-layer 同步」的 tok/s 上界(缺失专家读脏字节 → 数值错,仅测速)。
-            # 池未建(首 token 预热)则落到下面正常路径先把池建起来。
-            self.gpu_fastpath += 1
-            return self._pools[layer], local
-        n_miss = int(mx.sum((local < 0).astype(mx.int32)))   # 唯一同步（与 demand 同）
-        if config.probe_no_demand() and layer in self._pools:
-            # Phase 0 探针2(throwaway):保留上面的 n_miss 同步 barrier,但跳过 demand 读盘+落池,
-            # miss 位置返回脏 local(仅测速)。与探针1 对比可拆分「barrier」vs「demand I/O+落池」成本。
-            if n_miss == 0:
-                self.gpu_fastpath += 1
-            else:
-                self.gpu_fallback += 1
-            return self._pools[layer], local
-        if n_miss == 0:
-            if _DUAL_VERIFY and has_side:
-                sc = {int(k): int(v) for k, v in zip(keys.tolist(), vals.tolist())}
-                self._verify_side_bytes(layer, inds, sc)
-            self.gpu_fastpath += 1
-            self.hits += int(inds.size)
-            if self.eviction_policy == "lfu":
-                self._note_access(layer, [int(i) for i in inds.reshape(-1).tolist()])
-            return self._pools[layer], local
-        # 真 miss：eff 已叠加侧区，故 local<0 恰为真 miss（既不在真实区、也不在侧区）。
-        # 单次同步取回两列：本前向全部 inds 原 id + 每位置的 local（<0 即 miss）。
-        # 为什么要拿全部 inds：demand 落 miss 需驱逐腾槽，若只保护 miss 集，会把本前向仍需的
-        # 命中专家挤掉 → 其 slot 被复用 → 重算 local 里该专家变 -1 → gather 读 row-1 错字节，
-        # 在 cap 逼近单前向唯一专家数时确定性破坏容量不变性。故把全部 inds 作为驱逐保护集。
-        self.gpu_fallback += 1
-        flat_local = local.reshape(-1)
-        flat_inds = inds.reshape(-1).astype(mx.int32)
-        combo = mx.stack([flat_inds, flat_local.astype(mx.int32)], axis=0)
-        combo_host = combo.tolist()                          # 唯一同步
-        inds_host, local_host = combo_host[0], combo_host[1]
-        miss_ids = [inds_host[i] for i in range(len(inds_host)) if local_host[i] < 0]  # 真 miss(带重复)
-        self.hits += int(inds.size) - len(miss_ids)          # 位置口径，与快路径一致
-        if miss_ids:
-            protect = {int(v) for v in inds_host}            # 本前向全部 inds：落 miss 时不可被驱逐
-            self.acquire(layer, miss_ids, protect=protect)   # dedup+note_access+pread+落池+补表
-        base = self._slot_table[layer]
-        eff = mx.array(base) if has_side else base
-        if has_side:
-            eff[keys] = vals
-        local = mx.take(eff, inds)
-        return self._pools[layer], local
 
     def hit_rate(self) -> float:
         tot = self.hits + self.misses

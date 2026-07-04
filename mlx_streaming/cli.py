@@ -28,7 +28,6 @@ _FASTPATH_ENV = {
     "NATIVE_FUSED_PREFETCH": "1",
     "ZEROCOPY_DUAL_SOURCE": "1",
     "SIDEREGION_LFU": "1",
-    "NATIVE_DEMAND_DUAL": "1",   # 真实区槽状态 C++ demand_dual 全接管(单一权威,+8% tok/s)
 }
 
 

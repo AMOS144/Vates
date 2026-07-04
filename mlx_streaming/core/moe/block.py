@@ -128,7 +128,7 @@ class FileStreamingMoeBlock:
         # host/verify 路径已算出真实路由 uniq_set，可"只 promote 命中本层路由的专家"，零额外同步地
         # 丢弃假阳性 → 省掉无用 scatter + 池污染（这是 promote -3.2% 开销的主因）。
         _stg_mgr = getattr(self.store, "_staging", None)
-        # 双源：投机专家留池侧区由 acquire_gpu_dual 取，不 promote、不驱逐 → 关 promote。
+        # 双源：投机专家留池侧区由 demand_dual 取，不 promote、不驱逐 → 关 promote。
         _do_promote = (_stg_mgr is not None and not config.native_no_promote()
                        and not config.zerocopy_dual_source())
         if config.route_trace_enabled():
@@ -154,7 +154,7 @@ class FileStreamingMoeBlock:
         layer_cap = self.store.cap_for(self.layer_idx)
         # verify(小 seq)可走 GPU 重映射;prefill(大 seq)唯一专家可能超 cap,须留在 host 路径(有超容量 fetch 回退)。
         if config.zerocopy_dual_source() and getattr(self, "_vpool", None) is not None:
-            # 双源两级缓存本就是为 MTP verify 建的:acquire_gpu_dual 用全专家宽表寻址,任意并集都安全
+            # 双源两级缓存本就是为 MTP verify 建的:demand_dual 用全专家宽表寻址,任意并集都安全
             # (miss 走 demand 回退),有效容量 = cap + 侧区行。verify 默认走 dual 路径读侧区,否则
             # 落 host 路径会白填侧区(预取填了却不读)→ 命中骤降、读盘翻倍。判据用 dual 有效容量,
             # 避免更大 K 时 K×top_k 误伤 cap。

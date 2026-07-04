@@ -227,20 +227,3 @@ class NativeStagingManager:
             out[f"{proj}.{tensor}"] = _typed_seg(seg, dt, shape)
             off += nb
         return out
-
-
-class _StagingSide:
-    """把 NativeStagingManager.sideregion_contents 适配成 acquire_gpu_dual 期望的 .contents 接口。
-
-    供 block.py 的双源取用路径使用。gen=读代：双缓冲下消费上一前向填好的那一代。
-    """
-    def __init__(self, stg, gen: int = 0):
-        self._stg = stg
-        self._gen = int(gen)
-
-    def contents(self, layer):
-        return self._stg.sideregion_contents(layer, self._gen)
-
-    def kv(self, layer):
-        # C++ 直接吐 (keys uint32, vals int32) device 数组，供 acquire_gpu_dual 快路径零 host 胶水合并。
-        return self._stg.sideregion_kv(layer, self._gen)

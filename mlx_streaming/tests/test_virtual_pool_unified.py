@@ -2,7 +2,7 @@
 
 验证 VirtualPool 对外呈现「所有专家都在」的视角：dual / 非 dual GPU-remap / host / fetch
 四条路径都收口进 VirtualPool，返回统一三元组 (pool_arrays, local, n_experts)，
-与 block.py 原逐分支逐元素等价。沿用 test_resident_sideregion.py 的轻量 mock 风格。
+与 block.py 原逐分支逐元素等价。用轻量 mock 风格。
 """
 import mlx.core as mx
 
@@ -10,19 +10,16 @@ from mlx_streaming.core.cache.virtual_pool import VirtualPool
 
 
 class _RPDual:
-    """dual 路径 mock：记录调用、返回哨兵。"""
+    """dual 路径 mock：demand_dual 唯一权威（_native_demand=True）。"""
     spec_gens = 2
     spec_slots = 16
+    _native_demand = True
 
     def __init__(self):
         self.calls = []
 
     def cap_for(self, layer):
         return 32
-
-    def acquire_gpu_dual(self, layer, inds, num_experts, side):
-        self.calls.append((layer, num_experts, side._gen))
-        return ("POOL_DUAL", "LOCAL_DUAL")
 
 
 class _Stg:
@@ -59,15 +56,19 @@ class _RPHost:
         return "POOL_FETCH"
 
 
-def test_acquire_dual_returns_n_experts():
-    # dual：走 acquire_gpu_dual，n_experts = layer_cap + spec_gens*spec_slots
+def test_acquire_dual_returns_n_experts(monkeypatch):
+    # dual：派发到 C++ demand_dual（_acquire_native），n_experts = layer_cap + spec_gens*spec_slots
     rp = _RPDual()
     vp = VirtualPool(rp, _Stg(), spec_slots=16)
     vp.begin_forward(0)
+    # stub _acquire_native（避开 native 依赖），记录派发入参
+    monkeypatch.setattr(vp, "_acquire_native",
+                        lambda layer, inds, side_gen, cap: rp.calls.append((layer, side_gen, cap))
+                        or ("POOL_DUAL", "LOCAL_DUAL"))
     pool, local, n_exp = vp.acquire(0, "INDS", 128, seq_len=4, layer_cap=32)
     assert pool == "POOL_DUAL" and local == "LOCAL_DUAL"
     assert n_exp == 32 + 2 * 16
-    assert rp.calls == [(0, 128, vp.read_gen())]      # 用读代
+    assert rp.calls == [(0, vp.read_gen(), 32)]      # 用读代 + cap
 
 
 def test_acquire_nondual_gpu_remap():
