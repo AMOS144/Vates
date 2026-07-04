@@ -201,6 +201,14 @@ class NativeStagingManager:
         import mlx_streaming.native_moe_ext as _N
         return _N.sideregion_kv(int(layer), int(gen))
 
+    def sideregion_publish(self, layer, gen, seg_nbytes):
+        """C++ 取出本代侧区新到行字节，按段拆成 per-seg uint8 数组，供消费侧 MLX scatter 落池。
+
+        返回 (rows int32[m], seg_arrays: list[uint8 (m, seg_nbytes[k])])；取出即清脏。
+        """
+        import mlx_streaming.native_moe_ext as _N
+        return _N.sideregion_publish(int(layer), int(gen), list(seg_nbytes))
+
     def sideregion_reset(self):
         """清空 C++ 侧区缓存（换 prompt/重置统计时调用）。"""
         import mlx_streaming.native_moe_ext as _N
@@ -241,3 +249,25 @@ class _StagingSide:
     def kv(self, layer):
         # C++ 直接吐 (keys uint32, vals int32) device 数组，供 acquire_gpu_dual 快路径零 host 胶水合并。
         return self._stg.sideregion_kv(layer, self._gen)
+
+    def publish(self, layer):
+        """取本代侧区新到行字节，按段拆成 per-key 具类型数组，供消费侧 MLX scatter 落池。
+
+        返回 (rows int32[m], {key: (m,*shape)})；m=0 表示无新行(返回空 dict)。
+        dtype 分派与 native_staging 行装配一致：uint32 权重原样；uint16→bfloat16；uint8(mxfp4 scales)原样。
+        """
+        seg_nbytes = [nb for *_, nb in self._stg.src._segs]
+        rows, seg_arrays = self._stg.sideregion_publish(layer, self._gen, seg_nbytes)
+        m = int(rows.shape[0]) if rows.ndim else 0
+        if m == 0:
+            return rows, {}
+        out = {}
+        for (proj, tensor, dt, shape, _nb), seg in zip(self._stg.src._segs, seg_arrays):
+            if dt == "uint32":
+                arr = seg.view(mx.uint32).reshape((m,) + tuple(shape))
+            elif dt == "uint16":
+                arr = seg.view(mx.uint16).reshape((m,) + tuple(shape)).view(mx.bfloat16)
+            else:  # uint8（mxfp4 scales）
+                arr = seg.reshape((m,) + tuple(shape))
+            out[f"{proj}.{tensor}"] = arr
+        return rows, out
