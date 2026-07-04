@@ -28,6 +28,15 @@ from mlx_streaming.core.profiling import note_tprof, TPROF_ON
 _STG_VERIFY = os.environ.get("STG_VERIFY") == "1"
 
 
+def _typed_seg(seg, dt, shape):
+    """按段 dtype 重解释：uint32 原样 / uint16→bfloat16 / uint8(mxfp4 scales) 原样。"""
+    if dt == "uint32":
+        return seg.view(mx.uint32).reshape(shape)
+    if dt == "uint16":
+        return seg.view(mx.uint16).reshape(shape).view(mx.bfloat16)
+    return seg.reshape(shape)
+
+
 def route_used_subset(cand: "list[int]", route_inds: mx.array, num_experts: int) -> "set[int]":
     """返回 cand 中“被 route_inds 真实路由到”的子集（GPU membership，drain ≤len(cand)）。
 
@@ -223,13 +232,7 @@ class NativeStagingManager:
         off = 0
         for proj, tensor, dt, shape, nb in self.src._segs:
             seg = row[off:off + nb]
-            if dt == "uint32":
-                arr = seg.view(mx.uint32).reshape(shape)
-            elif dt == "uint16":
-                arr = seg.view(mx.uint16).reshape(shape).view(mx.bfloat16)
-            else:  # uint8（mxfp4 scales）
-                arr = seg.reshape(shape)
-            out[f"{proj}.{tensor}"] = arr
+            out[f"{proj}.{tensor}"] = _typed_seg(seg, dt, shape)
             off += nb
         return out
 
@@ -261,13 +264,9 @@ class _StagingSide:
         m = int(rows.shape[0]) if rows.ndim else 0
         if m == 0:
             return rows, {}
+        assert len(seg_arrays) == len(self._stg.src._segs), \
+            f"侧区段数不匹配: {len(seg_arrays)} != {len(self._stg.src._segs)}"
         out = {}
         for (proj, tensor, dt, shape, _nb), seg in zip(self._stg.src._segs, seg_arrays):
-            if dt == "uint32":
-                arr = seg.view(mx.uint32).reshape((m,) + tuple(shape))
-            elif dt == "uint16":
-                arr = seg.view(mx.uint16).reshape((m,) + tuple(shape)).view(mx.bfloat16)
-            else:  # uint8（mxfp4 scales）
-                arr = seg.reshape((m,) + tuple(shape))
-            out[f"{proj}.{tensor}"] = arr
+            out[f"{proj}.{tensor}"] = _typed_seg(seg, dt, (m,) + tuple(shape))
         return rows, out

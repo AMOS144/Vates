@@ -1,5 +1,4 @@
 import mlx.core as mx
-import pytest
 
 
 class _FakeSrc:
