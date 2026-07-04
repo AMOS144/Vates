@@ -279,6 +279,15 @@ git commit -m "test(phase1): STG_VERIFY 字节真值 oracle 提为一等公民�
 
 ## Phase 2 —— root-cause 并修复方案 B 确定性错槽（走 systematic-debugging）
 
+> **✅ 结论回填（2026-07-04）：无 bug，原前提已过时。** systematic-debugging 定位:demand_dual
+> 与 Python 路径的唯一 token 分歧(48 里 1 处,token 45)是 **logit 精确平局处的良性 FP-order 噪声**
+> ——两路径同一对候选 {100144,101065}、logit 差 ≤ 1 量化步(0.125),Python 侧甚至是 gap=0 的精确平局,
+> argmax 靠 tie-break 定胜负。字节/映射 bug 会给大幅偏差,绝不可能是平局。验收:容量不变性 PASS
+> (cap32==cap48)+ STG_VERIFY 字节落池 0 BAD(ok=45730)+ n_mismatch ≤ N_floor。
+> 原「确定性错槽」前提基于旧状态:C++ `demand_core_locked` 的驱逐保护(`access_seen`=本前向全部专家)
+> **早已正确**,同类 bug 只在 Python `acquire`(仅护 miss)存在、已于 commit e388851 修复。
+> 详见 `benchmarks/reports/schemeB-mismatch-rootcause-2026-07-04.md`。Task 2.1-2.3 遂降级为「验证已干净」。
+
 > **性质**：这是调试任务。以下 Task 给出**结构化调查步骤 + 验收**，具体 fix 代码由 root-cause 结论决定，不预写占位代码。
 > **REQUIRED SUB-SKILL**：执行本 Phase 必须用 superpowers:systematic-debugging。
 

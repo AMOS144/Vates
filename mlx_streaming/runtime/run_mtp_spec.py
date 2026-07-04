@@ -45,10 +45,21 @@ def _baseline_greedy(model, tok, prompt, n):
     t0 = time.perf_counter()
     # prefill 分块:把整段 prompt 的激活峰值压到与 decode 同稳态(见 config.prefill_chunk)。
     logits, _ = prefill_chunked(model, ids, cache)
+    _dump_margin = bool(os.environ.get("DUMP_MARGIN"))
     out = []
     for _ in range(n):
-        nxt = int(mx.argmax(logits[:, -1, :]))
+        lg = logits[:, -1, :]
+        nxt = int(mx.argmax(lg))
         out.append(nxt)
+        if _dump_margin:
+            # 诊断:每步 top-2 logit 与差值,用于判定路径间发散是「FP 近平局」还是「真错」。
+            v = lg.reshape(-1)
+            top2 = mx.argpartition(-v, 2)[:2]
+            t2 = [int(x) for x in top2.tolist()]
+            vv = {t: float(v[t]) for t in t2}
+            st = sorted(t2, key=lambda t: -vv[t])
+            print(f"MARGIN step={len(out)-1} top1={st[0]}({vv[st[0]]:.5f}) "
+                  f"top2={st[1]}({vv[st[1]]:.5f}) gap={vv[st[0]]-vv[st[1]]:.6f}", flush=True)
         cur = mx.array([[nxt]])
         mx.eval(cur)
         if len(out) >= n:
