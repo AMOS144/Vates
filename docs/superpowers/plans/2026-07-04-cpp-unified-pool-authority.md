@@ -380,9 +380,21 @@ git commit -m "fix(phase2): 根治方案B确定性错槽——NATIVE_DEMAND_DUAL
 
 ## Phase 4 —— 收尾
 
-- [ ] **Task 4.1**：统一 C++ 路径设为默认（评估 `NATIVE_DEMAND_DUAL` 默认值翻转为 1），保留开关兜底一版。验收：默认配置下 oracle 全绿、tok/s 达 Phase 2 收益。
-- [ ] **Task 4.2**：退役 Python 槽路径的死代码（保留 prefill host 路径 + 诊断），更新 `config.py` 注释。
-- [ ] **Task 4.3**：归档最终收益报告 `benchmarks/reports/cpp-unified-pool-final-2026-07-04.md`（baseline vs 统一后 tok/s、内存、n_mismatch）。
+> **✅ 本版完成(2026-07-04)。** 基于 Phase 2 证明 demand_dual 正确+快8%,采用**精简路径**(用户拍板):
+> 直接启用 demand_dual 默认(=C++ 单一权威)→ 兑现目标,而非逐项搬 Phase 3 的 6 迁移
+> (其中 P3-a/c 已被 demand_dual 吸收或不在 dual 热路径,P3-e/f 是给兜底路径删死影子)。
+> 详见 `benchmarks/reports/cpp-unified-pool-final-2026-07-04.md`。
+
+- [x] **Task 4.1**：`NATIVE_DEMAND_DUAL` 默认翻为 1(config+cli),保留 `=0` 兜底。验收:容量不变性 PASS + 双路径字节真值 0 BAD + spec tok/s +8%。commit `2327ffa`。
+- [ ] **Task 4.2**：退役 Python 槽路径死代码 —— **显式延后**:`_slot_of/_free/_freq` 当前仍是 `NATIVE_DEMAND_DUAL=0` 兜底路径的活状态,计划「保留开关兜底一版」,本版保留,下一版删。
+- [x] **Task 4.3**：最终收益报告已归档 `benchmarks/reports/cpp-unified-pool-final-2026-07-04.md`。
+
+## Phase 3 状态回填(2026-07-04)
+
+- **P3-a/b(promote→C++)**:dual-source 路径 `_do_promote=False`(`block.py:132`),promote/`_place_expert` 不在生产热路径 → 无需迁移(仅利好非-dual legacy)。
+- **P3-c(overlay→C++)**:demand_dual 在 `demand_core_locked` 内以 C++ 做 side 快照∪e2r → 已吸收。
+- **P3-e/f(删 Python 影子)**:demand_dual 模式下 `resident_experts` 已读 C++ `g_real`;Python `_slot_of` 仅兜底路径用 → 随 Task 4.2 延后。
+- **P3-d(并行读→C++ BgReader)**:独立性能优化、风险最高 → 延后。
 
 ---
 
