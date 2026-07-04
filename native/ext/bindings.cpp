@@ -1,5 +1,10 @@
-#include "native_fused.h"
-#include "native_prefetch.h"
+#include "compute/fused_moe.h"
+#include "io/blob_load.h"
+#include "io/bg_reader.h"
+#include "prefetch/prefetch.h"
+#include "pool/owned_pool.h"
+#include "pool/side_region.h"
+#include "pool/demand.h"
 using namespace nb::literals;
 
 NB_MODULE(native_moe_ext, m) {

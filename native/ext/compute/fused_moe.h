@@ -1,7 +1,7 @@
 // fused MoE 计算：合成/真实 mmap staging、staged(预切片权重)、slot(local slot 索引)三条工厂。
-// 实现见 native_fused.cpp；这里只暴露给 bindings 的自由函数声明（默认参数放在声明处）。
+// 实现见 fused_moe.cpp；这里只暴露给 bindings 的自由函数声明（默认参数放在声明处）。
 #pragma once
-#include "native_common.h"
+#include "../common.h"
 
 mx::array fused_moe(
     const mx::array& x, const mx::array& expert_ids, const mx::array& scores,

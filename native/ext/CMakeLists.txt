@@ -15,9 +15,14 @@ nanobind_add_module(
   LTO
   NOMINSIZE
   NB_DOMAIN mlx
-  native_fused.cpp
-  native_prefetch.cpp
-  native_bindings.cpp
+  compute/fused_moe.cpp
+  io/blob_load.cpp
+  io/bg_reader.cpp
+  prefetch/prefetch.cpp
+  pool/owned_pool.cpp
+  pool/side_region.cpp
+  pool/demand.cpp
+  bindings.cpp
 )
 
 target_link_libraries(native_moe_ext PRIVATE mlx)

@@ -1,4 +1,5 @@
 # 一次性 de-risk 基准程序（非生产；各自独立 main）。生产扩展在 ../ext。
+# 按类别分级：io/（blob/array 读写）、compute/（量化线性、compute buffer）、metal/（Metal 内核）。
 CXX ?= c++
 CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra
 PY_SITE := $(abspath ../../.venv/lib/python3.12/site-packages)
@@ -8,30 +9,30 @@ MLX_LIB := $(PY_SITE)/mlx/lib
 MLX_FLAGS := -I$(MLX_INC) -L$(MLX_LIB) -lmlx -Wl,-rpath,$(MLX_LIB)
 METAL_FLAGS := -O3 -std=c++17 -fobjc-arc -framework Foundation -framework Metal
 
-all: pack_loader array_bench qlinear_bench compute_buffer_bench \
-     metal_staging_bench metal_fused_moe_bench native_moe_runner
+all: io/pack_loader io/array_bench compute/qlinear_bench compute/compute_buffer_bench \
+     metal/metal_staging_bench metal/metal_fused_moe_bench metal/native_moe_runner
 
-pack_loader: main.cpp
+io/pack_loader: io/pack_loader.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
-array_bench: array_bench.cpp
+io/array_bench: io/array_bench.cpp
 	$(CXX) $(CXXFLAGS) $(MLX_FLAGS) -o $@ $<
 
-qlinear_bench: qlinear_bench.cpp
+compute/qlinear_bench: compute/qlinear_bench.cpp
 	$(CXX) $(CXXFLAGS) $(MLX_FLAGS) -o $@ $<
 
-compute_buffer_bench: compute_buffer_bench.cpp
+compute/compute_buffer_bench: compute/compute_buffer_bench.cpp
 	$(CXX) $(CXXFLAGS) $(MLX_FLAGS) -o $@ $<
 
-metal_staging_bench: metal_staging_bench.mm
+metal/metal_staging_bench: metal/metal_staging_bench.mm
 	$(CXX) $(METAL_FLAGS) -o $@ $<
 
-metal_fused_moe_bench: metal_fused_moe_bench.mm
+metal/metal_fused_moe_bench: metal/metal_fused_moe_bench.mm
 	$(CXX) $(METAL_FLAGS) -o $@ $<
 
-native_moe_runner: native_moe_runner.mm
+metal/native_moe_runner: metal/native_moe_runner.mm
 	$(CXX) $(METAL_FLAGS) -o $@ $<
 
 clean:
-	rm -f pack_loader array_bench qlinear_bench compute_buffer_bench \
-	      metal_staging_bench metal_fused_moe_bench native_moe_runner
+	rm -f io/pack_loader io/array_bench compute/qlinear_bench compute/compute_buffer_bench \
+	      metal/metal_staging_bench metal/metal_fused_moe_bench metal/native_moe_runner

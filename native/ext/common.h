@@ -1,4 +1,4 @@
-// 共用前导：系统/Metal/MLX/nanobind 头 + 命名空间别名。三个 TU 都包含。
+// 共用前导：系统/Metal/MLX/nanobind 头 + 命名空间别名。所有 TU 都包含。
 #pragma once
 
 #include <nanobind/nanobind.h>

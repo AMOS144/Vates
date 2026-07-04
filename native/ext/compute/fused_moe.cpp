@@ -1,4 +1,4 @@
-#include "native_fused.h"
+#include "fused_moe.h"
 
 struct FusedParams {
   int experts;
