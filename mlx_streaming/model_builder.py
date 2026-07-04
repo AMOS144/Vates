@@ -85,8 +85,8 @@ def build_streaming_model():
         # 零拷贝双源双缓冲：常驻池换成侧区模式（预分配 cap+2*spec_slots 行、禁 grow），复用原池 loader/cap/profile。
         from mlx_streaming.core.cache.resident_pool import ResidentExpertPool
         _old = store._resident
-        # 侧区持久 LFU 用单代(一份工作集,省一半侧区内存);非 LFU 保持双缓冲。
-        _spec_gens = 1 if config.sideregion_lfu() else max(2, int(os.environ.get("SPEC_GENS", "2")))
+        # 默认单缓冲(持久 LFU,一份工作集,省一半侧区内存=生产路径);仅显式 legacy(SIDEREGION_LFU=0)用双缓冲。
+        _spec_gens = 1 if config.sideregion_lfu() else 2
         store._resident = ResidentExpertPool(
             _old.capacity, loader=_old.loader, layer_caps=_old.layer_caps,
             spec_slots=config.pool_spec_slots(),

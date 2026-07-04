@@ -153,7 +153,7 @@ def native_fused_prefetch() -> bool: return _b("NATIVE_FUSED_PREFETCH", "0")
 #   注:dual on 各 spec 均有 run-to-run token 漂移(良性时序噪声,字节校验 0 BAD),故默认 off。
 def zerocopy_dual_source() -> bool: return _b("ZEROCOPY_DUAL_SOURCE")
 def pool_spec_slots() -> int: return _i("POOL_SPEC_SLOTS", 3)          # 每层侧区投机槽数(LFU 推荐 8 省内存 / 32 提命中)
-def sideregion_lfu() -> bool: return _b("SIDEREGION_LFU")              # 侧区持久 LFU 二级缓存(默认 off);见 spec 2026-07-01
+def sideregion_lfu() -> bool: return _b("SIDEREGION_LFU", "1")        # 侧区持久 LFU 单缓冲二级缓存(默认 on=生产路径);SIDEREGION_LFU=0 回退 legacy 双缓冲
 def native_no_submit() -> bool: return _b("NATIVE_NO_SUBMIT", "0")
 def native_no_promote() -> bool: return _b("NATIVE_NO_PROMOTE", "0")
 def native_materialize() -> bool: return _b("NATIVE_MATERIALIZE", "0")

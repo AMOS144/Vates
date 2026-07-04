@@ -98,7 +98,7 @@ def test_sideregion_kv_empty(monkeypatch):
 
 
 def test_lfu_off_is_legacy(monkeypatch):
-    monkeypatch.delenv("SIDEREGION_LFU", raising=False)
+    monkeypatch.setenv("SIDEREGION_LFU", "0")   # 默认已 on,须显式关才走 legacy
     N.sideregion_reset()
     cap, spec = 4, 4
     pool = _pool(cap, spec)
