@@ -46,6 +46,8 @@ mx::array prefetch_pool_sideregion(
 std::vector<int> sideregion_contents(int layer, int gen);   // [expert, phys_row, ...]
 std::pair<mx::array, mx::array> sideregion_kv(int layer, int gen);  // (keys uint32, vals int32) device 数组
 void sideregion_reset();
+// 诊断：mx.array 底层 buffer 原始指针（uintptr），用于对拍侧区写入 buffer 与 consume 读到 buffer 是否同一块。
+uintptr_t array_data_ptr(const mx::array& a);
 
 // Task1 spike：图内 primitive 输出别名输入 buffer，验证下游 gather 依赖边机制。
 mx::array materialize_spike(const mx::array& src, uint32_t fillval, mx::StreamOrDevice s);

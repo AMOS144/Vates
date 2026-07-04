@@ -516,6 +516,52 @@ class ResidentExpertPool:
                     print(f"[DUAL_VERIFY] BAD layer={layer} expert={e} row={row} "
                           f"key={bad_key} (ok={_dual_verify_state['ok']} bad={_dual_verify_state['bad']})",
                           flush=True)
+                # ===== 临时诊断插桩（DUAL_DIAG=1）：辨识 row 实际占用专家（全专家 + 跨层扫描）=====
+                if os.environ.get("DUAL_DIAG") == "1" and _dual_verify_state.get("diag", 0) < 8:
+                    _dual_verify_state["diag"] = _dual_verify_state.get("diag", 0) + 1
+                    seg = pool[bad_key][row]
+                    is_zero = bool(mx.all(seg == 0))
+                    same_row = [int(k2) for k2, v2 in sc.items() if int(v2) == row]
+                    # 占用者辨识：本层全专家扫描（找 pool[row] 到底装的是谁）
+                    occ_same_layer = None
+                    for c in range(512):
+                        try:
+                            t = self.loader(layer, c)
+                        except Exception:
+                            continue
+                        if bad_key in t and t[bad_key].shape == seg.shape and bool(mx.all(seg == t[bad_key])):
+                            occ_same_layer = c
+                            break
+                    # 跨层扫描：若本层找不到，检查相邻层是否装了别层的专家字节（跨层污染）
+                    occ_cross = None
+                    if occ_same_layer is None:
+                        for lyr in range(max(0, layer - 2), layer + 3):
+                            if lyr == layer:
+                                continue
+                            for c in range(512):
+                                try:
+                                    t = self.loader(lyr, c)
+                                except Exception:
+                                    continue
+                                if bad_key in t and t[bad_key].shape == seg.shape and bool(mx.all(seg == t[bad_key])):
+                                    occ_cross = (lyr, c)
+                                    break
+                            if occ_cross:
+                                break
+                    # 对拍 buffer 指针：C++ 侧区 memcpy 写的 ptrs[0]=第一段池数组基址；
+                    # 这里取同一「第一段」池数组的当前基址。若不同即证明 MLX 重分配了池 buffer。
+                    pool_ptr0 = None
+                    try:
+                        import mlx_streaming.native_moe_ext as _N
+                        first_key = next(iter(pool))
+                        pool_ptr0 = hex(_N.array_data_ptr(pool[first_key]))
+                    except Exception as _e:
+                        pool_ptr0 = f"err:{_e}"
+                    print(f"[DUAL_DIAG] layer={layer} e2r_says={e}->row{row} bad_key={bad_key} "
+                          f"row_is_zero={is_zero} occ_same_layer={occ_same_layer} "
+                          f"occ_cross_layer={occ_cross} experts_mapped_to_row={same_row} "
+                          f"e2r_size={len(sc)} routed_this_e={e in flat} "
+                          f"pool_ptr0(first_key={next(iter(pool))})={pool_ptr0}", flush=True)
 
     def verify_acquire_bytes(self, layer, inds, stg=None):
         """诊断(STG_VERIFY)：acquire 后把本层真实路由命中专家的池槽字节与磁盘真值逐 key 比对。
@@ -571,6 +617,17 @@ class ResidentExpertPool:
         避免 Python 侧每层 dict 构建 + list(...)→mx.array 的 host 胶水；快路径零 per-expert host work）。
         """
         base = self._ensure_table(layer, num_experts)   # 真实区表（int32 [E]）
+        # ===== 临时诊断（POOL_PTR_TRACE=层号）：辨识池数组对象是否被换 + buffer 是否漂移 =====
+        if os.environ.get("POOL_PTR_TRACE") is not None and layer == int(os.environ["POOL_PTR_TRACE"]) \
+                and layer in self._pools:
+            try:
+                import mlx_streaming.native_moe_ext as _N
+                _p = self._pools[layer]
+                _fk = next(iter(_p))
+                print(f"[POOL_PTR] consume layer={layer} key={_fk} obj_id={id(_p[_fk])} "
+                      f"ptr={hex(_N.array_data_ptr(_p[_fk]))}", flush=True)
+            except Exception as _e:
+                print(f"[POOL_PTR] err {_e}", flush=True)
         keys, vals = side.kv(layer)
         has_side = int(keys.size) > 0                    # .size 只读 shape，无 GPU 同步
         eff = mx.array(base) if has_side else base       # 无侧区条目时直接用 base，省掉每层一次 256-int 拷贝

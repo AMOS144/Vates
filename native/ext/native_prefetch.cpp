@@ -372,6 +372,22 @@ struct SideLayer {
 static std::mutex g_side_mutex;
 static std::map<std::pair<int, int>, SideLayer> g_side;   // 键 (layer, gen)：双缓冲两代独立
 
+// 临时诊断：只追踪指定 (layer,row) 的所有账本/字节事件（SIDE_TRACE_LAYER/ROW）。
+static inline bool side_trace_hit(int layer, int row) {
+  const char* le = std::getenv("SIDE_TRACE_LAYER");
+  const char* re = std::getenv("SIDE_TRACE_ROW");
+  if (!le || !re) return false;
+  return layer == atoi(le) && row == atoi(re);
+}
+
+// 临时诊断：跨线程全局事件序号 + 线程短 id，用于把 reserve(Metal 回调线程)/read_publish(bg 线程)/
+// sideregion_kv(主线程) 的事件按发生顺序排出来（root-cause 取证，SIDE_TRACE_* 命中时才用）。
+static std::atomic<uint64_t> g_side_ev{0};
+static inline unsigned side_tid() {
+  return static_cast<unsigned>(
+      std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xffff);
+}
+
 class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
  public:
   PrefetchPoolSideRegionPrimitive(mx::Stream s, std::vector<int> seg_nbytes, int layer, int gen,
@@ -497,6 +513,9 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
       if (!c.free_rows.empty()) {
         row = c.free_rows.back();
         c.free_rows.pop_back();
+        if (side_trace_hit(layer, row))
+          fprintf(stderr, "[SIDE_TRACE ev=%llu tid=%u] L%d gen%d RESERVE_FROM_FREE row=%d expert=%d\n",
+                  (unsigned long long)g_side_ev.fetch_add(1), side_tid(), layer, gen, row, e);
       } else {
         // free 空:LFU 淘汰 e2r 中 freq 最小且 ∉P 者(tie-break:最小 expert id)。
         int victim = -1;
@@ -513,10 +532,40 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
         row = c.e2r[victim];
         c.e2r.erase(victim);
         c.freq.erase(victim);
+        if (side_trace_hit(layer, row))
+          fprintf(stderr, "[SIDE_TRACE ev=%llu tid=%u] L%d gen%d EVICT_REUSE row=%d victim=%d newExpert=%d\n",
+                  (unsigned long long)g_side_ev.fetch_add(1), side_tid(), layer, gen, row, victim, e);
       }
       to_read.emplace_back(e, row);
     }
+    // ===== 临时诊断（SIDE_AUDIT=1）：reserve 结束时审计侧区行账本自洽性 =====
+    if (std::getenv("SIDE_AUDIT")) side_audit(c, layer, gen, "reserve", to_read);
     return to_read;
+  }
+
+  // 审计：检测「一行被两专家占用」「free 与 e2r 行重叠」「to_read 行仍被 e2r 占用」。
+  static void side_audit(SideLayer& c, int layer, int gen, const char* where,
+                         const std::vector<std::pair<int, int>>& to_read) {
+    std::map<int, int> row_owner;                 // row -> expert
+    for (auto& p : c.e2r) {
+      auto it = row_owner.find(p.second);
+      if (it != row_owner.end())
+        fprintf(stderr, "[SIDE_AUDIT] %s L%d gen%d DOUBLE_OWN row=%d experts=%d,%d\n",
+                where, layer, gen, p.second, it->second, p.first);
+      row_owner[p.second] = p.first;
+    }
+    std::unordered_set<int> free_set(c.free_rows.begin(), c.free_rows.end());
+    for (auto& p : c.e2r)
+      if (free_set.count(p.second))
+        fprintf(stderr, "[SIDE_AUDIT] %s L%d gen%d FREE_E2R_OVERLAP row=%d owned_by=%d\n",
+                where, layer, gen, p.second, p.first);
+    if (c.free_rows.size() != free_set.size())
+      fprintf(stderr, "[SIDE_AUDIT] %s L%d gen%d FREE_DUP free_n=%zu uniq=%zu\n",
+              where, layer, gen, c.free_rows.size(), free_set.size());
+    for (auto& pr : to_read)
+      if (row_owner.count(pr.second))
+        fprintf(stderr, "[SIDE_AUDIT] %s L%d gen%d TOREAD_LIVE_ROW row=%d assigned_to=%d still_owned_by=%d\n",
+                where, layer, gen, pr.second, pr.first, row_owner[pr.second]);
   }
 
   // 阶段2+3：pread + memcpy 进已预留的独占行（不持锁），写完后持锁发布 e2r。
@@ -546,16 +595,33 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
         std::memcpy(ptrs[k] + static_cast<size_t>(row) * seg[k], tmp.data() + off, seg[k]);
         off += static_cast<size_t>(seg[k]);
       }
+      if (side_trace_hit(layer, row))
+        fprintf(stderr, "[SIDE_TRACE ev=%llu tid=%u] L%d gen%d MEMCPY row=%d expert=%d ptr0=%p\n",
+                (unsigned long long)g_side_ev.fetch_add(1), side_tid(), layer, gen, row, e, (void*)ptrs[0]);
       done.emplace_back(e, row);
     }
     ::close(fd);
     {
       std::lock_guard<std::mutex> lk(g_side_mutex);
       SideLayer& c = g_side[{layer, gen}];
+      if (std::getenv("SIDE_AUDIT")) {
+        // 发布前：检测本批要发布的 row 是否已被别的专家占用（会造成同行两主/覆盖）。
+        std::map<int, int> row_owner;
+        for (auto& p : c.e2r) row_owner[p.second] = p.first;
+        for (auto& pr : done)
+          if (row_owner.count(pr.second) && row_owner[pr.second] != pr.first)
+            fprintf(stderr, "[SIDE_AUDIT] publish L%d gen%d ROW_STEAL row=%d newE=%d oldOwner=%d\n",
+                    layer, gen, pr.second, pr.first, row_owner[pr.second]);
+      }
       for (auto& pr : done) {                                  // 字节就绪后才发布 e2r
         c.e2r[pr.first] = pr.second;
         if (!c.freq.count(pr.first)) c.freq[pr.first] = 1;     // 新专家初始 freq
+        if (side_trace_hit(layer, pr.second))
+          fprintf(stderr, "[SIDE_TRACE ev=%llu tid=%u] L%d gen%d PUBLISH row=%d expert=%d ptr0=%p\n",
+                  (unsigned long long)g_side_ev.fetch_add(1), side_tid(), layer, gen, pr.second,
+                  pr.first, ptrs.empty() ? nullptr : (void*)ptrs[0]);
       }
+      if (std::getenv("SIDE_AUDIT")) side_audit(c, layer, gen, "publish", {});
     }
     g_pf_fires.fetch_add(1);
   }
@@ -622,6 +688,9 @@ std::pair<mx::array, mx::array> sideregion_kv(int layer, int gen) {
       for (auto& p : it->second.e2r) {
         keys.push_back(static_cast<uint32_t>(p.first));
         vals.push_back(static_cast<int32_t>(p.second));
+        if (side_trace_hit(layer, p.second))
+          fprintf(stderr, "[SIDE_TRACE ev=%llu tid=%u] L%d gen%d CONSUME_KV row=%d expert=%d\n",
+                  (unsigned long long)g_side_ev.fetch_add(1), side_tid(), layer, gen, p.second, p.first);
       }
     }
   }
@@ -633,6 +702,15 @@ std::pair<mx::array, mx::array> sideregion_kv(int layer, int gen) {
 void sideregion_reset() {
   std::lock_guard<std::mutex> lk(g_side_mutex);
   g_side.clear();
+}
+
+// 临时诊断：返回某 mx.array 底层 buffer 的原始数据指针（uintptr）。用于对拍
+// 「C++ 侧区 memcpy 写入的 buffer 指针」与「Python consume/verify 读到的 pool buffer 指针」
+// 是否同一块——若不同即证明 MLX 在两者之间重分配了池 buffer，raw 写入被落单。
+uintptr_t array_data_ptr(const mx::array& a) {
+  mx::array b = a;
+  b.eval();
+  return reinterpret_cast<uintptr_t>(b.data<uint8_t>());
 }
 
 // ====== Phase 2 方案B：真实区槽状态 C++ 全接管（1 次同步版）======

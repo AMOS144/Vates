@@ -324,6 +324,15 @@ class FileStreamingMoeBlock:
                     return None                          # 目标层池未建(首 token 预热) → 跳过本次
                 segs = stg.src._segs                     # (proj, tensor, dt, shape, nb)，与池 key 顺序一致
                 pool_list = [rp._pools[tgt][f"{p}.{t}"] for p, t, *_ in segs]
+                import os as _os
+                if _os.environ.get("POOL_PTR_TRACE") is not None and tgt == int(_os.environ["POOL_PTR_TRACE"]):
+                    try:
+                        import mlx_streaming.native_moe_ext as _N
+                        _fk = f"{segs[0][0]}.{segs[0][1]}"
+                        print(f"[POOL_PTR] submit  layer={tgt} key={_fk} obj_id={id(rp._pools[tgt][_fk])} "
+                              f"ptr={hex(_N.array_data_ptr(rp._pools[tgt][_fk]))}", flush=True)
+                    except Exception as _e:
+                        print(f"[POOL_PTR] err {_e}", flush=True)
                 return self._vpool.prefetch(tgt, pred, resident, pool_list)
             # miss→hit:回调按目标层常驻快照过滤，只把缺口 pread 进 staging（≤budget 行），promote 时写池。
             if TPROF_ON:

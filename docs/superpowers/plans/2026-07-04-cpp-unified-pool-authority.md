@@ -128,6 +128,14 @@ git commit -m "bench(phase0): 32GB 上 cap 扫描峰值内存与 tok/s，定安�
 ### Phase 0 出口判据
 `U_max` 已知（cap 下限）、`N_floor` 已知（验收基准）、安全 cap 已定。三者写入报告后进入 Phase 1。
 
+> **⚠️ Phase 0 中途重大发现 + 方向调整（2026-07-04，用户拍板 pivot）**
+>
+> Task 0.2 实测 N_floor 时发现：**当前默认路径 `ZEROCOPY_DUAL_SOURCE=1` 的侧区存在可复现的字节错槽真 bug**——`DUAL_VERIFY=1` 连跑 3 次每次都 BAD（31/62/54 条），`L1 e453 r32` 跨三次运行复现（确定性）：被路由命中的专家读到了别的专家的权重字节（详见 `benchmarks/reports/fp-noise-floor-2026-07-04.md`）。此外：STG_VERIFY 不覆盖该默认路径（其正确开关是 `DUAL_VERIFY`）；约 70% 走慢回退路径的 acquire 当前无 live 字节校验。
+>
+> **后果**：① 待对齐的「正确性基线」本身是错的；② token 级容量不变性（原 Task 1.1）在修复前不可用；③ 原 Phase 2 的错槽 root-cause **从「方案 B（默认关）」升级为「默认热路径真 bug」，提到 Phase 0.3/1 之前先做**。
+>
+> **调整后顺序**：Phase 2（改名 **Phase 2′：默认双源侧区错槽 root-cause + 修复到 DUAL_VERIFY 0 BAD**）→ 回头补 Phase 0.3 + 干净 N_floor + Phase 1 oracle → 原 Phase 3/4 不变。
+
 ---
 
 ## Phase 1 —— 正确性护栏（不改行为，只建 oracle 与量具）

@@ -94,6 +94,7 @@ NB_MODULE(native_moe_ext, m) {
   m.def("sideregion_contents", &sideregion_contents, "layer"_a, "gen"_a = 0);
   m.def("sideregion_kv", &sideregion_kv, "layer"_a, "gen"_a = 0);
   m.def("sideregion_reset", &sideregion_reset);
+  m.def("array_data_ptr", &array_data_ptr, "a"_a);
   m.def("materialize_spike", &materialize_spike, "src"_a, "fillval"_a, nb::kw_only(),
         "stream"_a = nb::none());
   m.def("demand_probe", &demand_probe, "inds"_a, "offset"_a, nb::kw_only(),
