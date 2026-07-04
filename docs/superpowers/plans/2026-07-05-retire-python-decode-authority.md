@@ -41,13 +41,16 @@ decode/verify 双源路径**不再留 Python 退路**,demand_dual(C++ g_real)作
 - [x] 快速单测套件全绿(排除既存环境坏点 qlinear/qwen-mtp)
 - [x] commit(Stage1+2+3 一起)
 
-## Stage 4 —— Task 3.7 收敛 block.py(双源 decode 分支)
+## Stage 4 —— Task 3.7 收敛 block.py ✅(评估:无安全高价值收敛空间)
 
-- [ ] 评估 decode GPU-remap 分支:双源已单一(_vpool.acquire→demand_dual);清理只服务旧退路的诊断分叉(miss_attrib/route_trace 保留为诊断)。**非双源 acquire_gpu 分支保留**。
-- [ ] 出口:oracle 全绿 + commit。
+- [x] 评估结论:block.py 生产双源路径**已是** gate→prefetch(`_native_fused_prefetch`)→acquire(`_vpool.acquire`→demand_dual)。其余分支均为**保留的运行模式**,非死代码:
+  - `stream_blob`/`stream_blob_bg`(legacy 全流式,配置门控)
+  - 非双源 `acquire_gpu`(用户拍板保留)
+  - host prefill `acquire_host`(用户拍板保留,内存有界)
+  - `route_trace`/`miss_attrib`/`union_prof`/`probe_perlayer_sync`(opt-in 可观测性)
+- 在"保留非双源 + prefill"的约束下,进一步删这些分支=删用户选择保留的功能,超范围且有回归风险。故**本轮不动**;若未来要更彻底单路径,需另立"退役 legacy 模式"决策。
 
-## Stage 5 —— P3-d 并行读→C++ BgReader(最高风险,单独评估)
+## Stage 5 —— P3-d 并行读→C++ BgReader ✅(评估:不做,附理由)
 
-- [ ] 现状:host `fetch`/prefetch 用 `blob_loader` 的 Python `ThreadPoolExecutor`;`_materialize_native` 已用 C++ `blob_load`(eval 时 C++ pread 绕 GIL)。demand miss 已用 C++ `BgReader`。
-- [ ] 评估把 host 并行 pread 也统一到 C++ `BgReader` 的收益/风险;有净收益且可灰度再做,否则记录为不做的理由。
-- [ ] 出口:A/B tok/s + oracle 全绿 + commit 或明确不做。
+- [x] 现状:decode 稳态**已全走** C++ `BgReader`(demand miss,`bg_reader_start` DEMAND_WORKERS=8);`_materialize_native` 用 C++ `blob_load`(eval 时 C++ pread 绕 GIL)。`blob_loader` 的 Python `ThreadPoolExecutor` 仅服务**一次性 prefill/host fetch**,decode 稳态不触发。
+- **结论:不做。** 迁移只影响一次性 prefill 的并行读,对 decode 稳态 tok/s **零收益**,而改动 blob_loader 线程模型是本计划标注的**最高风险项**。风险/收益严重倒挂。若将来要压 prefill 首 token 延迟再单独立项灰度。

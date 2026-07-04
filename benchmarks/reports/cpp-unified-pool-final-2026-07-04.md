@@ -1,5 +1,12 @@
 # C++ 统一池权威 —— 最终收益报告(Phase 4)
 
+> **后续更新(2026-07-05):** 本报告写于"保留 `NATIVE_DEMAND_DUAL=0` 兜底一版"阶段。
+> 之后已**彻底退役 Python decode 权威路径**:移除 opt-out、删 `acquire_gpu_dual`+`DUAL_VERIFY`、
+> dual 模式弃用 PIN_HOT,demand_dual 成 decode 唯一权威(净删 316 行,tok/s 无回归 14.75)。
+> prefill/host 常驻池路径与非双源 `acquire_gpu` 按需保留。详见
+> `docs/superpowers/plans/2026-07-05-retire-python-decode-authority.md`。下文"显式延后"段已落地。
+
+
 **日期:** 2026-07-04
 **分支:** `perf/async-demand-offload`
 **结论:** 生产路径的专家池管理已统一到 C++ 单一权威(demand_dual 默认接管真实区),**正确性严格验证通过、spec tok/s +8%、侧区内存减半**。Python 权威路径保留为 `NATIVE_DEMAND_DUAL=0` 兜底(计划「保留开关兜底一版」)。
