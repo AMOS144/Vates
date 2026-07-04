@@ -1,6 +1,7 @@
 #include "native_prefetch.h"
 
 #include <unordered_set>
+#include <set>
 #include <thread>
 #include <queue>
 #include <condition_variable>
@@ -11,6 +12,7 @@
 #include <map>
 #include <utility>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -368,9 +370,16 @@ struct SideLayer {
   std::vector<int> free_rows;
   std::map<int, uint32_t> freq;    // expert -> 预测频次(LFU 分数;仅 SIDEREGION_LFU 用)
   bool inited = false;
+  int base = 0;                    // 侧区起始物理行 base_row
+  int spec = 0;                    // 侧区行数 spec_slots
+  std::set<int> dirty;             // 已写字节但尚未被 publish 取出的物理行
 };
 static std::mutex g_side_mutex;
 static std::map<std::pair<int, int>, SideLayer> g_side;   // 键 (layer, gen)：双缓冲两代独立
+
+// C++ 拥有的稳定字节缓冲：键 (layer, gen)，大小 spec*stride，按 (row-base)*stride 索引。
+// 侧区字节写进这里（永不被 MLX 迁移），consume 时由 Python 用 MLX 追踪的 scatter 落池。
+static std::map<std::pair<int, int>, std::vector<uint8_t>> g_side_bytes;
 
 // 临时诊断：只追踪指定 (layer,row) 的所有账本/字节事件（SIDE_TRACE_LAYER/ROW）。
 static inline bool side_trace_hit(int layer, int row) {
@@ -484,6 +493,8 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
     SideLayer& c = g_side[{layer, gen}];
     if (!c.inited) {
       for (int r = 0; r < spec; ++r) c.free_rows.push_back(base + r);
+      c.base = base;
+      c.spec = spec;
       c.inited = true;
     }
     if (!lfu) {
@@ -573,6 +584,23 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
   static void read_publish(const std::vector<uint8_t*>& ptrs, const std::vector<int>& seg,
                            const std::vector<std::pair<int, int>>& to_read,
                            const std::string& path, size_t stride, int layer, int gen) {
+    (void)ptrs;   // 不再旁路写 MLX 池 buffer：字节改写进 C++ 稳定缓冲
+    (void)seg;    // 段拆分推迟到 sideregion_publish（消费时用 MLX scatter 落池）
+    int base = 0;
+    {
+      // 确保稳定字节缓冲已按 spec*stride 分配好（首次或 stride 变化时重置）。
+      std::lock_guard<std::mutex> lk(g_side_mutex);
+      SideLayer& c = g_side[{layer, gen}];
+      base = c.base;
+      auto& buf = g_side_bytes[{layer, gen}];
+      size_t want = static_cast<size_t>(c.spec) * stride;
+      if (buf.size() != want) buf.assign(want, 0);
+    }
+    uint8_t* bufp;
+    {
+      std::lock_guard<std::mutex> lk(g_side_mutex);
+      bufp = g_side_bytes[{layer, gen}].data();
+    }
     int fd = open_blob_nocache(path.c_str());
     if (fd < 0) {                                             // 失败则把预留行还回 free
       std::lock_guard<std::mutex> lk(g_side_mutex);
@@ -580,46 +608,34 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
       for (auto& pr : to_read) c.free_rows.push_back(pr.second);
       return;
     }
-    std::vector<uint8_t> tmp(stride);
     std::vector<std::pair<int, int>> done;
     for (auto& pr : to_read) {
       int e = pr.first, row = pr.second;
-      if (::pread(fd, tmp.data(), stride, static_cast<off_t>(static_cast<size_t>(e) * stride)) !=
+      // 直接把整条 blob 记录 pread 进稳定缓冲对应行（按 (row-base)*stride 定位）。
+      uint8_t* dst = bufp + static_cast<size_t>(row - base) * stride;
+      if (::pread(fd, dst, stride, static_cast<off_t>(static_cast<size_t>(e) * stride)) !=
           static_cast<ssize_t>(stride)) {
         std::lock_guard<std::mutex> lk(g_side_mutex);         // 读失败：行还回 free
         g_side[{layer, gen}].free_rows.push_back(row);
         continue;
       }
-      size_t off = 0;
-      for (size_t k = 0; k < seg.size(); ++k) {
-        std::memcpy(ptrs[k] + static_cast<size_t>(row) * seg[k], tmp.data() + off, seg[k]);
-        off += static_cast<size_t>(seg[k]);
-      }
       if (side_trace_hit(layer, row))
-        fprintf(stderr, "[SIDE_TRACE ev=%llu tid=%u] L%d gen%d MEMCPY row=%d expert=%d ptr0=%p\n",
-                (unsigned long long)g_side_ev.fetch_add(1), side_tid(), layer, gen, row, e, (void*)ptrs[0]);
+        fprintf(stderr, "[SIDE_TRACE ev=%llu tid=%u] L%d gen%d READBUF row=%d expert=%d\n",
+                (unsigned long long)g_side_ev.fetch_add(1), side_tid(), layer, gen, row, e);
       done.emplace_back(e, row);
     }
     ::close(fd);
     {
       std::lock_guard<std::mutex> lk(g_side_mutex);
       SideLayer& c = g_side[{layer, gen}];
-      if (std::getenv("SIDE_AUDIT")) {
-        // 发布前：检测本批要发布的 row 是否已被别的专家占用（会造成同行两主/覆盖）。
-        std::map<int, int> row_owner;
-        for (auto& p : c.e2r) row_owner[p.second] = p.first;
-        for (auto& pr : done)
-          if (row_owner.count(pr.second) && row_owner[pr.second] != pr.first)
-            fprintf(stderr, "[SIDE_AUDIT] publish L%d gen%d ROW_STEAL row=%d newE=%d oldOwner=%d\n",
-                    layer, gen, pr.second, pr.first, row_owner[pr.second]);
-      }
-      for (auto& pr : done) {                                  // 字节就绪后才发布 e2r
+      for (auto& pr : done) {                                  // 字节就绪后才发布 e2r + 标脏
         c.e2r[pr.first] = pr.second;
         if (!c.freq.count(pr.first)) c.freq[pr.first] = 1;     // 新专家初始 freq
+        c.dirty.insert(pr.second);
         if (side_trace_hit(layer, pr.second))
-          fprintf(stderr, "[SIDE_TRACE ev=%llu tid=%u] L%d gen%d PUBLISH row=%d expert=%d ptr0=%p\n",
+          fprintf(stderr, "[SIDE_TRACE ev=%llu tid=%u] L%d gen%d PUBLISH row=%d expert=%d\n",
                   (unsigned long long)g_side_ev.fetch_add(1), side_tid(), layer, gen, pr.second,
-                  pr.first, ptrs.empty() ? nullptr : (void*)ptrs[0]);
+                  pr.first);
       }
       if (std::getenv("SIDE_AUDIT")) side_audit(c, layer, gen, "publish", {});
     }
@@ -702,6 +718,49 @@ std::pair<mx::array, mx::array> sideregion_kv(int layer, int gen) {
 void sideregion_reset() {
   std::lock_guard<std::mutex> lk(g_side_mutex);
   g_side.clear();
+  g_side_bytes.clear();
+}
+
+// 取出并清空脏行：从 C++ 稳定字节缓冲把脏行按段拆分成多个 (m, seg_nbytes[k]) uint8 数组，
+// 返回 (rows int32[m], seg_arrays)。消费侧（Python）用 rows 做 MLX 追踪的 scatter 落池。
+std::pair<mx::array, std::vector<mx::array>> sideregion_publish(
+    int layer, int gen, const std::vector<int>& seg_nbytes) {
+  // 段在 blob 记录内的偏移与总 stride（段顺序 = seg_nbytes 顺序 = 池 key 顺序）。
+  std::vector<int> seg_off(seg_nbytes.size(), 0);
+  size_t stride = 0;
+  for (size_t k = 0; k < seg_nbytes.size(); ++k) { seg_off[k] = static_cast<int>(stride); stride += seg_nbytes[k]; }
+
+  std::vector<int32_t> rows;
+  std::vector<std::vector<uint8_t>> segbuf(seg_nbytes.size());
+  {
+    std::lock_guard<std::mutex> lk(g_side_mutex);
+    auto it = g_side.find({layer, gen});
+    auto bit = g_side_bytes.find({layer, gen});
+    if (it != g_side.end() && bit != g_side_bytes.end() && !it->second.dirty.empty()) {
+      SideLayer& c = it->second;
+      const std::vector<uint8_t>& buf = bit->second;
+      int m = static_cast<int>(c.dirty.size());
+      rows.reserve(m);
+      for (size_t k = 0; k < seg_nbytes.size(); ++k)
+        segbuf[k].resize(static_cast<size_t>(m) * seg_nbytes[k]);
+      int i = 0;
+      for (int row : c.dirty) {
+        rows.push_back(row);
+        size_t rbase = static_cast<size_t>(row - c.base) * stride;
+        for (size_t k = 0; k < seg_nbytes.size(); ++k)
+          std::memcpy(segbuf[k].data() + static_cast<size_t>(i) * seg_nbytes[k],
+                      buf.data() + rbase + seg_off[k], seg_nbytes[k]);
+        ++i;
+      }
+      c.dirty.clear();   // 取出即清脏：下次 publish 只返回新写入行
+    }
+  }
+  int m = static_cast<int>(rows.size());
+  std::vector<mx::array> out;
+  out.reserve(seg_nbytes.size());
+  for (size_t k = 0; k < seg_nbytes.size(); ++k)
+    out.push_back(mx::array(segbuf[k].data(), mx::Shape{m, seg_nbytes[k]}, mx::uint8));
+  return {mx::array(rows.data(), mx::Shape{m}, mx::int32), out};
 }
 
 // 临时诊断：返回某 mx.array 底层 buffer 的原始数据指针（uintptr）。用于对拍

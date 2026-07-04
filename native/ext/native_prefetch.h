@@ -46,6 +46,9 @@ mx::array prefetch_pool_sideregion(
 std::vector<int> sideregion_contents(int layer, int gen);   // [expert, phys_row, ...]
 std::pair<mx::array, mx::array> sideregion_kv(int layer, int gen);  // (keys uint32, vals int32) device 数组
 void sideregion_reset();
+// 取出并清空脏行：返回 (rows int32[m], 各段 uint8[m, seg_nbytes[k]])，供 Python scatter 落池。
+std::pair<mx::array, std::vector<mx::array>> sideregion_publish(
+    int layer, int gen, const std::vector<int>& seg_nbytes);
 // 诊断：mx.array 底层 buffer 原始指针（uintptr），用于对拍侧区写入 buffer 与 consume 读到 buffer 是否同一块。
 uintptr_t array_data_ptr(const mx::array& a);
 
