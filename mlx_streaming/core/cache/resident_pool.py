@@ -485,6 +485,23 @@ class ResidentExpertPool:
         local = mx.take(self._slot_table[layer], inds)
         return pool_arrays, local
 
+    def _publish_side(self, layer, side):
+        """把侧区自上次起新到达的行(C++ 稳定缓冲)以 MLX 追踪 scatter 写进池。
+
+        每行只在字节首次到达时发布一次；MLX 追踪的写随 buffer 迁移存活，故之后无需重发。
+        仅当 side 适配器实现 publish 时生效(向后兼容旧适配器)。
+        """
+        pub = getattr(side, "publish", None)
+        if pub is None:
+            return
+        rows, typed = pub(layer)
+        m = int(rows.shape[0]) if rows.ndim else 0
+        if m == 0:
+            return
+        pool = self._pools[layer]
+        for k, arr in typed.items():
+            pool[k][rows] = arr
+
     def _verify_side_bytes(self, layer, inds, sc):
         """诊断：侧区命中专家 E→行 R，把 pool[R] 各段与 loader(layer,E) 真值逐段比对。
         不一致即「侧区行装错字节」的铁证（与 timing/gen 无关）。"""
@@ -630,6 +647,8 @@ class ResidentExpertPool:
                 print(f"[POOL_PTR] err {_e}", flush=True)
         keys, vals = side.kv(layer)
         has_side = int(keys.size) > 0                    # .size 只读 shape，无 GPU 同步
+        if has_side and layer in self._pools:
+            self._publish_side(layer, side)              # 新到侧区行以 MLX 追踪 scatter 落池(随迁移存活)
         eff = mx.array(base) if has_side else base       # 无侧区条目时直接用 base，省掉每层一次 256-int 拷贝
         if has_side:
             eff[keys] = vals                             # vals 为 int32，与 base.dtype 一致
