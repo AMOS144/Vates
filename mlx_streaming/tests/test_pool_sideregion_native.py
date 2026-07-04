@@ -1,5 +1,6 @@
-"""验证 C++ 把 blob 段散写进多个结构化池数组的侧区行，drain 后 host 读得到正确字节。
-2 段布局：seg0 = weight uint32 [W]，seg1 = scales uint8 [S]。临时小 blob 全确定字节。"""
+"""验证 C++ 把 blob 段按记录写进侧区稳定缓冲，sideregion_publish 取回得到正确字节。
+2 段布局：seg0 = weight uint32 [W]，seg1 = scales uint8 [S]。临时小 blob 全确定字节。
+（Route 1 后侧区字节不再旁路写池数组，改由稳定缓冲 + 消费侧 MLX scatter 发布。）"""
 import os, struct, tempfile, time
 import mlx.core as mx
 import mlx_streaming.native_moe_ext as N
@@ -45,10 +46,16 @@ def test_sideregion_segment_scatter():
     mx.eval(d)
     m = _wait(0, 3)                                  # {expert: phys_row}
     assert set(m.keys()) == {5, 6, 7}
-    for e, row in m.items():
+    row2exp = {int(row): e for e, row in m.items()}
+    # 新机制：字节写进 C++ 稳定缓冲、不再写池；用 sideregion_publish 取回脏行字节验证真值。
+    rows, segs = N.sideregion_publish(0, 0, SEG)
+    assert int(rows.shape[0]) == 3
+    w = segs[0].view(mx.uint32)                       # seg0 uint8 (m,64) → (m,16) uint32
+    for i, row in enumerate(rows.tolist()):
+        e = row2exp[int(row)]
         assert CAP <= row < CAP + SPEC              # 落在侧区
-        assert int(pool[0][row][0]) == e + 1        # weight 段正确
-        assert int(pool[1][row][0]) == (e + 100) & 0xFF  # scales 段正确
+        assert int(w[i][0]) == e + 1                # weight 段正确
+        assert int(segs[1][i][0]) == (e + 100) & 0xFF  # scales 段正确
     os.unlink(path)
 
 
