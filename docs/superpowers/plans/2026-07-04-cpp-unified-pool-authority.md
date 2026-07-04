@@ -10,6 +10,14 @@
 
 **关联 spec:** `docs/superpowers/specs/2026-07-04-cpp-unified-pool-authority-design.md`
 
+> **进度更新 2026-07-04（Route 3 Phase 1 已完成，取代 Route 1）**：Route 1（消费侧 MLX scatter）在
+> 低 cap 引入 15× 回归（cap=32 仅 0.89 tok/s）。已实现 **C++ 拥有池 buffer + 侧区/真实区全部 C++ 直写、
+> 删掉 pool 上所有 MLX scatter**。root-cause：对被 compute 图引用的数组做 in-place scatter 会重分配
+> pool buffer 并重绑，孤立侧区直写（= pre-Route-1「donation/recycling」bug 真身）。验收：`DUAL_VERIFY 0 BAD`
+> （cap 32/64）+ cap=32/48/64 spec = 13.22/15.02/17.59 tok/s + 两 oracle 绿 + 池相关单测全绿。
+> 详见 `benchmarks/reports/route3-phase1-owned-pool-2026-07-04.md`。这同时兑现了 Phase 3 的核心目标之一
+> （侧区∪真实区落池不经 MLX scatter）。剩余 Phase 2（方案 B n_mismatch）、Phase 3 其余降耦合项、Phase 4 收尾未动。
+
 > **Phase 0 实测结论回填（2026-07-04）**：MTP verify 前向实际喂 **K=3** 个 token（`verify_in=[x, d_1..d_{K-1}]`，`mtp/generate.py:296`），非早前假设的 K+1=4。故单前向并集理论上界 = `K×top_k = 3×10 = 30`；**实测 U_max=30（恰触顶、零裕度）、p99=29、均值≈19.5**（详见 `benchmarks/reports/union-cap-floor-2026-07-04.md`）。**正确性下限：cap（真实区+侧区可寻址）≥ 30**。→ 后续所有实测/测试的 cap 一律取 ≥ 30；`EXPERT_SLOTS=32` 满足但仅 2 裕度，`cap<30` 必然溢出错槽。
 
 ---

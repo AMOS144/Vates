@@ -1,5 +1,5 @@
-// native-fused-prefetch：blob 字节直读 + GPU 完成回调里读 id/派发 pread/写 staging。
-// 实现见 native_prefetch.cpp；跨线程全局态(g_pf_*/g_stg_*)私有于该 TU。
+// native-fused-prefetch：blob 字节直读 + GPU 完成回调里读 id/派发 pread/写 staging/侧区。
+// 实现见 native_prefetch.cpp；跨线程全局态(g_stg_*/g_side_*/g_real_*/g_owned_*)私有于该 TU。
 #pragma once
 #include <tuple>
 #include <utility>
@@ -10,17 +10,11 @@ mx::array blob_load(
     const std::string& path, const mx::array& expert_ids, int stride,
     mx::StreamOrDevice s);
 
-// 挂 GPU 完成回调：算完 inds 后在回调里读 id（可选预热字节），返回 dummy。
+// 挂 GPU 完成回调：算完 inds 后在回调里读 id 预热 page cache，返回 dummy。
+// （无 staging 的轻量预取模式：仅把预测专家字节读进 page cache，不落池。）
 mx::array prefetch_on_complete(
     const mx::array& expert_ids, const std::string& path, int stride,
     bool do_read, mx::StreamOrDevice s);
-std::vector<int> prefetch_on_complete_last_ids();
-int prefetch_on_complete_fires();
-
-// 回调把专家字节 pread 进调用方预分配的 MLX buffer（零拷贝物化候选）。
-mx::array prefetch_into(
-    const mx::array& dst, const mx::array& expert_ids, const std::string& path,
-    int stride, mx::StreamOrDevice s);
 
 // miss→hit（方案B）：expert_ids 为预测宽集合(降序)，回调按 resident 过滤、取前 cap 个缺口
 // pread 进 per-layer staging buffer(cap=buffer 行数)，并原子记录 (gen,[expert,row])。
@@ -46,19 +40,19 @@ mx::array prefetch_pool_sideregion(
 std::vector<int> sideregion_contents(int layer, int gen);   // [expert, phys_row, ...]
 std::pair<mx::array, mx::array> sideregion_kv(int layer, int gen);  // (keys uint32, vals int32) device 数组
 void sideregion_reset();
-// 取出并清空脏行：返回 (rows int32[m], 各段 uint8[m, seg_nbytes[k]])，供 Python scatter 落池。
-std::pair<mx::array, std::vector<mx::array>> sideregion_publish(
-    int layer, int gen, const std::vector<int>& seg_nbytes);
+// 排空侧区在途 fill：阻塞直到所有已提交的侧区预取字节写完。消费方在前向开头调用，
+// 保证被消费的侧区行字节已完全写好（闭合异步写-读竞态）。
+void sideregion_drain();
+// Route 3 Phase 1 底座：C++ 拥有的池 buffer 包成 mx.array（no-op deleter，进程内持有、永不迁移）。
+// 供侧区/demand 后台 pread 安全直写；替代原 mx.zeros 建池 + 消费侧 MLX scatter。
+mx::array pool_owned_zeros(const std::vector<int>& shape, const std::string& dtype);
+// demand 真实区落池：把已加载专家段直接 memcpy 进 owned 池行（无 MLX scatter，保 buffer 稳定）。
+void pool_write_rows(const std::vector<mx::array>& pool_list,
+                     const std::vector<mx::array>& srcs_flat, const std::vector<int>& slots);
+void pool_write_stacked(const std::vector<mx::array>& pool_list,
+                        const std::vector<mx::array>& stacked_list, const std::vector<int>& slots);
 // 诊断：mx.array 底层 buffer 原始指针（uintptr），用于对拍侧区写入 buffer 与 consume 读到 buffer 是否同一块。
 uintptr_t array_data_ptr(const mx::array& a);
-
-// Task1 spike：图内 primitive 输出别名输入 buffer，验证下游 gather 依赖边机制。
-mx::array materialize_spike(const mx::array& src, uint32_t fillval, mx::StreamOrDevice s);
-
-// Phase 2 方案B 机制探针：eval_gpu body 直接读 GPU 算出的 inds，写 local=inds+offset。
-mx::array demand_probe(const mx::array& inds, int offset, mx::StreamOrDevice s);
-// 探针2：完成回调里写 local，测同前向下游能否读到回调写入。
-mx::array demand_probe_handler(const mx::array& inds, int offset, mx::StreamOrDevice s);
 
 // ---- Phase 2 方案B：真实区槽状态 C++ 全接管（1 次同步版）----
 void real_init(int layer, int cap);                       // 初始化某层真实区(cap 槽全空闲)，幂等
@@ -76,7 +70,6 @@ void demand_timing_enable(bool on);
 // 测试壳：纯状态推进(不 pread/不侧区)，返回 local 槽位；供 LFU 驱逐等价对拍。
 std::vector<int> real_debug_place(int layer, const std::vector<int>& experts_flat, int cap,
                                   bool lfu, int decay_interval);
-uint32_t real_freq(int layer, int e);
 
 // ---- 自由后台读线程（de-risk）：脱离 GPU 完成回调、零 GIL，pread 进调用方 MLX buffer ----
 void bg_reader_start(int workers, int low_cap = 0);

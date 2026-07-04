@@ -5,6 +5,8 @@ using namespace nb::literals;
 NB_MODULE(native_moe_ext, m) {
   nb::module_::import_("mlx.core");
   m.doc() = "Native MLX MoE extension.";
+
+  // ---- 融合 MoE 计算核（native_fused.cpp）----
   m.def(
       "fused_moe",
       &fused_moe,
@@ -41,6 +43,7 @@ NB_MODULE(native_moe_ext, m) {
       "bits"_a,
       nb::kw_only(),
       "stream"_a = nb::none());
+  // ---- [1] blob 直读 ----
   m.def(
       "blob_load",
       &blob_load,
@@ -49,6 +52,7 @@ NB_MODULE(native_moe_ext, m) {
       "stride"_a,
       nb::kw_only(),
       "stream"_a = nb::none());
+  // ---- [2] 轻量预取(无 staging，仅预热 page cache) ----
   m.def(
       "prefetch_on_complete",
       &prefetch_on_complete,
@@ -58,17 +62,7 @@ NB_MODULE(native_moe_ext, m) {
       "do_read"_a = true,
       nb::kw_only(),
       "stream"_a = nb::none());
-  m.def("prefetch_on_complete_last_ids", &prefetch_on_complete_last_ids);
-  m.def("prefetch_on_complete_fires", &prefetch_on_complete_fires);
-  m.def(
-      "prefetch_into",
-      &prefetch_into,
-      "dst"_a,
-      "expert_ids"_a,
-      "path"_a,
-      "stride"_a,
-      nb::kw_only(),
-      "stream"_a = nb::none());
+  // ---- [3] staging miss→hit + 完成回调时刻探针（诊断）----
   m.def(
       "prefetch_into_staging",
       &prefetch_into_staging,
@@ -87,6 +81,7 @@ NB_MODULE(native_moe_ext, m) {
   m.def("staging_hprof_enable", &staging_hprof_enable, "on"_a);
   m.def("staging_hprof_now", &staging_hprof_now);
   m.def("staging_hprof_get", &staging_hprof_get);
+  // ---- [4] 段散写侧区缓存（zero-copy dual-source 默认路径）----
   m.def("prefetch_pool_sideregion", &prefetch_pool_sideregion,
         "pool_list"_a, "seg_nbytes"_a, "expert_ids"_a, "layer"_a, "path"_a, "stride"_a,
         "resident"_a, "spec_slots"_a, "base_row"_a, "gen"_a = 0, nb::kw_only(),
@@ -94,14 +89,14 @@ NB_MODULE(native_moe_ext, m) {
   m.def("sideregion_contents", &sideregion_contents, "layer"_a, "gen"_a = 0);
   m.def("sideregion_kv", &sideregion_kv, "layer"_a, "gen"_a = 0);
   m.def("sideregion_reset", &sideregion_reset);
-  m.def("sideregion_publish", &sideregion_publish, "layer"_a, "gen"_a, "seg_nbytes"_a);
+  m.def("sideregion_drain", &sideregion_drain,
+        nb::call_guard<nb::gil_scoped_release>());   // 等待时释放 GIL
+  // ---- [5] Route 3 owned 池底座（C++ 拥有 buffer + 直写，删 MLX scatter）----
+  m.def("pool_owned_zeros", &pool_owned_zeros, "shape"_a, "dtype"_a);
+  m.def("pool_write_rows", &pool_write_rows, "pool_list"_a, "srcs_flat"_a, "slots"_a);
+  m.def("pool_write_stacked", &pool_write_stacked, "pool_list"_a, "stacked_list"_a, "slots"_a);
   m.def("array_data_ptr", &array_data_ptr, "a"_a);
-  m.def("materialize_spike", &materialize_spike, "src"_a, "fillval"_a, nb::kw_only(),
-        "stream"_a = nb::none());
-  m.def("demand_probe", &demand_probe, "inds"_a, "offset"_a, nb::kw_only(),
-        "stream"_a = nb::none());
-  m.def("demand_probe_handler", &demand_probe_handler, "inds"_a, "offset"_a, nb::kw_only(),
-        "stream"_a = nb::none());
+  // ---- [6] 方案B 真实区槽状态 C++ 接管 + demand_dual ----
   m.def("real_init", &real_init, "layer"_a, "cap"_a);
   m.def("real_region_contents", &real_region_contents, "layer"_a);
   m.def("real_region_count", &real_region_count, "layer"_a);
@@ -114,7 +109,7 @@ NB_MODULE(native_moe_ext, m) {
   m.def("demand_timing_enable", &demand_timing_enable, "on"_a);
   m.def("real_debug_place", &real_debug_place, "layer"_a, "experts_flat"_a, "cap"_a, "lfu"_a,
         "decay_interval"_a);
-  m.def("real_freq", &real_freq, "layer"_a, "e"_a);
+  // ---- [7] 自由后台读线程 ----
   m.def("bg_reader_start", &bg_reader_start, "workers"_a = 1, "low_cap"_a = 0);
   m.def("bg_reader_submit", &bg_reader_submit,
         "dst"_a, "experts"_a, "rows"_a, "path"_a, "stride"_a, "ticket"_a, "prio"_a = 0);
@@ -125,6 +120,7 @@ NB_MODULE(native_moe_ext, m) {
   m.def("bg_pread_into_pool", &bg_pread_into_pool,
         "dst"_a, "seg_off"_a, "seg_nb"_a, "slot"_a, "expert"_a,
         "path"_a, "stride"_a, "ticket"_a, "prio"_a = 0, "nocache"_a = true);
+  // ---- 融合 MoE 计算核（slots 版，native_fused.cpp）----
   m.def(
       "fused_moe_slots",
       &fused_moe_slots,

@@ -25,6 +25,30 @@ _stg_verify_state = {"ok": 0, "bad": 0, "printed": 0, "calls": 0, "first_bad_cal
 
 from mlx_streaming import config
 
+# Route 3 Phase 1 底座：spec/dual 模式下池 buffer 改由 C++ 拥有(mx::allocator + no-op deleter)，
+# 地址进程内恒定、永不被 MLX donation/迁移，供侧区/demand 后台 pread 安全直写（替代消费侧 MLX scatter）。
+# POOL_OWNED=0 可强制回退 mx.zeros(仅供 A/B 对照)。
+_POOL_OWNED = os.environ.get("POOL_OWNED", "1") == "1"
+# mx.Dtype -> C++ pool_owned_zeros 接受的 dtype 名。
+_DTYPE_NAME = {
+    mx.uint32: "uint32", mx.uint16: "uint16", mx.uint8: "uint8",
+    mx.int32: "int32", mx.int16: "int16",
+    mx.bfloat16: "bfloat16", mx.float16: "float16", mx.float32: "float32",
+}
+
+
+def _owned_pool(sample: "Dict[str, mx.array]", n: int) -> "Dict[str, mx.array]":
+    """用 C++-owned buffer 建 (n,*shape) 的 per-key 池数组（地址恒定，供 C++ 直写）。"""
+    import mlx_streaming.native_moe_ext as _N
+    out = {}
+    for k, v in sample.items():
+        name = _DTYPE_NAME.get(v.dtype)
+        if name is None:
+            raise RuntimeError(f"pool_owned_zeros 不支持 dtype {v.dtype} (key={k})")
+        out[k] = _N.pool_owned_zeros([int(n)] + [int(d) for d in v.shape], name)
+    return out
+
+
 # 池按需增长(grow-on-demand)的初始物理行数。
 # 起步小,工作集扩大时按 ~1.5× 增长,封顶 cap_for(默认=全局 capacity)。
 # 好处:无需 profile 也能自动右尺寸(内存≈实际工作集),且对任何 prompt 自适应、容量内永不超预算。
@@ -123,12 +147,18 @@ class ResidentExpertPool:
         """首次为某层分配池张量,起步 _POOL_INIT_SLOTS 行(不超过该层天花板)。"""
         if self.spec_slots > 0:
             n = self.cap_for(layer) + self.spec_gens * self.spec_slots   # 预分配满（含 spec_gens 代侧区）
+            # spec/dual 模式：池由 C++ 拥有，侧区异步直写落此 buffer（Route 3 底座）。
+            if _POOL_OWNED:
+                self._pools[layer] = _owned_pool(sample, n)
+            else:
+                self._pools[layer] = {
+                    k: mx.zeros((n,) + v.shape, dtype=v.dtype) for k, v in sample.items()}
         else:
             n = min(_POOL_INIT_SLOTS, self.cap_for(layer))
-        self._pools[layer] = {
-            k: mx.zeros((n,) + v.shape, dtype=v.dtype)
-            for k, v in sample.items()
-        }
+            self._pools[layer] = {
+                k: mx.zeros((n,) + v.shape, dtype=v.dtype)
+                for k, v in sample.items()
+            }
         self._alloc[layer] = n
         real = self.cap_for(layer) if self.spec_slots > 0 else n
         self._free[layer].extend(range(real))    # 原地 mutate,不重新绑定；侧区行不进 free，永不被 LRU 分配/驱逐
@@ -160,9 +190,12 @@ class ResidentExpertPool:
         self._ensure_layer(layer)
         if layer in self._pools:
             return
-        self._pools[layer] = {
-            k: mx.zeros((cap,) + v.shape, dtype=v.dtype) for k, v in sample.items()
-        }
+        if _POOL_OWNED:
+            self._pools[layer] = _owned_pool(sample, cap)   # C++ 拥有，地址恒定供直写
+        else:
+            self._pools[layer] = {
+                k: mx.zeros((cap,) + v.shape, dtype=v.dtype) for k, v in sample.items()
+            }
         mx.eval(list(self._pools[layer].values()))   # 固定 data 指针
         self._alloc[layer] = cap
         # 登记所有物理行为空闲,供共用分配器(_alloc_slot)按 free 优先分配；
@@ -174,21 +207,37 @@ class ResidentExpertPool:
         """该层池张量当前物理行数(按需增长,≤ cap_for),用于内存核算/测试。"""
         return self._alloc.get(layer, 0)
 
+    def _pool_owned(self, layer: int) -> bool:
+        """该层池是否为 C++-owned buffer（spec/dual 模式 + POOL_OWNED）。
+        owned 池禁止任何 MLX scatter（会重分配 buffer、孤立侧区直写），落池一律走 C++ 直写。"""
+        return _POOL_OWNED and self.spec_slots > 0
+
     def _write_slot(self, layer: int, slot: int, expert: Dict[str, mx.array]):
+        if self._pool_owned(layer):
+            self._write_slots_batch(layer, [slot], [expert])   # 单槽也走 C++ 直写，避免 scatter
+            return
         pool = self._pools[layer]
         for k, v in expert.items():
             pool[k][slot] = v        # de-risk 选定：原地写，单槽、不拷贝整池
 
     def _write_slots_batch(self, layer: int, slots: List[int],
                            experts: "List[Dict[str, mx.array]]") -> None:
-        """把多个专家一次性写进各自槽位：每个 key 仅一次 stacked scatter。
+        """把多个专家一次性写进各自槽位。
 
-        取代 demand 多 miss 时逐专家、逐段的 _write_slot（6 段 × N 个碎 scatter），
-        合成「每 key 一次 stack + 一次 fancy-index scatter」，砍掉热路径碎 kernel 启动开销。
+        owned 池：C++ memcpy 直写各行（无 MLX scatter，保 buffer 地址恒定 → 侧区直写不被孤立）。
+        非 owned：每个 key 一次 stack + fancy-index scatter（原碎 kernel 最少化路径）。
         """
         if not slots:
             return
         pool = self._pools[layer]
+        if self._pool_owned(layer):
+            import mlx_streaming.native_moe_ext as _N
+            keys = list(pool.keys())
+            pool_list = [pool[k] for k in keys]
+            srcs_flat = [e[k] for k in keys for e in experts]   # key-major：与 C++ pool_write_rows 约定一致
+            mx.eval(srcs_flat)                                   # 物化源，固定 data 指针
+            _N.pool_write_rows(pool_list, srcs_flat, [int(s) for s in slots])
+            return
         idx = mx.array(slots, dtype=mx.int32)
         for k in pool:
             pool[k][idx] = mx.stack([e[k] for e in experts], axis=0)
@@ -218,9 +267,12 @@ class ResidentExpertPool:
             sample = self.loader(layer, 0)           # 仅取 shape/dtype，不写入池
             cap = self.cap_for(layer)
             n = cap + self.spec_gens * self.spec_slots
-            self._pools[layer] = {
-                k: mx.zeros((n,) + v.shape, dtype=v.dtype) for k, v in sample.items()
-            }
+            if _POOL_OWNED:
+                self._pools[layer] = _owned_pool(sample, n)   # C++ 拥有，地址恒定供直写
+            else:
+                self._pools[layer] = {
+                    k: mx.zeros((n,) + v.shape, dtype=v.dtype) for k, v in sample.items()
+                }
             mx.eval(list(self._pools[layer].values()))   # 固定 data 指针，供 C++ memcpy
             self._alloc[layer] = n
             import mlx_streaming.native_moe_ext as N
@@ -328,8 +380,16 @@ class ResidentExpertPool:
         if layer not in self._pools:
             self._alloc_pool(layer, {k: v[0] for k, v in stacked.items()})
         slots = [self._alloc_slot(layer, e, current)[0] for e in ids]
-        idx = mx.array(slots, dtype=mx.int32)
         pool = self._pools[layer]
+        if self._pool_owned(layer):
+            import mlx_streaming.native_moe_ext as _N
+            keys = list(pool.keys())
+            pool_list = [pool[k] for k in keys]
+            stacked_list = [stacked[k] for k in keys]
+            mx.eval(stacked_list)                          # 物化预堆叠源
+            _N.pool_write_stacked(pool_list, stacked_list, [int(s) for s in slots])
+            return slots
+        idx = mx.array(slots, dtype=mx.int32)
         for k in pool:
             pool[k][idx] = stacked[k]
         return slots
@@ -405,7 +465,10 @@ class ResidentExpertPool:
             self._place_expert(layer, e, expert, current=current)
             self.prefetch_loads += 1
 
-    def acquire(self, layer: int, expert_ids: List[int]):
+    def acquire(self, layer: int, expert_ids: List[int], protect: "set[int] | None" = None):
+        """protect：额外的「不可驱逐」专家集（除本批 miss 外）。dual 路径传入本前向全部 inds，
+        确保落 miss 腾槽时不驱逐本前向仍需的命中专家（否则其 slot 被复用 → 消费侧 gather 错字节）。
+        仅影响驱逐候选，不改 hit/miss 记账口径。"""
         # 唯一专家集合(保序去重)：池只需同时容纳本次请求的唯一专家
         uniq = list(dict.fromkeys(int(e) for e in expert_ids))
         cap = self.cap_for(layer)
@@ -415,6 +478,8 @@ class ResidentExpertPool:
         self._ensure_layer(layer)
         self._note_access(layer, uniq)
         uniq_set = set(uniq)
+        # 驱逐保护集 = 本批 miss ∪ 调用方额外指定(如本前向全部 inds 命中专家)。
+        current = uniq_set if protect is None else (uniq_set | protect)
         slot_of, free = self._slot_of[layer], self._free[layer]
         # 先处理命中（触摸 LRU），再把所有 miss 收成一批
         misses = []
@@ -429,7 +494,7 @@ class ResidentExpertPool:
             if self.stacked_batch_loader is not None:
                 # 批量读 + 批量物化：每段一次 mx.array，写池每 key 一次 scatter（碎 kernel 最少）
                 stacked = self.stacked_batch_loader(layer, misses)
-                self._place_experts_stacked(layer, misses, stacked, current=uniq_set)
+                self._place_experts_stacked(layer, misses, stacked, current=current)
             else:
                 if self.batch_loader is not None:
                     # 一次并行读本层所有 miss（8-worker pread）；保序写池，LRU/驱逐语义不变
@@ -437,7 +502,7 @@ class ResidentExpertPool:
                 else:
                     loaded = {e: self.loader(layer, e) for e in misses}
                 # 批量写：每 key 仅一次 stacked scatter，取代逐专家逐段碎 scatter
-                self._place_experts(layer, misses, loaded, current=uniq_set)
+                self._place_experts(layer, misses, loaded, current=current)
         # slots 与原始 expert_ids 一一对应(含重复)，便于直接 reshape 成 routing 索引
         slots = [slot_of[int(e)] for e in expert_ids]
         return self._pools[layer], slots
@@ -484,23 +549,6 @@ class ResidentExpertPool:
         pool_arrays, _ = self.acquire(layer, flat)
         local = mx.take(self._slot_table[layer], inds)
         return pool_arrays, local
-
-    def _publish_side(self, layer, side):
-        """把侧区自上次起新到达的行(C++ 稳定缓冲)以 MLX 追踪 scatter 写进池。
-
-        每行只在字节首次到达时发布一次；MLX 追踪的写随 buffer 迁移存活，故之后无需重发。
-        仅当 side 适配器实现 publish 时生效(向后兼容旧适配器)。
-        """
-        pub = getattr(side, "publish", None)
-        if pub is None:
-            return
-        rows, typed = pub(layer)
-        m = int(rows.shape[0]) if rows.ndim else 0
-        if m == 0:
-            return
-        pool = self._pools[layer]
-        for k, arr in typed.items():
-            pool[k][rows] = arr
 
     def _verify_side_bytes(self, layer, inds, sc):
         """诊断：侧区命中专家 E→行 R，把 pool[R] 各段与 loader(layer,E) 真值逐段比对。
@@ -647,8 +695,8 @@ class ResidentExpertPool:
                 print(f"[POOL_PTR] err {_e}", flush=True)
         keys, vals = side.kv(layer)
         has_side = int(keys.size) > 0                    # .size 只读 shape，无 GPU 同步
-        if has_side and layer in self._pools:
-            self._publish_side(layer, side)              # 新到侧区行以 MLX 追踪 scatter 落池(随迁移存活)
+        # Route 3 底座：侧区字节已由 C++ 后台直写进 C++-owned 池 buffer（地址恒定不迁移），
+        # 无需消费侧 MLX scatter 发布；e2r 叠加即寻址到已就绪的侧区行。
         eff = mx.array(base) if has_side else base       # 无侧区条目时直接用 base，省掉每层一次 256-int 拷贝
         if has_side:
             eff[keys] = vals                             # vals 为 int32，与 base.dtype 一致
@@ -678,24 +726,21 @@ class ResidentExpertPool:
                 self._note_access(layer, [int(i) for i in inds.reshape(-1).tolist()])
             return self._pools[layer], local
         # 真 miss：eff 已叠加侧区，故 local<0 恰为真 miss（既不在真实区、也不在侧区）。
-        # 用 GPU 布尔索引只取这几个 miss id 回 host，复用 demand 读盘落真实区、补表；
-        # 砍掉整批 .tolist() + 侧区 keys.tolist() + 两个 Python set/成员循环。
-        # LFU 记账取舍：真实区命中的频次 bump 省略（不为精确 LFU 把全部命中 id 拉回 host），
-        # 属启发式精度损失、不影响正确性（详见 spec 2026-07-02-qwen-dual-fallback-native）。
+        # 单次同步取回两列：本前向全部 inds 原 id + 每位置的 local（<0 即 miss）。
+        # 为什么要拿全部 inds：demand 落 miss 需驱逐腾槽，若只保护 miss 集，会把本前向仍需的
+        # 命中专家挤掉 → 其 slot 被复用 → 重算 local 里该专家变 -1 → gather 读 row-1 错字节，
+        # 在 cap 逼近单前向唯一专家数时确定性破坏容量不变性。故把全部 inds 作为驱逐保护集。
         self.gpu_fallback += 1
         flat_local = local.reshape(-1)
-        miss_mask = flat_local < 0
-        # MLX 无布尔索引:用 where 把"miss 位置填专家 id、命中位置填 -1"合成一个数组,单次 .tolist()。
-        # 命中位(含侧区)一律 -1 被过滤 → 不需要侧区 keys.tolist() 与 set 成员判断。
-        miss_or_neg = mx.where(miss_mask,
-                               inds.reshape(-1).astype(mx.int32),
-                               mx.array(-1, dtype=mx.int32))
-        miss_host = miss_or_neg.tolist()                     # 唯一同步
-        n_miss_pos = sum(1 for v in miss_host if v >= 0)
-        self.hits += int(inds.size) - n_miss_pos             # 位置口径，与快路径一致
-        miss_ids = [v for v in miss_host if v >= 0]          # 真 miss 专家 id(带重复,acquire 内 dedup)
+        flat_inds = inds.reshape(-1).astype(mx.int32)
+        combo = mx.stack([flat_inds, flat_local.astype(mx.int32)], axis=0)
+        combo_host = combo.tolist()                          # 唯一同步
+        inds_host, local_host = combo_host[0], combo_host[1]
+        miss_ids = [inds_host[i] for i in range(len(inds_host)) if local_host[i] < 0]  # 真 miss(带重复)
+        self.hits += int(inds.size) - len(miss_ids)          # 位置口径，与快路径一致
         if miss_ids:
-            self.acquire(layer, miss_ids)                    # dedup+note_access+pread+落池+补表
+            protect = {int(v) for v in inds_host}            # 本前向全部 inds：落 miss 时不可被驱逐
+            self.acquire(layer, miss_ids, protect=protect)   # dedup+note_access+pread+落池+补表
         base = self._slot_table[layer]
         eff = mx.array(base) if has_side else base
         if has_side:

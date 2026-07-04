@@ -62,6 +62,12 @@ class VirtualPool:
         稳健：不依赖首个 MoE 层是 layer 0、也不要求 MoE 层连续。"""
         if layer_idx <= self._last_layer:
             self._gen += 1
+            # 新前向开头排空上一前向提交的侧区 fill：C++-owned 池 buffer 由后台异步直写，
+            # 若消费前 fill 未写完，GPU gather 会读到半写侧区行（DUAL_VERIFY BAD）。
+            # drain 阻塞到在途 fill 全部写完 → 本前向要消费的侧区行字节必已就绪。
+            if self._spec > 0:
+                import mlx_streaming.native_moe_ext as _N
+                _N.sideregion_drain()
         self._last_layer = layer_idx
 
     def _gens(self) -> int:

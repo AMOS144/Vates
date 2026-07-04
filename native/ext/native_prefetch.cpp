@@ -21,6 +21,23 @@
 #define F_NOCACHE 48          // macOS：提示内核读过的页不留 page cache
 #endif
 
+// ============================================================================
+// 文件分区（按出现顺序）：
+//   [0] 公共 IO 助手         open_blob_nocache / bg_submit_task 前置声明
+//   [1] blob 直读            blob_load —— 惰性图节点，pread 专家字节进 MLX buffer
+//   [2] 轻量预取(无 staging)  prefetch_on_complete —— 仅预热 page cache
+//   [3] staging miss→hit     prefetch_into_staging / prefetch_staging_take
+//                            + STAGING_HPROF 完成回调时刻探针（诊断，默认关）
+//   [4] 段散写侧区缓存        prefetch_pool_sideregion / sideregion_{contents,kv,reset,drain}
+//                            —— zero-copy dual-source 默认路径，后台直写 owned 池行
+//   [5] Route 3 owned 池底座  pool_owned_zeros / pool_write_rows / pool_write_stacked
+//                            + array_data_ptr（诊断）—— C++ 拥有池 buffer，删 MLX scatter
+//   [6] 方案B 真实区(C++接管)  real_{init,region_contents,region_count,reset} / demand_dual
+//                            / real_debug_place（LFU 对拍测试壳）
+//   [7] 自由后台读线程        BgReader + bg_reader_{start,submit,ready,wait,stop} / bg_pread_into_pool
+// 跨线程全局态均 static 私有于本 TU；对外接口见 native_prefetch.h。
+// ============================================================================
+
 // 打开 blob 并设 F_NOCACHE：与 demand 侧 blob_loader 对齐，避免预取读把 page cache 灌满 →
 // 在内存受限机上累积压力触发"双稳态"慢挡翻转（实测 zerocopy 每轮翻慢挡的根因）。
 static inline int open_blob_nocache(const char* path) {
@@ -33,6 +50,7 @@ static inline int open_blob_nocache(const char* path) {
 // 侧区预取的 GPU 完成回调用它把 pread 派到后台线程，脱离 Metal 回调线程 → 真正与计算重叠。
 namespace { void bg_submit_task(std::function<void()> fn); }
 
+// ====== [1] blob 直读：pread 专家字节进 MLX buffer（惰性图节点）======
 // 把一组专家的 blob 字节直接 pread 进 MLX 自有 buffer（无 kernel、无额外拷贝）。
 // load 作为惰性图节点：在批量 eval 中执行，避免 Python 侧 per-expert mx.eval 同步。
 class BlobLoadPrimitive : public mx::Primitive {
@@ -86,12 +104,8 @@ mx::array blob_load(
       std::vector<mx::array>{});
 }
 
-// ---- native-fused-prefetch (de-risk): GPU 完成回调里读 id + 派发 pread ----
+// ====== [2] 轻量预取(无 staging 模式)：GPU 完成回调里读 inds、pread 预热 page cache ======
 // 命门验证:回调在 command buffer 完成后触发,此时 inds 已算完,读到的是正确值。
-static std::mutex g_pf_mutex;
-static std::vector<int> g_pf_last_ids;
-static std::atomic<int> g_pf_fires{0};
-
 class PrefetchOnCompletePrimitive : public mx::Primitive {
  public:
   PrefetchOnCompletePrimitive(mx::Stream s, std::string path, size_t stride, bool do_read)
@@ -124,20 +138,14 @@ class PrefetchOnCompletePrimitive : public mx::Primitive {
  private:
   static void record_and_read(const uint32_t* p, size_t n, const std::string& path,
                               size_t stride, bool do_read) {
-    std::vector<int> seen;
-    seen.reserve(n);
     int fd = (do_read && !path.empty()) ? ::open(path.c_str(), O_RDONLY) : -1;
     static thread_local std::vector<uint8_t> buf;
     if (do_read && buf.size() < stride) buf.resize(stride);
     for (size_t i = 0; i < n; ++i) {
       int e = static_cast<int>(p[i]);
-      seen.push_back(e);
       if (fd >= 0) ::pread(fd, buf.data(), stride, static_cast<off_t>(static_cast<size_t>(e) * stride));
     }
     if (fd >= 0) ::close(fd);
-    std::lock_guard<std::mutex> lk(g_pf_mutex);
-    g_pf_last_ids = std::move(seen);
-    g_pf_fires.fetch_add(1);
   }
   std::string path_;
   size_t stride_;
@@ -159,65 +167,6 @@ mx::array prefetch_on_complete(
       std::vector<mx::array>{expert_ids});
 }
 
-std::vector<int> prefetch_on_complete_last_ids() {
-  std::lock_guard<std::mutex> lk(g_pf_mutex);
-  return g_pf_last_ids;
-}
-
-int prefetch_on_complete_fires() { return g_pf_fires.load(); }
-
-// de-risk: 完成回调把专家字节 pread 进调用方预分配的 MLX buffer(零拷贝物化候选)。
-// 验证:主线程后续读这块 buffer 能拿到正确字节、quantized_matmul 不崩。
-class PrefetchIntoPrimitive : public mx::Primitive {
- public:
-  PrefetchIntoPrimitive(mx::Stream s, std::string path, size_t stride)
-      : Primitive(s), path_(std::move(path)), stride_(stride) {}
-  const char* name() const override { return "PrefetchIntoPrimitive"; }
-
-  void eval_cpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override {
-    outputs[0].set_data(mx::allocator::malloc(outputs[0].nbytes()));
-    mx::array ids = inputs[0];
-    ids.eval();
-    mx::array dst = inputs[1];
-    dst.eval();
-    pread_into(ids.data<uint32_t>(), ids.size(), dst.data<uint8_t>(), path_, stride_);
-  }
-
-  void eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override {
-    outputs[0].set_data(mx::allocator::malloc(outputs[0].nbytes()));
-    mx::array ids = inputs[0];
-    mx::array dst = inputs[1];
-    const uint32_t* idp = ids.data<uint32_t>();
-    uint8_t* dstp = dst.data<uint8_t>();   // 预分配 buffer 的指针(统一内存,CPU 可写)
-    size_t n = ids.size();
-    std::string path = path_;
-    size_t stride = stride_;
-    auto& enc = mx::metal::get_command_encoder(stream());
-    MTL::CommandBuffer* cb = enc.get_command_buffer();
-    cb->addCompletedHandler([ids, dst, idp, dstp, n, path, stride](MTL::CommandBuffer*) {
-      pread_into(idp, n, dstp, path, stride);
-    });
-  }
-
- private:
-  static void pread_into(const uint32_t* idp, size_t n, uint8_t* dst,
-                         const std::string& path, size_t stride) {
-    int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) return;
-    for (size_t i = 0; i < n; ++i) {
-      size_t off = static_cast<size_t>(idp[i]) * stride;
-      ::pread(fd, dst + i * stride, stride, static_cast<off_t>(off));
-    }
-    ::close(fd);
-    {
-      std::lock_guard<std::mutex> lk(g_pf_mutex);
-      g_pf_fires.fetch_add(1);
-    }
-  }
-  std::string path_;
-  size_t stride_;
-};
-
 // ---- handler 触发时刻探针(STAGING_HPROF)：记录每次 staging 完成回调被 Metal 触发的时刻 ----
 // 用于实测"完成回调到底扎堆在 eval 尾、还是逐层铺开"。仅诊断用，默认关。
 static std::mutex g_hprof_mutex;
@@ -230,7 +179,7 @@ static inline double hprof_steady_now() {
       .count();
 }
 
-// ---- staging 版 miss→hit：handler pread 进 per-layer staging + 记录 (expert→row) ----
+// ====== [3] staging 版 miss→hit：handler pread 进 per-layer staging + 记录 (expert→row) ======
 static std::mutex g_stg_mutex;
 // layer -> (gen, [(expert, row)])；handler 原子写 gen+映射，主线程按 gen 匹配 buffer 后 take。
 static std::map<int, std::pair<long, std::vector<std::pair<int, int>>>> g_stg_ready;
@@ -307,7 +256,6 @@ class PrefetchStagingPrimitive : public mx::Primitive {
     ::close(fd);
     std::lock_guard<std::mutex> lk(g_stg_mutex);
     g_stg_ready[layer] = {gen, std::move(ready)};   // 原子：gen 与映射一起写
-    g_pf_fires.fetch_add(1);
   }
   int layer_;
   long gen_;
@@ -362,7 +310,7 @@ std::vector<double> staging_hprof_get() {
   return out;
 }
 
-// ---- 段散写持久侧区缓存 ----
+// ====== [4] 段散写持久侧区缓存（zero-copy dual-source 默认路径）======
 // 与持久 staging 缓存同构，但目标是“多个结构化 per-key 池数组”：每个池数组形如
 // (cap+spec, ...)，行 [base_row, base_row+spec) 为侧区。命中缺口时 pread blob 整行，
 // 再把该行内按固定顺序拼接的各段 memcpy 进对应 per-key 数组的同一物理行。
@@ -373,15 +321,27 @@ struct SideLayer {
   bool inited = false;
   int base = 0;                    // 侧区起始物理行 base_row
   int spec = 0;                    // 侧区行数 spec_slots
-  std::set<int> dirty;             // 已写字节但尚未被 publish 取出的物理行
 };
 static std::mutex g_side_mutex;
 static std::map<std::pair<int, int>, SideLayer> g_side;   // 键 (layer, gen)：双缓冲两代独立
 
-// C++ 拥有的稳定字节缓冲：键 (layer, gen)，大小 spec*stride，按 (row-base)*stride 索引。
-// 侧区字节写进这里（永不被 MLX 迁移），consume 时由 Python 用 MLX 追踪的 scatter 落池。
-// 用 shared_ptr：在途 bg 读任务拷一份 shared_ptr 保活其旧 buffer，reset/换代时新建替换互不影响 → 杜绝 UAF。
-static std::map<std::pair<int, int>, std::shared_ptr<std::vector<uint8_t>>> g_side_bytes;
+// 侧区 fill 在途计数：eval_gpu 提交预取时 +1，后台 read_publish 写完字节后 -1。
+// 消费方在前向开头 sideregion_drain() 排空上一前向的 fill，保证被消费的侧区行字节
+// 已完全写好（含 GPU 完成回调滞后的情形）→ 消灭「GPU 消费 kernel 读到半写侧区行」竞态。
+static std::atomic<long> g_side_inflight{0};
+static std::mutex g_side_drain_mutex;
+static std::condition_variable g_side_drain_cv;
+static inline void side_inflight_done() {
+  {
+    std::lock_guard<std::mutex> lk(g_side_drain_mutex);
+    g_side_inflight.fetch_sub(1);
+  }
+  g_side_drain_cv.notify_all();
+}
+void sideregion_drain() {
+  std::unique_lock<std::mutex> lk(g_side_drain_mutex);
+  g_side_drain_cv.wait(lk, [] { return g_side_inflight.load() == 0; });
+}
 
 // 临时诊断：只追踪指定 (layer,row) 的所有账本/字节事件（SIDE_TRACE_LAYER/ROW）。
 static inline bool side_trace_hit(int layer, int row) {
@@ -432,13 +392,19 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
     int spec = spec_, base = base_;
     auto& enc = mx::metal::get_command_encoder(stream());
     MTL::CommandBuffer* cb = enc.get_command_buffer();
+    // 提交即计在途：在 eval_gpu（预取提交）时 +1，直到后台字节写完才 -1。这样消费方前向开头
+    // sideregion_drain() 能等到「即使 GPU 完成回调尚未触发」的 fill，闭合跨前向的写-读竞态。
+    g_side_inflight.fetch_add(1);
     // in 按值捕获 → 保活 expert_ids 与所有池数组 buffer；idp/ptrs 在回调里指针有效。
     cb->addCompletedHandler(
         [in, ptrs, seg, idp, n, layer, gen, path, stride, resident, spec, base](MTL::CommandBuffer*) {
           // 阶段1（回调线程、持锁极短）：读惰性 id（此刻已算完）、预留侧区行。
           // 必须在回调里——id 只有 command buffer 完成后才有效。
           auto to_read = reserve(idp, n, layer, gen, resident, spec, base);
-          if (to_read.empty()) return;
+          if (to_read.empty()) {
+            side_inflight_done();               // 无缺口可读：立即消账，避免 drain 空等
+            return;
+          }
           // 诊断门控 SIDEREGION_SYNC=1：回调内同步 pread+memcpy+publish（不派 bg），
           // 消除「异步 bg fill 与下一前向 gather 竞态」这一变量，用于 systematic-debugging 取证。
           static const bool kSync = []() {
@@ -447,6 +413,7 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
           }();
           if (kSync) {
             read_publish(ptrs, seg, to_read, path, stride, layer, gen);
+            side_inflight_done();
             return;
           }
           // 阶段2+3 派给自由后台线程：~40MB pread + memcpy + 发布 e2r 脱离 Metal 回调线程，
@@ -454,6 +421,7 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
           // 闭包再次按值捕获 in：保活池/ids buffer 到后台读完（ptrs 指向其内存）。
           bg_submit_task([in, ptrs, seg, to_read, path, stride, layer, gen]() {
             read_publish(ptrs, seg, to_read, path, stride, layer, gen);
+            side_inflight_done();               // 字节写完才消账 → drain 保证被消费行已就绪
           });
         });
   }
@@ -480,7 +448,8 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
       const uint32_t* idp, size_t n, int layer, int gen, const std::vector<int>& resident,
       int spec, int base) {
     const char* lfu_env = std::getenv("SIDEREGION_LFU");   // 每次读,便于测试切换
-    bool lfu = lfu_env && lfu_env[0] == '1';
+    // 默认开:持久 LFU 单缓冲=生产路径(cli 默认)。仅显式 SIDEREGION_LFU=0 回退旧 legacy 双缓冲。
+    bool lfu = !lfu_env || lfu_env[0] != '0';
     std::unordered_set<int> res(resident.begin(), resident.end());
     std::vector<int> P;
     std::unordered_set<int> Pset, seen;
@@ -581,28 +550,17 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
                 where, layer, gen, pr.second, pr.first, row_owner[pr.second]);
   }
 
-  // 阶段2+3：pread + memcpy 进已预留的独占行（不持锁），写完后持锁发布 e2r。
-  // 在后台线程跑：与计算并发，且不阻塞消费侧的 sideregion_contents。
+  // 阶段2+3：pread blob 整行 + 各段 memcpy 直写进对应 per-key 池数组的物理侧区行（不持锁），
+  // 写完后持锁发布 e2r。ptrs[i] 为第 i 个池 key 数组的 buffer 指针（C++ 拥有、地址恒定不迁移，
+  // 由 Route 3 底座保证——见 pool_owned_zeros），故后台异步直写安全、消费侧读同一 buffer。
+  // 在后台线程跑：与计算并发，且不阻塞消费侧的 sideregion_kv。
   static void read_publish(const std::vector<uint8_t*>& ptrs, const std::vector<int>& seg,
                            const std::vector<std::pair<int, int>>& to_read,
                            const std::string& path, size_t stride, int layer, int gen) {
-    (void)ptrs;   // 不再旁路写 MLX 池 buffer：字节改写进 C++ 稳定缓冲
-    (void)seg;    // 段拆分推迟到 sideregion_publish（消费时用 MLX scatter 落池）
-    int base = 0;
-    std::shared_ptr<std::vector<uint8_t>> buf_sp;
-    {
-      // 单锁作用域：get-or-create 稳定缓冲，按需整体替换（新建 shared_ptr，不动在途旧 buffer），
-      // 并拷一份 shared_ptr 到局部保活 → reset/换代都不会让 bufp 悬垂。
-      std::lock_guard<std::mutex> lk(g_side_mutex);
-      SideLayer& c = g_side[{layer, gen}];
-      base = c.base;
-      size_t want = static_cast<size_t>(c.spec) * stride;
-      auto& slot = g_side_bytes[{layer, gen}];
-      if (!slot || slot->size() != want)
-        slot = std::make_shared<std::vector<uint8_t>>(want, 0);   // 换代/首次：新建，不动在途旧 buffer
-      buf_sp = slot;                                              // 拷贝 shared_ptr 保活到本任务结束
-    }
-    uint8_t* bufp = buf_sp->data();                              // buf_sp 在函数栈上保活，reset/换代不影响
+    // 段在 blob 记录内的偏移（段顺序 = seg 顺序 = ptrs/池 key 顺序）。
+    std::vector<size_t> seg_off(seg.size(), 0);
+    size_t acc = 0;
+    for (size_t i = 0; i < seg.size(); ++i) { seg_off[i] = acc; acc += static_cast<size_t>(seg[i]); }
     int fd = open_blob_nocache(path.c_str());
     if (fd < 0) {                                             // 失败则把预留行还回 free
       std::lock_guard<std::mutex> lk(g_side_mutex);
@@ -610,19 +568,22 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
       for (auto& pr : to_read) c.free_rows.push_back(pr.second);
       return;
     }
+    std::vector<uint8_t> rec(stride);                          // 整条 blob 记录临时缓冲
     std::vector<std::pair<int, int>> done;
     for (auto& pr : to_read) {
       int e = pr.first, row = pr.second;
-      // 直接把整条 blob 记录 pread 进稳定缓冲对应行（按 (row-base)*stride 定位）。
-      uint8_t* dst = bufp + static_cast<size_t>(row - base) * stride;
-      if (::pread(fd, dst, stride, static_cast<off_t>(static_cast<size_t>(e) * stride)) !=
+      if (::pread(fd, rec.data(), stride, static_cast<off_t>(static_cast<size_t>(e) * stride)) !=
           static_cast<ssize_t>(stride)) {
         std::lock_guard<std::mutex> lk(g_side_mutex);         // 读失败：行还回 free
         g_side[{layer, gen}].free_rows.push_back(row);
         continue;
       }
+      // 各段 memcpy 进对应 per-key 池数组的物理行 row（(n_slots,*shape) 布局 → 行偏移 = row*seg[i]）。
+      for (size_t i = 0; i < seg.size(); ++i)
+        std::memcpy(ptrs[i] + static_cast<size_t>(row) * static_cast<size_t>(seg[i]),
+                    rec.data() + seg_off[i], static_cast<size_t>(seg[i]));
       if (side_trace_hit(layer, row))
-        fprintf(stderr, "[SIDE_TRACE ev=%llu tid=%u] L%d gen%d READBUF row=%d expert=%d\n",
+        fprintf(stderr, "[SIDE_TRACE ev=%llu tid=%u] L%d gen%d WRITEPOOL row=%d expert=%d\n",
                 (unsigned long long)g_side_ev.fetch_add(1), side_tid(), layer, gen, row, e);
       done.emplace_back(e, row);
     }
@@ -630,10 +591,9 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
     {
       std::lock_guard<std::mutex> lk(g_side_mutex);
       SideLayer& c = g_side[{layer, gen}];
-      for (auto& pr : done) {                                  // 字节就绪后才发布 e2r + 标脏
+      for (auto& pr : done) {                                  // 字节就绪后才发布 e2r
         c.e2r[pr.first] = pr.second;
         if (!c.freq.count(pr.first)) c.freq[pr.first] = 1;     // 新专家初始 freq
-        c.dirty.insert(pr.second);
         if (side_trace_hit(layer, pr.second))
           fprintf(stderr, "[SIDE_TRACE ev=%llu tid=%u] L%d gen%d PUBLISH row=%d expert=%d\n",
                   (unsigned long long)g_side_ev.fetch_add(1), side_tid(), layer, gen, pr.second,
@@ -641,7 +601,6 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
       }
       if (std::getenv("SIDE_AUDIT")) side_audit(c, layer, gen, "publish", {});
     }
-    g_pf_fires.fetch_add(1);
   }
   std::vector<int> seg_;
   int layer_;
@@ -720,49 +679,85 @@ std::pair<mx::array, mx::array> sideregion_kv(int layer, int gen) {
 void sideregion_reset() {
   std::lock_guard<std::mutex> lk(g_side_mutex);
   g_side.clear();
-  g_side_bytes.clear();
 }
 
-// 取出并清空脏行：从 C++ 稳定字节缓冲把脏行按段拆分成多个 (m, seg_nbytes[k]) uint8 数组，
-// 返回 (rows int32[m], seg_arrays)。消费侧（Python）用 rows 做 MLX 追踪的 scatter 落池。
-std::pair<mx::array, std::vector<mx::array>> sideregion_publish(
-    int layer, int gen, const std::vector<int>& seg_nbytes) {
-  // 段在 blob 记录内的偏移与总 stride（段顺序 = seg_nbytes 顺序 = 池 key 顺序）。
-  std::vector<int> seg_off(seg_nbytes.size(), 0);
-  size_t stride = 0;
-  for (size_t k = 0; k < seg_nbytes.size(); ++k) { seg_off[k] = static_cast<int>(stride); stride += seg_nbytes[k]; }
+// ====== [5] Route 3 Phase 1 底座：C++ 拥有的池 buffer ======
+// 用 mx::allocator::malloc 分配 buffer、no-op deleter 建叶子 mx.array（C++ 经 g_owned_bufs
+// 持有 Buffer 句柄，进程内不释放）。因 C++ 独占持有、MLX 只读，该 buffer 永不被 MLX
+// donation/迁移（spike 已证），故侧区/demand 的后台异步 pread 可安全直写、消费侧读同一块。
+static std::mutex g_owned_mutex;
+static std::vector<mx::allocator::Buffer> g_owned_bufs;
 
-  std::vector<int32_t> rows;
-  std::vector<std::vector<uint8_t>> segbuf(seg_nbytes.size());
+static mx::Dtype dtype_from_str(const std::string& s) {
+  if (s == "uint32") return mx::uint32;
+  if (s == "uint16") return mx::uint16;
+  if (s == "uint8") return mx::uint8;
+  if (s == "int32") return mx::int32;
+  if (s == "int16") return mx::int16;
+  if (s == "bfloat16") return mx::bfloat16;
+  if (s == "float16") return mx::float16;
+  if (s == "float32") return mx::float32;
+  throw std::runtime_error("pool_owned_zeros: unsupported dtype " + s);
+}
+
+mx::array pool_owned_zeros(const std::vector<int>& shape, const std::string& dtype) {
+  mx::Dtype dt = dtype_from_str(dtype);
+  mx::Shape shp(shape.begin(), shape.end());
+  size_t n = 1;
+  for (int d : shape) n *= static_cast<size_t>(d);
+  size_t nbytes = n * static_cast<size_t>(mx::size_of(dt));
+  auto buf = mx::allocator::malloc(nbytes);
+  std::memset(buf.raw_ptr(), 0, nbytes);
   {
-    std::lock_guard<std::mutex> lk(g_side_mutex);
-    auto it = g_side.find({layer, gen});
-    auto bit = g_side_bytes.find({layer, gen});
-    if (it != g_side.end() && bit != g_side_bytes.end() && bit->second && !it->second.dirty.empty()) {
-      SideLayer& c = it->second;
-      const std::vector<uint8_t>& buf = *bit->second;   // 解引用 shared_ptr
-      int m = static_cast<int>(c.dirty.size());
-      rows.reserve(m);
-      for (size_t k = 0; k < seg_nbytes.size(); ++k)
-        segbuf[k].resize(static_cast<size_t>(m) * seg_nbytes[k]);
-      int i = 0;
-      for (int row : c.dirty) {
-        rows.push_back(row);
-        size_t rbase = static_cast<size_t>(row - c.base) * stride;
-        for (size_t k = 0; k < seg_nbytes.size(); ++k)
-          std::memcpy(segbuf[k].data() + static_cast<size_t>(i) * seg_nbytes[k],
-                      buf.data() + rbase + seg_off[k], seg_nbytes[k]);
-        ++i;
-      }
-      c.dirty.clear();   // 取出即清脏：下次 publish 只返回新写入行
+    std::lock_guard<std::mutex> lk(g_owned_mutex);
+    g_owned_bufs.push_back(buf);   // C++ 持有，保证进程内不被释放
+  }
+  return mx::array(buf, shp, dt, [](mx::allocator::Buffer) {});
+}
+
+// demand 真实区落池：把一批已加载专家段 memcpy 进 owned 池行（无 MLX scatter → pool buffer 永不重绑）。
+// pool_list[i]：第 i 个 key 的池数组；srcs_flat 长 K*m，key-major：[k0行0,k0行1,...,k1行0,...]；
+// slots[j]：第 j 个专家的目标物理行。CPU 端直写，调用点须保证此刻池未被 GPU 并发读该行。
+void pool_write_rows(const std::vector<mx::array>& pool_list,
+                     const std::vector<mx::array>& srcs_flat,
+                     const std::vector<int>& slots) {
+  int K = static_cast<int>(pool_list.size());
+  int m = static_cast<int>(slots.size());
+  if (m == 0) return;
+  if (static_cast<int>(srcs_flat.size()) != K * m)
+    throw std::runtime_error("pool_write_rows: srcs_flat 长度须 == K*m");
+  for (int i = 0; i < K; ++i) {
+    mx::array p = pool_list[i];
+    p.eval();
+    uint8_t* base = p.data<uint8_t>();
+    for (int j = 0; j < m; ++j) {
+      mx::array s = srcs_flat[static_cast<size_t>(i) * m + j];
+      s.eval();
+      size_t nb = s.nbytes();
+      std::memcpy(base + static_cast<size_t>(slots[j]) * nb, s.data<uint8_t>(), nb);
     }
   }
-  int m = static_cast<int>(rows.size());
-  std::vector<mx::array> out;
-  out.reserve(seg_nbytes.size());
-  for (size_t k = 0; k < seg_nbytes.size(); ++k)
-    out.push_back(mx::array(segbuf[k].data(), mx::Shape{m, seg_nbytes[k]}, mx::uint8));
-  return {mx::array(rows.data(), mx::Shape{m}, mx::int32), out};
+}
+
+// 同上，但源是每 key 预堆叠的 (m,*shape) 整块 stacked_list[i]，按行 memcpy 到 slots[j]。
+void pool_write_stacked(const std::vector<mx::array>& pool_list,
+                        const std::vector<mx::array>& stacked_list,
+                        const std::vector<int>& slots) {
+  int K = static_cast<int>(pool_list.size());
+  int m = static_cast<int>(slots.size());
+  if (m == 0) return;
+  for (int i = 0; i < K; ++i) {
+    mx::array p = pool_list[i];
+    p.eval();
+    mx::array st = stacked_list[i];
+    st.eval();
+    uint8_t* base = p.data<uint8_t>();
+    const uint8_t* src = st.data<uint8_t>();
+    size_t rownb = st.nbytes() / static_cast<size_t>(m);   // stacked 为 (m,*shape) → 每行字节
+    for (int j = 0; j < m; ++j)
+      std::memcpy(base + static_cast<size_t>(slots[j]) * rownb,
+                  src + static_cast<size_t>(j) * rownb, rownb);
+  }
 }
 
 // 临时诊断：返回某 mx.array 底层 buffer 的原始数据指针（uintptr）。用于对拍
@@ -774,7 +769,7 @@ uintptr_t array_data_ptr(const mx::array& a) {
   return reinterpret_cast<uintptr_t>(b.data<uint8_t>());
 }
 
-// ====== Phase 2 方案B：真实区槽状态 C++ 全接管（1 次同步版）======
+// ====== [6] Phase 2 方案B：真实区槽状态 C++ 全接管（1 次同步版）======
 // 复刻 Python ResidentExpertPool 的 _slot_of/_free/_freq + _choose_victim/_alloc_slot 语义：
 // - free 优先(front pop，free 初始 [0,cap))；free 空 → LFU 驱逐，受害者槽直接复用(不回 free)。
 // - _choose_victim：candidates=插入序中 ∉current 者；victim=min(freq, 候选下标)，驱逐不删 freq。
@@ -1032,126 +1027,7 @@ std::vector<int> real_debug_place(int layer, const std::vector<int>& experts_fla
   return std::vector<int>(local.begin(), local.end());
 }
 
-uint32_t real_freq(int layer, int e) {
-  std::lock_guard<std::mutex> lk(g_real_mutex);
-  auto it = g_real.find(layer);
-  if (it == g_real.end()) return 0;
-  auto fit = it->second.freq.find(e);
-  return fit == it->second.freq.end() ? 0 : fit->second;
-}
-
-// ====== Task1 spike：验证「输出别名输入 buffer + eval_gpu 回调里 memcpy 填值」机制 ======
-// 单输入 src(uint32 [N])；eval 把 src 的 buffer 原地写成常量 fill、并把输入别名为输出。
-// 下游 take(out) 必须确定性读到 fill —— 证明「图内 fill primitive 输出 → gather 依赖边」成立。
-class MaterializeSpikePrimitive : public mx::Primitive {
- public:
-  MaterializeSpikePrimitive(mx::Stream s, uint32_t fillval) : Primitive(s), fill_(fillval) {}
-  const char* name() const override { return "MaterializeSpikePrimitive"; }
-  void eval_cpu(const std::vector<mx::array>& in, std::vector<mx::array>& out) override {
-    out[0].set_data(mx::allocator::malloc(out[0].nbytes()));
-    uint32_t* p = out[0].data<uint32_t>();
-    for (size_t i = 0; i < out[0].size(); ++i) p[i] = fill_;
-  }
-  void eval_gpu(const std::vector<mx::array>& in, std::vector<mx::array>& out) override {
-    // 别名零拷贝：out 共享 in[0] buffer，再原地只写「偶数行」（模拟只填侧区行、保留其它行）。
-    out[0].copy_shared_buffer(in[0]);
-    uint32_t* p = out[0].data<uint32_t>();
-    for (size_t i = 0; i < out[0].size(); i += 2) p[i] = fill_;
-  }
- private:
-  uint32_t fill_;
-};
-
-mx::array materialize_spike(const mx::array& src, uint32_t fillval, mx::StreamOrDevice s = {}) {
-  return mx::array(src.shape(), src.dtype(),
-                   std::make_shared<MaterializeSpikePrimitive>(mx::to_stream(s), fillval),
-                   std::vector<mx::array>{src});
-}
-
-// ====== Phase 2 方案B 机制探针：eval_gpu BODY 里直接读 GPU 算出的 inds 值 ======
-// 命门：不挂完成回调，直接在 eval_gpu 读 inputs[0] 的数据，写 local = inds + offset。
-// 若 MLX 保证 eval_gpu 调用时输入已算完 → local 正确；否则读到脏值。用于判定
-// 「零主线程同步同前向 demand」是否可行（可行则可在 body 里读 inds→pread→写 local→下游 gather）。
-class DemandProbePrimitive : public mx::Primitive {
- public:
-  DemandProbePrimitive(mx::Stream s, int offset) : Primitive(s), offset_(offset) {}
-  const char* name() const override { return "DemandProbePrimitive"; }
-  void eval_cpu(const std::vector<mx::array>& in, std::vector<mx::array>& out) override {
-    out[0].set_data(mx::allocator::malloc(out[0].nbytes()));
-    mx::array ids = in[0]; ids.eval();
-    const uint32_t* p = ids.data<uint32_t>();
-    int32_t* o = out[0].data<int32_t>();
-    for (size_t i = 0; i < out[0].size(); ++i) o[i] = static_cast<int32_t>(p[i]) + offset_;
-  }
-  void eval_gpu(const std::vector<mx::array>& in, std::vector<mx::array>& out) override {
-    out[0].set_data(mx::allocator::malloc(out[0].nbytes()));
-    mx::array ids = in[0];
-    const uint32_t* p = ids.data<uint32_t>();     // 命门：此刻 inds 是否已算完？
-    int32_t* o = out[0].data<int32_t>();
-    for (size_t i = 0; i < out[0].size(); ++i) o[i] = static_cast<int32_t>(p[i]) + offset_;
-  }
- private:
-  int offset_;
-};
-
-mx::array demand_probe(const mx::array& inds, int offset, mx::StreamOrDevice s = {}) {
-  return mx::array(inds.shape(), mx::int32,
-                   std::make_shared<DemandProbePrimitive>(mx::to_stream(s), offset),
-                   std::vector<mx::array>{inds});
-}
-
-// 探针2：完成回调里读 inds、写 local=inds+offset。测「回调写的 output 能否被同前向下游读到」
-// （若不能 → 同前向 demand 无法用回调 → 零同步不可行）。
-class DemandProbeHandlerPrimitive : public mx::Primitive {
- public:
-  DemandProbeHandlerPrimitive(mx::Stream s, int offset) : Primitive(s), offset_(offset) {}
-  const char* name() const override { return "DemandProbeHandlerPrimitive"; }
-  void eval_cpu(const std::vector<mx::array>& in, std::vector<mx::array>& out) override {
-    out[0].set_data(mx::allocator::malloc(out[0].nbytes()));
-    mx::array ids = in[0]; ids.eval();
-    const uint32_t* p = ids.data<uint32_t>();
-    int32_t* o = out[0].data<int32_t>();
-    for (size_t i = 0; i < out[0].size(); ++i) o[i] = static_cast<int32_t>(p[i]) + offset_;
-  }
-  void eval_gpu(const std::vector<mx::array>& in, std::vector<mx::array>& out) override {
-    out[0].set_data(mx::allocator::malloc(out[0].nbytes()));
-    mx::array ids = in[0];
-    const uint32_t* p = ids.data<uint32_t>();
-    int32_t* o = out[0].data<int32_t>();
-    size_t n = out[0].size();
-    int off = offset_;
-    auto& enc = mx::metal::get_command_encoder(stream());
-    MTL::CommandBuffer* cb = enc.get_command_buffer();
-    cb->addCompletedHandler([ids, out0 = out[0], p, o, n, off](MTL::CommandBuffer*) {
-      for (size_t i = 0; i < n; ++i) o[i] = static_cast<int32_t>(p[i]) + off;
-    });
-  }
- private:
-  int offset_;
-};
-
-mx::array demand_probe_handler(const mx::array& inds, int offset, mx::StreamOrDevice s = {}) {
-  return mx::array(inds.shape(), mx::int32,
-                   std::make_shared<DemandProbeHandlerPrimitive>(mx::to_stream(s), offset),
-                   std::vector<mx::array>{inds});
-}
-
-// dst: 预分配 uint8 [n, stride] MLX 数组(调用方已 eval)；回调把 n 个专家 pread 进它。
-// 返回 dummy(折进图触发)。
-mx::array prefetch_into(
-    const mx::array& dst,
-    const mx::array& expert_ids,
-    const std::string& path,
-    int stride,
-    mx::StreamOrDevice s = {}) {
-  return mx::array(
-      mx::Shape{1},
-      mx::uint8,
-      std::make_shared<PrefetchIntoPrimitive>(mx::to_stream(s), path, static_cast<size_t>(stride)),
-      std::vector<mx::array>{expert_ids, dst});
-}
-
-// ====== 自由后台读线程（de-risk）======
+// ====== [7] 自由后台读线程（de-risk）======
 // 线程全程只碰 dst 原始指针 / 路径 / 整数，绝不接触 Python 对象 → 无需 GIL。
 namespace {
 struct ReadOp { uint8_t* dst; size_t nbytes; off_t file_off; };
