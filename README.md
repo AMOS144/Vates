@@ -1,6 +1,6 @@
 # vates
 
-**在 32GB 内存的 Apple Silicon Mac 上，跑起原本装不下的 Qwen3-Next-80B-A3B MoE 模型。**
+**把 80B MoE 的运行内存压到 ~8 GB —— 相对 4-bit 全量 41 GB 约 5× 压缩，让 32GB 的 Mac 也能跑。**
 
 vates 是一套面向 Apple Silicon（MLX）的**显存外置流式 MoE 推理引擎** + **MTP 自投机解码**系统。核心思路：把 80B MoE 里绝大部分体积的专家权重留在磁盘（4-bit ≈ 41GB），运行时按需流式加载 + 预测式预取，配合 Qwen3-Next 自带的 MTP 头做自投机解码，让一台 32GB 的 Mac 也能跑完整的 80B 模型。
 
