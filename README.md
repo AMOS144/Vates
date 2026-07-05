@@ -10,7 +10,7 @@ vates 是一套面向 Apple Silicon（MLX）的**显存外置流式 MoE 推理�
 
 ## 演示
 
-[![vates 演示 · 点击播放](https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo-poster.png)](https://github.com/AMOS144/Vates/blob/main/vates-demo.mp4)
+[![vates 演示](https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo-poster.png)](https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo.mp4)
 
 ---
 

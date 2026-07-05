@@ -26,8 +26,9 @@ mlx_streaming/native_moe_ext*.so
 # 模型权重软链与 GPU trace 等大体积产物不入库
 /models
 *.gputrace/
-# 原始录屏(大)不入库;转码后的 vates-demo.mp4 入库供 GitHub blob 页播放
+# 演示录屏/转码/封面产物不入库(视频经 GitHub user-attachments 内嵌,见 README)
 *.mov
+vates-demo.mp4
 vates-demo-poster.png
 # 一次性下载/构建暂存脚本与日志(不入库)
 /dl_*.sh
