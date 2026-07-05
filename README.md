@@ -85,16 +85,26 @@ benchmarks/reports/      # 每次优化的消融报告与 GO/NO-GO 裁决
 ## 安装
 
 ```bash
-# 1) Python 依赖
-uv pip install -e .
+# 0) 进项目根目录（后续所有命令都在这里跑；默认模型路径是相对路径）
+cd /path/to/vates/mlx-streaming-moe
 
-# 2) 编译 native 扩展（生产快路径必需：统一池权威 / 融合 kernel / 并行 pread）
-cd native/ext && make native_moe_ext
+# 1) 按锁文件安装依赖并创建虚拟环境（uv sync 会自动生成 .venv 并装 uv.lock 里验证过的版本）
+uv sync
+
+# 2) 激活虚拟环境（vates 命令依赖此步才在 PATH 上）
+source .venv/bin/activate
+
+# 3) 编译 native 扩展（生产快路径必需：统一池权威 / 融合 kernel / 并行 pread）
+cd native/ext && make native_moe_ext && cd ../..
 ```
 
 依赖：Python ≥ 3.11、MLX ≥ 0.31、mlx-lm ≥ 0.31、textual ≥ 0.80；编译扩展需 `nanobind`（在 dev 依赖组）与 CMake。
 
+> 用 `uv sync` 而非 `uv pip install -e .`：前者严格按 `uv.lock` 锁定版本，避免传递依赖（如 `transformers`）漂移到不兼容的新版导致加载失败。
+
 > 扩展未编译时会自动降级（关掉预取/统一池），但会明显变慢；生产使用请务必编译。
+
+> **`vates: command not found`？** `vates` 是装进 `.venv/bin/` 的入口脚本，只有**激活 venv**（`source .venv/bin/activate`）后才在 PATH 上；没激活时用全路径 `.venv/bin/vates`。若 venv 是在别的目录名下创建后又移动/改名过，绝对路径会失效，用 `uv venv --clear && uv sync` 重建即可。
 
 ---
 
@@ -119,9 +129,12 @@ cd native/ext && make native_moe_ext
 
 ## 使用：交互式对话
 
-安装后直接 `vates` 进入全屏 TUI（opencode 风格），默认走 MTP 自投机 + 零拷贝双源快路径：
+在项目根目录、激活 venv 后，直接 `vates` 进入全屏 TUI（opencode 风格），默认走 MTP 自投机 + 零拷贝双源快路径：
 
 ```bash
+cd /path/to/vates/mlx-streaming-moe   # 默认模型路径是相对路径，须在项目根目录运行
+source .venv/bin/activate             # 每开一个新终端都要先激活
+
 vates                              # 进入交互式对话
 vates -k 4 -n 800 --stats          # 调宽投机 / 加长生成 / 打印吞吐
 vates --system "你是一个简洁的助手"
