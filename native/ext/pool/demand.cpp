@@ -178,7 +178,10 @@ mx::array demand_dual(
   if (seg_nbytes.size() != pool_list.size())
     throw std::invalid_argument("demand_dual: seg_nbytes.size() != pool_list.size()");
   double t0 = g_dt_on ? dt_now_us() : 0;
-  mx::array ids = inds;
+  // 关键:inds 常是 argpartition(...)[..., -k:] 切片 → 非连续 strided 视图(每行按父数组 stride E
+  // 偏移)。若直接按连续读 data(),仅首行(token0)正确,后续 token 读到错位内存 → 装错专家、seq≥2 全错
+  // (投机 verify 全体受害)。contiguous() 强制物化为连续,读取才逐位正确。
+  mx::array ids = mx::contiguous(inds);
   ids.eval();                                   // 唯一同步
   size_t n = ids.size();
   const uint32_t* ip = ids.data<uint32_t>();

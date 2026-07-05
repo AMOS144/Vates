@@ -23,11 +23,14 @@ from mlx_streaming import config
 
 # MTP 快路径环境变量兜底配方(benchmark 验证过的最优组合)。
 # 用 setdefault 兜底:用户显式导出的环境变量优先级更高,不会被覆盖。
+# TREE_TOP2:最小树 top-2 救回。2026-07-05 修复 demand_dual 非连续读 bug 后已 bit-lossless
+# (bench_tree.py 全 prompt control_mm=0/on_mm=0),median +10.8% tok/s → 纳入用户主路径默认。
 _FASTPATH_ENV = {
     "STREAM_BLOB_LOADER": "1",
     "NATIVE_FUSED_PREFETCH": "1",
     "ZEROCOPY_DUAL_SOURCE": "1",
     "SIDEREGION_LFU": "1",
+    "TREE_TOP2": "1",
 }
 
 

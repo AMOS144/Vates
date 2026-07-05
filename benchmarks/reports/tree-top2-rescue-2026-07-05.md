@@ -1,105 +1,81 @@
-# 最小树 top-2 救回评测报告（2026-07-05）
+# 最小树 top-2 救回评测报告（2026-07-05，含根因修复）
 
 ## 结论一句话
 
-**NO-GO（严格 lossless 下）**。最小树 top-2 救回在本流式 MoE 后端上**无法做到 bit-lossless**，
-根因是**结构性、不可修的数值差异**（后端对序列长度的数值敏感性），而非 cache 管理 bug。
-沿途发现并修复了一个**真实的潜在 cache 正确性 bug**（`_restore` 别名双恢复污染递归态），予以保留。
+先前"NO-GO / 后端天然数值敏感性"的结论是错的。真根因是 **`demand_dual` 的一个内存布局 bug**：
+路由张量 `inds`（`argpartition(...)[..., -k:]` 的切片）是**非连续 strided 视图**，而 `demand_dual`
+在 C++ 里按连续内存读 `ids.data<uint32_t>()`，导致 `seq≥2` 时**第 0 个 token 之后的所有 token 读到
+错位内存 → 装错专家**。修法：`demand_dual` 入口 `mx::contiguous(inds)` 物化为连续后再读。修后：
 
-## 方案与目标
+- **`seq=K` verify 与 `seq=1` 解码逐位等价**（`_diag_seqk`：pos0/pos1 `max|Δlogit|=0.0000`）。
+- **plain spec 与最小树救回均 bit-lossless**（`bench_tree.py`：全 6 prompt `control_mm=0, on_mm=0`）。
+- 最小树 top-2 救回裁决从 NO-GO 翻转为 **GO，median +10.8% tok/s**。
 
-- **方案**：最小树 top-2 救回。每步 MTP 出 chainA(top-1)/chainB(top-2)；当 chainA 首草稿被拒
-  (`matched==0`) 且 chainB 首候选 == 模型真实 token (`tree_b[0]==preds[0]`) 时，恢复 cache、改验
-  chainB，试图把"被拒的第一位"救回，从而提升平均接受长度、提速。
-- **红线**：输出必须 lossless。参照采用"噪声地板"口径：`tree-on` 相对 `tree-off`（MTP 自投机，
-  单链 spec）的失配不得超过 `tree-off` 自身的 run-to-run 噪声。
+> 这印证了"之前我们好像做过这个（lossless）"——它本就该 lossless，是 `demand_dual` 引入的回归。
+> 2026-07-04 schemeB 报告把此分歧解释为"良性 N_floor 精确平局"，本次被推翻：`max|Δlogit|` 达数个
+> 单位，是"读错专家权重"级别的真错，不是 0.1 级平局。
 
-## 评测配置
+## 根因：非连续视图被按连续读
 
-```
-STREAM_BLOB_LOADER=1 NATIVE_FUSED_PREFETCH=1 EXPERT_SLOTS=32 ZEROCOPY_DUAL_SOURCE=1 \
-  SIDEREGION_LFU=1 POOL_SPEC_SLOTS=32 K=3 MAXTOK=96 REPEAT=3 \
-  .venv/bin/python benchmarks/bench_tree.py
-```
+`block.py` 里 `inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]`。这个切片在 MLX 里是对完整
+`(1, seq, E)` 结果的 **strided 视图**（每行按父数组 stride `E` 偏移、取末 `k` 个）。`demand_dual` 的
+`ids.data<uint32_t>()` 假设内存连续、按 `ip[i]=buffer[i]` 顺序读：
 
-6 条多样中文 prompt，每配置每 prompt 重复 3 次取中位数；ref=非投机贪婪基线，`control_mm`=tree-off
-各轮相对 ref 的最大失配（噪声地板），`on_mm`=tree-on 各轮相对 ref 的最大失配。
+- token0（`i=0..k-1`）：偏移恰好落在第 0 行末 `k` 个 → **正确**。
+- token1+（`i=k..`）：应读第 1 行末 `k` 个（偏移 `E+(E-k)`），却读成 `(E-k)+k`=连续下一段 → **错位**。
 
-## 结果（修复别名 bug 后）
+决定性对拍（`_diag_seqk` + 逐位 dump，`seq=2` 第一次 demand 调用）：
 
-| prompt | off tok/s | on tok/s | Δ% | rescues | direct/fallback | control_mm | on_mm | lossless |
-|---|---|---|---|---|---|---|---|---|
-| 混合专家 | 13.82 | 14.21 | +2.82 | 4 | 44/0 | 0 | 28 | ✗ |
-| Python 代码 | 11.55 | 11.44 | -0.95 | 3 | 38/0 | 0 | 0 | ✓ |
-| 量化困惑度 | 11.94 | 18.14 | +51.9 | 3 | 36/0 | 0 | 92 | ✗ |
-| 英文摘要 | 10.57 | 10.71 | +1.32 | 8 | 46/0 | 0 | 70 | ✗ |
-| 短故事 | 11.06 | 11.79 | +6.60 | 3 | 49/0 | 0 | 61 | ✗ |
-| JSON 解析 | 11.01 | 11.20 | +1.73 | 2 | 36/0 | 0 | 90 | ✗ |
+| 来源 | token0 | token1 |
+|---|---|---|
+| Python `inds`（真实路由，scores/gather 用） | `485,474,400,438,433,412,292,21,346,216` | `395,137,231,275,368,228,287,348,391,91` |
+| C++ `ip`（`demand_dual` 实际装池用） | `485,474,400,438,433,412,292,21,346,216` ✓ | `379,8,337,199,70,362,164,226,271,39` ✗ |
 
-**汇总**：`lossless_all=false`，`max_control_mm=0`，`max_on_mm=92`，**verdict=bug**。
+token0 完全一致，token1 完全不同 → `demand_dual` 把**错的专家**装进池、`local` 指向这些错槽，而
+`scores`/combine 用的是真实路由的专家 → seq≥2 的每个 token≥1 全部计算错。
 
-关键观察：`control_mm=0`（本轮后端确定性，tree-off run-to-run 无漂移），但 tree-on 相对 tree-off
-出现**确定性大幅失配**；生产全程走 checkpoint **直接提交**（`fallback_replays=0`），从不 fallback。
+## 收敛过程（systematic debugging）
 
-## 根因定位（systematic debugging）
+1. **排除生成机制/双缓冲代**：`_pin_gen` 等假设均未消除发散。
+2. **排除侧区**：`FORCE_EMPTY_SIDE=1`（仅真实区）后 `seq=K` 仍发散 → 不是侧区。
+3. **排除专家字节错**：`STG_VERIFY=1` 全程 `0 BAD`——真实区每槽字节 == 其**属主**专家真值。池落字节
+   本身没错（是"装了错的专家当属主"，不是"字节写坏"）。
+4. **新增 `ROUTE_VERIFY`**：校 `pool[local[i]]` 字节是否 == **路由专家** `inds[i]` 真值（STG 只校
+   slot↔属主，不校 local 是否指向"该 token 真正路由的专家"）。命中 `seq=2` 的 token1 全 BAD。
+5. **`POSTCHK`（C++ 锁内）vs `ROUTE`（Python 锁后）矛盾**：C++ 侧 `local[i]==e2r[ip[i]]` 恒成立
+   （0 违例），Python 侧却看到 token1 专家不在 e2r。加 epoch 计数证明**两次读的是同一次调用、同一份
+   e2r**——即 C++ 的 `ip` 与 Python 的 `inds` 本就不同 → 锁定入参读取环节。
+6. **C++/Python 逐位 dump**：见上表，token1 的 `ip` 与 `inds` 完全不同 → 非连续视图按连续读。
+7. **验证修复**：`mx::contiguous(inds)` 后 `ROUTE_VERIFY` 0 BAD、`_diag_seqk` pos0/pos1 均 0.0000。
 
-用玩具递归层复现 + 一系列受控开关逐步逼近，证据链如下：
+## 修复后基准（`bench_tree.py`，生产 env，K=3 MAXTOK=64 REPEAT=2）
 
-1. **别名 bug（已修，真实）**：`_restore(caches, snaps)` 用 `c.state = st` 把快照 list 直接赋给
-   `ArraysCache`（其 setter 是别名 `self.cache=v`），后续前向 `cache[idx]=new` 会**原地改写快照
-   元素**。救回步对同一 `snap_m` 恢复两次（救回一次 + fallback 一次），第二次恢复到的已是被
-   chainB 前向污染的状态 → 递归 cache 损坏。修法：`_restore` 装入 `_copy_state(st)` 副本。
-   含递归层的玩具测试可稳定复现并已回归锁定。
-   - 但生产走直接提交、从不 fallback，故此修复**未改变生产评测结果**（仍发散）→ 说明还有第二个原因。
+| 项 | 值 |
+|---|---|
+| `lossless_all` | **true** |
+| `max_control_mm`（tree-off 噪声地板） | **0** |
+| `max_on_mm`（tree-on 失配） | **0** |
+| `median_delta_pct`（救回净提速） | **+10.8%** |
+| `verdict` | **go** |
 
-2. **probe-only 排除"专家池扰动"**：让救回步做额外 chainB 前向（扰动流式专家池）但**不采用**其结果
-   → 输出**完全 lossless**（mismatch=0）。证明额外前向 + 双恢复的机制本身是干净的，发散只来自
-   **采用 chainB 的结果**。
+逐 prompt `control_mm/on_mm` 全 0——**过去所有报告归咎的"后端 run-to-run 噪声地板"实际就是这个 bug**，
+修后彻底归零。
 
-3. **接受长度 bisect**：限制救回接受长度 `cap`：
-   - `cap=0`（只提交 position-0）→ **lossless**（但等价 tree-off，无收益）。
-   - `cap≥1`（提交 position≥1）→ **发散**（fdi=2, mismatch≈92）。
-   定位到"采纳 chainB 的 position≥1 结果"才出问题。
+## 变更 / 保留
 
-4. **专家池容量排除**：`EXPERT_SLOTS=64` 仍**完全相同地发散** → 非池容量溢出。
+- **核心修复**：`native/ext/pool/demand.cpp::demand_dual` — `mx::array ids = mx::contiguous(inds);`。
+- **文档**：`generate.py` 救回块注释、本报告更新为根因+修复定论。
+- **清理**：所有诊断脚手架（`ROUTE_VERIFY`/`POSTCHK`/`DCDBG`/`CPPDUMP`/epoch 计数、`FORCE_EMPTY_SIDE`、
+  `VERIFY_HOST`）已从源码移除；`demand_dual` 相关单测（11 项）全绿。
 
-5. **seq=1 自检（决定性）**：救回步用 seq=1 逐 token 从 `snap_m` 重算续写，与 chainB 的 seq=K
-   preds 对比：
-   ```
-   [SELFCHK] chainB preds[:2]=[108048, 101219] | seq1 t0=108048 t1=20412
-   ```
-   chainB 的 **seq=K position-1** logit 给出 `101219`，而**同一前缀的 seq=1 续写**给出 `20412`
-   （正是 tree-off 的对应 token）。**chainB 前向本身算得没错**，是 seq=K 与 seq=1 在近平局处
-   **天然不一致**。
+## 影响面
 
-### 为什么这是结构性、不可修的
-
-- **tree-off** 在救回候选步（MTP top-1 错）→ `matched=0` → 只采纳 position-0 logit；该输出位的下一
-  token 由**新的 seq=1/position-0 前向**产出。
-- **tree-on 救回** → 在同一输出位采纳 chainB 的 **position-1(seq=K)** logit。
-- 后端（MoE 专家选择 / 注意力归约顺序对序列长度敏感）使 position-0(seq=1) 与 position-1(seq=K) 的
-  logit 在近平局处**确定性翻转** → 一处翻转即级联，`mismatch` 高达 92。
-
-这与既知现象"spec(seq=K) 相对 dense(seq=1) 在 token 3 系统性发散"是**同一机制**。canonical spec 在
-精确算术下是 lossless 的（seq=K 的 position-i logit 应 == seq=1），本后端的非精确性打破了这一前提。
-救回一旦要拿到收益，就必须采纳 seq=K position≥1 的续写，故与朴素解码的偏离不可避免。
-
-## 保留 / 变更
-
-- **保留（真实修复）**：`mtp/kv_cache.py::_restore` 别名 bug 修复 + 两条含递归层的救回 lossless
-  单测（fallback replay 与 direct commit 两条路径）。
-- **保留**：`bench_tree.py` 稳态多 prompt A/B harness（noise-floor 口径 + direct/fallback 计数）。
-- **变更**：`tree_top2` 保持**默认关闭**；救回块加注释标明"非严格 lossless、开启即接受非 lossless 输出"。
-- **清理**：所有诊断脚手架（probe_only / accept_cap / force_fallback / tree_dbg / selfcheck）与临时诊断脚本已移除。
+`demand_dual` 是 `run_mtp_spec` 生产默认（`POOL_SPEC_SLOTS=32`）。修复前**生产 spec 解码相对 dense
+贪婪即有损**（seq≥2 装错专家）；修复后 spec 与最小树救回均恢复 bit-lossless，且保留 schemeB 的
++8% tok/s 基座——无需在 `acquire_gpu`（放弃提速）与 lossless 之间二选一。
 
 ## 已知次要 bug（未修，未在生产触发）
 
-- fallback replay 在 `matched==K` 时 `accepted_in=[x0]+drafts[:K]` 会 replay K+1 个 token（比直接提交
-  路径多提交 1 个），且在真实模型上会触发专家池 `inds.size=(K+1)·top_k > cap` 溢出告警。生产恒走直接
-  提交、从不 fallback，故未触发；但递归态无 checkpoint 的极端场景会命中。建议后续单独修（对齐直接
-  提交路径：`matched==K` 时只 replay `drafts[:K-1]`、留 `drafts[K-1]` 作 pending）。
-
-## 后续（若仍想要接受率收益）
-
-严格 lossless 无解；若可放宽到"near-lossless / 质量不劣化"，可考虑训练侧提升 MTP top-1 覆盖率
-（减少救回触发本身），或对救回接受的 token 事后用 seq=1 复核（但会吃掉大部分提速）。
+- fallback replay 在 `matched==K` 时 replay K+1 个 token，真实模型上会触发专家池
+  `inds.size=(K+1)·top_k > cap` 溢出告警。生产恒走直接提交、从不 fallback，故未触发。建议对齐
+  直接提交路径：`matched==K` 时只 replay `drafts[:K-1]`、留 `drafts[K-1]` 作 pending。

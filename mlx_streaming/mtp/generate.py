@@ -316,10 +316,10 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
         matched = accept_prefix(drafts, preds)
         # 最小树救回:A 链首草稿被拒(matched==0)且 B 候选=模型真实 token(=preds[0])时,
         # 恢复 cache、改验 B 链。preds[0] 只依赖 [x],两链一致;故 d1b==preds[0] 即 B 首命中。
-        # 注意(2026-07-05 评测结论,见 reports/tree-top2-rescue-2026-07-05.md):本救回在流式
-        # MoE 后端上并非 bit-lossless——救回采纳的是 chainB 的 seq=K position≥1 logit,它与朴素
-        # 解码的 seq=1 续写在近平局处会确定性翻转(后端对序列长度的数值敏感性,非 cache bug)。
-        # 因此 tree_top2 默认关闭;开启即接受"非严格 lossless"的输出。
+        # lossless(2026-07-05 定论,见 reports/tree-top2-rescue-2026-07-05.md):曾疑此救回非
+        # bit-lossless,实为 demand_dual 的一个 bug——inds(argpartition 切片)是非连续视图,C++
+        # 按连续读 data() 致 seq≥2 的 token≥1 装错专家,spec/救回全体失真。修 demand_dual 用
+        # contiguous() 物化后,seq=K verify 与 seq=1 解码逐位等价,spec 与本救回均 bit-lossless。
         if tree_b is not None and matched == 0 and tree_b[0] == preds[0]:
             _restore(main_cache, snap_m)
             begin_speculative_checkpoints(main_cache)
