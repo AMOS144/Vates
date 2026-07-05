@@ -180,6 +180,35 @@ class _RecurLayer(nn.Module):
         return self.proj(mx.stack(outs, axis=1))
 
 
+class _RecurCkptLayer(nn.Module):
+    """玩具递归层,模仿 Qwen3-Next gated-delta 的 verify-time per-token checkpoint 捕获。
+
+    与 _RecurLayer 同样是可加递归态,但被 begin_speculative_checkpoints 标记后会把每个
+    prefix 后的状态写入 cache._spec_checkpoints,从而走 commit_verified_prefix 的「直接提交」
+    路径(而非 fallback replay)——对齐生产 gated-delta 的行为,用于测直接提交下的救回 lossless。
+    """
+    is_linear = True
+
+    def __init__(self, h):
+        super().__init__()
+        self.proj = nn.Linear(h, h, bias=False)
+
+    def __call__(self, x, mask=None, cache=None):
+        B, L, H = x.shape
+        state = cache[1] if (cache is not None and cache[1] is not None) else mx.zeros((B, H))
+        outs, ckpts = [], []
+        for t in range(L):
+            state = state + x[:, t, :]
+            outs.append(state)
+            ckpts.append([None, state])           # [conv(None), ssm=state] per-token checkpoint
+        if cache is not None:
+            cache[1] = state
+            if getattr(cache, "_capture_spec_checkpoints", False):
+                cache._spec_checkpoints = ckpts
+                cache._capture_spec_checkpoints = False
+        return self.proj(mx.stack(outs, axis=1))
+
+
 class _Inner(nn.Module):
     def __init__(self, vocab, h, nl):
         super().__init__()
@@ -520,3 +549,55 @@ def test_tree_top2_rescue_accepted_in_uses_chain_b(monkeypatch):
             checked_full_step = True
         pos += acc_len
     assert checked_full_step                        # 至少覆盖到一整步 K 长接受
+
+
+def test_tree_top2_rescue_lossless_with_recurrent_layer(monkeypatch):
+    """最小树救回在含 gated-delta 递归层(ArraysCache)时也必须 lossless。
+
+    真实 Qwen3-Next 有线性递归层;救回的 _restore(main_cache)+二次前向+checkpoint 提交
+    必须正确回滚/重建递归态。KV-only 玩具测不到,故此处第 1 层换 _RecurLayer 复现。
+    """
+    from mlx_streaming.mtp.generate import mtp_generate
+
+    monkeypatch.setenv("TREE_TOP2", "1")
+    monkeypatch.delenv("MTP_VERIFY_MODE", raising=False)
+    monkeypatch.delenv("TREE_VERIFY", raising=False)
+    mx.random.seed(3)
+    model = _ToyModel(nl=3, vocab=40)
+    model.model.layers[1] = _RecurLayer(32)     # 第 1 层换递归(ArraysCache)
+    mx.eval(model.parameters())
+    prompt = mx.array([[2, 7, 1]])
+    ref = _naive_greedy(model, prompt, 16)
+
+    drafter = _OracleTreeDraft(ref, vocab=40)
+    got, stats = mtp_generate(model, drafter, None, prompt, 16, K=3, ids_mode=True)
+
+    assert stats["tree_rescues"] > 0            # 救回确有触发
+    assert stats["fallback_replays"] > 0        # 该 toy 无 checkpoint → 走 fallback replay 路径
+    assert got == ref                           # 含递归层时救回仍 lossless
+
+
+def test_tree_top2_rescue_lossless_direct_commit_recurrent(monkeypatch):
+    """最小树救回在「checkpoint 直接提交」路径(生产 gated-delta 行为)下也必须 lossless。
+
+    上一个测试覆盖 fallback replay;此处用会捕获 per-token checkpoint 的 _RecurCkptLayer,
+    使 commit_verified_prefix 直接提交(direct_commits>0,零 replay),对齐真实 Qwen3-Next。
+    """
+    from mlx_streaming.mtp.generate import mtp_generate
+
+    monkeypatch.setenv("TREE_TOP2", "1")
+    monkeypatch.delenv("MTP_VERIFY_MODE", raising=False)
+    monkeypatch.delenv("TREE_VERIFY", raising=False)
+    mx.random.seed(5)
+    model = _ToyModel(nl=3, vocab=40)
+    model.model.layers[1] = _RecurCkptLayer(32)     # 第 1 层换「带 checkpoint」递归
+    mx.eval(model.parameters())
+    prompt = mx.array([[3, 8, 2]])
+    ref = _naive_greedy(model, prompt, 16)
+
+    drafter = _OracleTreeDraft(ref, vocab=40)
+    got, stats = mtp_generate(model, drafter, None, prompt, 16, K=3, ids_mode=True)
+
+    assert stats["tree_rescues"] > 0            # 救回确有触发
+    assert stats["direct_commits"] > 0          # 走直接提交路径(非 fallback)
+    assert got == ref                           # 直接提交下救回仍 lossless

@@ -160,7 +160,11 @@ def _restore(caches, snaps):
                 c.cache = [None] * len(c.cache)
             c.meta_state = meta
             continue
-        c.state = st
+        # 必须装入副本:ArraysCache.state setter 是别名赋值(self.cache=v),后续前向
+        # 的 cache[idx]=new 会原地改写这个 list 的元素,从而污染快照本体。救回路径会对
+        # 同一 snap_m 恢复两次(救回时一次 + fallback 一次),若不复制,第二次恢复到的将是
+        # 被中间前向污染的状态 → 递归 cache 损坏、输出发散。
+        c.state = _copy_state(st)
         c.meta_state = meta
 
 
