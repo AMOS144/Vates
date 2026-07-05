@@ -61,6 +61,44 @@ class MTPDrafter:
                     break
         return drafts
 
+    def draft_adaptive_tree(self, H_last, x_ids, mtp_cache, depth_max, tau):
+        """置信度门控变长 + pos0 分支:返回 (chainA, chainB)。
+
+        chainA 同 draft_adaptive(累计置信度门控,变长 n=1..depth_max);chainB 是第1 位 top-2 分支,
+        续抽到与 chainA 同深度 n(仅 n>=2 时,浅步 depth=1 无位置可救 → chainB=None)。用快照隔离
+        A/B 分叉,B 不带 A 的递归污染。供合并路径:动态定深 + 对深链做 pos0 救回。
+        """
+        logits1, mh1 = mtp_step(self.mtp, H_last, x_ids, self.lm_head, mtp_cache[0])
+        lg = logits1[0].reshape(-1)
+        top2 = [int(i) for i in mx.argsort(lg)[-2:].tolist()][::-1]   # [d1a, d1b] 降序
+        d1a, d1b = top2[0], top2[1]
+        snap_after_x = _snapshot(mtp_cache)
+
+        # chainA:从 d1a 续抽,累计置信度跌破 tau 即停(与 draft_adaptive 同语义)。
+        chainA = [d1a]
+        conf = float(mx.softmax(lg)[d1a])
+        h, cur = mh1, mx.array([[d1a]])
+        while len(chainA) < depth_max and conf >= tau:
+            lo, mh = mtp_step(self.mtp, h, cur, self.lm_head, mtp_cache[0])
+            lg2 = lo[0].reshape(-1)
+            d = int(mx.argmax(lg2))
+            chainA.append(d)
+            conf *= float(mx.softmax(lg2)[d])
+            h, cur = mh, mx.array([[d]])
+
+        n = len(chainA)
+        chainB = None
+        if n >= 2:                                    # 浅步无后续位置可救,不抽 B
+            _restore(mtp_cache, snap_after_x)
+            chainB = [d1b]
+            h, cur = mh1, mx.array([[d1b]])
+            for _ in range(n - 1):
+                lo, mh = mtp_step(self.mtp, h, cur, self.lm_head, mtp_cache[0])
+                d = int(mx.argmax(lo[0]))
+                chainB.append(d)
+                h, cur = mh, mx.array([[d]])
+        return chainA, chainB
+
     def draft_tree(self, H_last, x_ids, mtp_cache, K, pos1=True):
         """最小树:第1(始终)、第2(pos1=True 时)草稿位置展开 top-2,返回三条链,各长 K。
 

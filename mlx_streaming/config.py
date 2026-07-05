@@ -226,6 +226,10 @@ def tree_branches() -> int: return _i("TREE_BRANCHES", 2)
 def adaptive_depth() -> bool: return _b("MTP_ADAPTIVE_DEPTH", "0")
 def conf_tau() -> float: return _f("MTP_CONF_TAU", 0.3)
 def depth_max() -> int: return _i("MTP_DEPTH_MAX", 3)
+# 合并路径:在动态深度基础上,对"被保留成深链(n>=2)"的步叠加 pos0 top-2 救回(首 token 被拒且
+# top-2=模型真值时改验 B 链)。两机理正交(动态深度压每步成本、救回抬接受长度),但都作用于低置信步、
+# 方向相反(depth=1 的浅步无位置可救),故叠加非简单相加,须实测。默认关。
+def adaptive_rescue() -> bool: return _b("MTP_ADAPTIVE_RESCUE", "0")
 
 
 def parse_layers_env(name: str) -> "set[int] | None":

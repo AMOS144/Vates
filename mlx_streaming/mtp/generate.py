@@ -240,6 +240,7 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     # 置信度门控动态深度:仅在 plain 单链路径生效(与 tree/tree_verify/step 互斥)。
     adaptive_mode = config.adaptive_depth() and not tree_mode and not tree_verify_mode \
         and verify_mode != "step"
+    adaptive_rescue_mode = adaptive_mode and config.adaptive_rescue()   # 深链叠加 pos0 救回
     conf_tau_v = config.conf_tau()
     depth_max_v = max(1, config.depth_max())
     tree_P = max(1, config.tree_branches())
@@ -249,7 +250,7 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     # (snap_m 只用于 tree 救回 / step / replay 回退,这些路径都不满足下方条件)。省 ~72MiB 在途
     # 峰值和一次同步栅栏,数值完全不变(bit-exact,只改内存调度)。模型结构恒定,循环外算一次即可。
     _skip_snap = (verify_mode != "step") and (not tree_mode) and (not tree_verify_mode) \
-        and _batch_direct_commit_guaranteed(model)
+        and (not adaptive_rescue_mode) and _batch_direct_commit_guaranteed(model)
 
     while len(produced) < max_tokens and not _stop_from_initial:
         x0 = x
@@ -302,7 +303,12 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             draft_cands = None
         elif adaptive_mode:
             # 置信度门控:返回可变长度(1..depth_max)草稿链,本步深度随置信度自适应。
-            drafts = drafter.draft_adaptive(H_last, x_ids, mtp_cache, depth_max_v, conf_tau_v)
+            if adaptive_rescue_mode:
+                # 合并路径:变长 chainA + pos0 分支 chainB(深链才有),供下方 pos0 救回。
+                drafts, tree_b = drafter.draft_adaptive_tree(
+                    H_last, x_ids, mtp_cache, depth_max_v, conf_tau_v)
+            else:
+                drafts = drafter.draft_adaptive(H_last, x_ids, mtp_cache, depth_max_v, conf_tau_v)
             draft_cands = None
             step_k = len(drafts)
         elif topk_probe > 0:
@@ -341,7 +347,7 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             begin_speculative_checkpoints(main_cache)
             # 重建 verify_in 为 B 链:后续 accepted_in=verify_in[:, :accepted_len] 才会取到 chainB,
             # 否则残留 chainA 的错误首草稿会经 sync 污染 MTP cache、拉低后续草稿质量(低估救回收益)。
-            verify_in = mx.array([[x] + tree_b[:K - 1]])
+            verify_in = mx.array([[x] + tree_b[:step_k - 1]])
             vlogits, vH = forward_with_hidden(model, verify_in, main_cache)
             mx.eval(vlogits, vH)
             preds = [int(t) for t in mx.argmax(vlogits[0], axis=-1)]
@@ -355,7 +361,7 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
         elif tree_c is not None and matched == 1 and len(tree_c) > 1 and tree_c[1] == preds[1]:
             _restore(main_cache, snap_m)
             begin_speculative_checkpoints(main_cache)
-            verify_in = mx.array([[x] + tree_c[:K - 1]])
+            verify_in = mx.array([[x] + tree_c[:step_k - 1]])
             vlogits, vH = forward_with_hidden(model, verify_in, main_cache)
             mx.eval(vlogits, vH)
             preds = [int(t) for t in mx.argmax(vlogits[0], axis=-1)]

@@ -707,3 +707,57 @@ def test_mtp_generate_adaptive_depth_lossless(monkeypatch):
 
     assert got == ref                           # 变长深度下仍 lossless
     assert stats["avg_accept_len"] > 1.0        # 确有多 token 步(投机真的在跑)
+
+
+class _OracleAdaptiveTree:
+    """玩具 drafter:合并路径(动态深度 + pos0 救回)。每步深度轮转(恒 >=2 以有 chainB),chainA
+    首草稿故意置错(matched==0),chainB 首=真值 → 触发 pos0 救回全命中。验证合并路径仍 lossless。
+    """
+
+    def __init__(self, ref, vocab):
+        self.ref = list(ref)
+        self.pos = 0
+        self.vocab = vocab
+        self.step = 0
+
+    def make_cache(self):
+        from mlx_lm.models import cache as kvcache
+        return [kvcache.KVCache()]
+
+    def draft_adaptive_tree(self, H_last, x_ids, mtp_cache, depth_max, tau):
+        depth = max(2, 1 + (self.step % depth_max))      # 恒 >=2,保证有 chainB
+        self.step += 1
+        nxt = self.ref[self.pos + 1: self.pos + 1 + depth]
+        while len(nxt) < depth:
+            nxt.append(0)
+        wrong0 = (nxt[0] + 1) % self.vocab
+        chain_a = [wrong0] + nxt[1:]                     # 首错 → matched==0
+        chain_b = list(nxt)                              # 首=真值 → 救回全命中
+        return chain_a, chain_b
+
+    def sync(self, prev_H, rH, replay_in, mtp_cache):
+        self.pos += int(replay_in.shape[1])
+
+
+def test_mtp_generate_adaptive_rescue_lossless_and_rescues(monkeypatch):
+    """合并路径:变长深度 + pos0 救回,强制每步走救回,主输出必须逐 token 等于贪婪且救回确有触发。"""
+    from mlx_streaming.mtp.generate import mtp_generate
+
+    monkeypatch.setenv("MTP_ADAPTIVE_DEPTH", "1")
+    monkeypatch.setenv("MTP_ADAPTIVE_RESCUE", "1")
+    monkeypatch.setenv("MTP_DEPTH_MAX", "3")
+    monkeypatch.delenv("TREE_TOP2", raising=False)
+    monkeypatch.delenv("MTP_VERIFY_MODE", raising=False)
+    monkeypatch.delenv("TREE_VERIFY", raising=False)
+    mx.random.seed(0)
+    model = _ToyModel(nl=2, vocab=40)
+    model.make_cache = lambda: [kvcache.KVCache() for _ in model.layers]
+    mx.eval(model.parameters())
+    prompt = mx.array([[1, 5, 9]])
+    ref = _naive_greedy(model, prompt, 20)
+
+    drafter = _OracleAdaptiveTree(ref, vocab=40)
+    got, stats = mtp_generate(model, drafter, None, prompt, 20, K=3, ids_mode=True)
+
+    assert got == ref                           # 合并路径下仍 lossless
+    assert stats["tree_rescues"] > 0            # pos0 救回在合并路径里确有触发
