@@ -8,6 +8,14 @@ vates 是一套面向 Apple Silicon（MLX）的**显存外置流式 MoE 推理�
 
 ---
 
+## 演示
+
+https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo.mp4
+
+> 若视频未内嵌显示，可[点此下载观看](https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo.mp4)。
+
+---
+
 ## 亮点
 
 - **装得下**：常驻内存峰值 ≈ **8 GB**（`EXPERT_SLOTS=32`），而模型 4-bit 全量 ≈ 41 GB。专家权重字节在磁盘，内存里只留一个小 LFU 缓存池。
