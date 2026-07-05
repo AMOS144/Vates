@@ -415,3 +415,56 @@ def test_commit_verified_prefix_uses_arrayscache_checkpoint():
     assert committed is True
     assert float(c.cache[0].sum()) == 24.0
     assert float(c.cache[1].sum()) == 80.0
+
+
+# ---------------------------------------------------------------- 最小树 top-2 救回
+class _OracleTreeDraft:
+    """玩具 drafter：用贪婪参考 ref 当"主模型真实 preds"的 oracle。
+
+    每步 chainA 首草稿故意置错(必触发 matched==0)、chainB = 从当前位置起的真实贪婪续,
+    故 chainB[0]==preds[0] 必触发救回且全命中。用于确定性地覆盖 tree_top2 救回分支,
+    验证主输出仍逐 token 等于贪婪(lossless)。pos 靠 sync 每步按接受长度前进。
+    """
+
+    def __init__(self, ref, vocab):
+        self.ref = list(ref)      # 完整贪婪续(主模型真值)
+        self.pos = 0              # 当前 x 在 ref 中的下标
+        self.vocab = vocab
+
+    def make_cache(self):
+        # 返回非 None,使 generate 触发 snap_d 与 sync(sync 用于推进 pos)。
+        from mlx_lm.models import cache as kvcache
+        return [kvcache.KVCache()]
+
+    def draft_tree(self, H_last, x_ids, mtp_cache, K):
+        nxt = self.ref[self.pos + 1: self.pos + 1 + K]   # 真实 preds[0..K-1]
+        while len(nxt) < K:                              # 末尾补齐(会被拒,不破坏 lossless)
+            nxt.append(0)
+        wrong0 = (nxt[0] + 1) % self.vocab               # 保证 != preds[0]
+        chain_a = [wrong0] + nxt[1:]                     # 首错 → matched==0
+        chain_b = list(nxt)                              # 首=真实 → 救回且全命中
+        return chain_a, chain_b
+
+    def sync(self, prev_H, rH, replay_in, mtp_cache):
+        self.pos += int(replay_in.shape[1])              # 按本步接受长度前进
+
+
+def test_mtp_generate_tree_top2_lossless_and_rescues(monkeypatch):
+    """最小树 top-2:强制每步走救回分支,主输出必须逐 token 等于贪婪,且救回确有触发。"""
+    from mlx_streaming.mtp.generate import mtp_generate
+
+    monkeypatch.setenv("TREE_TOP2", "1")
+    monkeypatch.delenv("MTP_VERIFY_MODE", raising=False)
+    monkeypatch.delenv("TREE_VERIFY", raising=False)
+    mx.random.seed(0)
+    model = _ToyModel(nl=2, vocab=40)
+    model.make_cache = lambda: [kvcache.KVCache() for _ in model.layers]
+    mx.eval(model.parameters())
+    prompt = mx.array([[1, 5, 9]])
+    ref = _naive_greedy(model, prompt, 16)
+
+    drafter = _OracleTreeDraft(ref, vocab=40)
+    got, stats = mtp_generate(model, drafter, None, prompt, 16, K=3, ids_mode=True)
+
+    assert got == ref                       # lossless
+    assert stats["tree_rescues"] > 0        # 救回分支确实被覆盖
