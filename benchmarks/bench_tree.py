@@ -1,11 +1,12 @@
 """最小树 top-2(TREE_TOP2)稳态多 prompt A/B:tree-off vs tree-on 的净 tok/s 与 lossless 裁决。
 
 模型只加载一次。lossless 口径(噪声地板对照):
-  ZEROCOPY_DUAL_SOURCE=1 后端有良性 run-to-run token 漂移(字节校验 0 BAD,漂移来自 MoE 浮点
-  非结合性在近平局处翻转 argmax),严格逐 token 相等对 baseline 自己都不成立。故:
-    - ref  = 非投机贪婪 baseline(每 prompt 跑一次,作真参考)
-    - 噪声地板 control_mm = tree-off 各重复轮相对 ref 的最大失配数
-    - on_mm = tree-on 各重复轮相对 ref 的最大失配数
+  最小树的 lossless 参照是 spec 本身(tree-off),而非 dense 贪婪——dense(seq=1)与 verify
+  (seq=K 批前向)的 MoE/注意力浮点归约顺序不同,会在近平局处系统性发散(既有性质,非最小树引入)。
+  又因 ZEROCOPY_DUAL_SOURCE=1 后端有间歇 run-to-run 漂移(字节校验 0 BAD),故:
+    - ref = tree-off 首轮输出
+    - 噪声地板 control_mm = tree-off 其余各轮相对 ref 的最大失配数
+    - on_mm = tree-on 各轮相对 ref 的最大失配数
     - lossless_ok(逐 prompt) = on_mm <= control_mm(最小树不引入超出后端噪声的失配)
 tok/s 每配置每 prompt 重复 REPEAT 次取中位数,抵抗抖动;跑前 warmup 一遍热 kernel/池。
 生产配置(env,与 run_mtp_spec 一致):
@@ -21,8 +22,7 @@ from mlx_lm.models.qwen3_next import ModelArgs
 from mlx_streaming.core.mem import reset_peak
 from mlx_streaming.mtp.bench_verdict import median, verdict_from_delta
 from mlx_streaming.mtp.drafter import MTPDrafter
-from mlx_streaming.mtp.generate import (
-    forward_with_hidden, prefill_chunked, mtp_generate)
+from mlx_streaming.mtp.generate import mtp_generate
 from mlx_streaming.mtp.qwen3_next_mtp import load_mtp
 from mlx_streaming.model_builder import build_streaming_model
 from mlx_streaming import config as _cfg
@@ -43,20 +43,6 @@ PROMPTS = [
 ]
 
 
-def _baseline_greedy(model, enc, n):
-    """非投机贪婪 baseline(逐 token argmax),作为 lossless 真参考 ref。"""
-    cache = model.make_cache()
-    logits, _ = prefill_chunked(model, enc, cache)
-    out = []
-    for _ in range(n):
-        nxt = int(mx.argmax(logits[:, -1, :]))
-        out.append(nxt)
-        if len(out) >= n:
-            break
-        logits, _ = forward_with_hidden(model, mx.array([[nxt]]), cache)
-    return out
-
-
 def _run_once(model, drafter, tok, enc, store):
     store.reset_stats()
     ids, stats = mtp_generate(model, drafter, tok, enc, MAXTOK, K=K,
@@ -71,27 +57,29 @@ def _mismatch(ids, ref):
 
 def _bench_prompt(model, drafter, tok, prompt, store):
     enc = mx.array([tok.encode(prompt)])
-    ref = _baseline_greedy(model, enc, MAXTOK)          # 非投机贪婪真参考
 
+    # tree-off:首轮作 lossless 参照 ref;其余各轮 vs ref = 后端噪声地板。
     os.environ["TREE_TOP2"] = "0"
-    off_tps, off_mm = [], []
+    off_tps, ref, control_mm = [], None, 0
     for _r in range(REPEAT):
         ids, _stats, tps = _run_once(model, drafter, tok, enc, store)
         off_tps.append(tps)
-        off_mm.append(_mismatch(ids, ref))
+        if ref is None:
+            ref = ids
+        else:
+            control_mm = max(control_mm, _mismatch(ids, ref))
 
+    # tree-on:各轮 vs ref。
     os.environ["TREE_TOP2"] = "1"
-    on_tps, on_mm, on_rescues = [], [], 0
+    on_tps, on_mm, on_rescues = [], 0, 0
     for _r in range(REPEAT):
         ids, stats, tps = _run_once(model, drafter, tok, enc, store)
         on_tps.append(tps)
-        on_mm.append(_mismatch(ids, ref))
+        on_mm = max(on_mm, _mismatch(ids, ref))
         on_rescues = stats["tree_rescues"]
 
     off_med, on_med = median(off_tps), median(on_tps)
-    control_mm = max(off_mm)                             # 后端噪声地板
-    on_mm_max = max(on_mm)
-    lossless_ok = on_mm_max <= control_mm               # 不引入超出噪声的失配
+    lossless_ok = on_mm <= control_mm                   # 不引入超出后端噪声的失配
     delta = (on_med - off_med) / max(off_med, 1e-6)
     return {
         "prompt": prompt[:16],
@@ -102,7 +90,7 @@ def _bench_prompt(model, drafter, tok, prompt, store):
         "delta_pct": round(delta * 100, 2),
         "tree_rescues": on_rescues,
         "control_mm": control_mm,                       # tree-off vs ref 最大失配(噪声地板)
-        "on_mm": on_mm_max,                             # tree-on vs ref 最大失配
+        "on_mm": on_mm,                                 # tree-on vs ref 最大失配
         "lossless_ok": lossless_ok,
     }
 
