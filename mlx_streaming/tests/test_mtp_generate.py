@@ -654,3 +654,56 @@ def test_mtp_generate_tree_pos1_lossless_and_rescues(monkeypatch):
     assert got == ref                           # lossless
     assert stats["tree_rescues_p1"] > 0         # pos1 救回分支确实被覆盖
     assert stats["tree_rescues"] == 0           # 本 oracle 首草稿恒命中,不走 pos0 救回
+
+
+# ---------------------------------------------------------------- 置信度门控动态深度
+class _OracleAdaptiveDraft:
+    """玩具 drafter:每步草稿深度在 1..depth_max 间轮转(模拟置信度门控的变长输出),偶数步把
+    末位改错(制造 matched<step_k 的拒绝+bonus 纠正)。用于验证变长深度提交仍逐 token 等于贪婪。
+    """
+
+    def __init__(self, ref, vocab):
+        self.ref = list(ref)
+        self.pos = 0
+        self.vocab = vocab
+        self.step = 0
+
+    def make_cache(self):
+        from mlx_lm.models import cache as kvcache
+        return [kvcache.KVCache()]
+
+    def draft_adaptive(self, H_last, x_ids, mtp_cache, depth_max, tau):
+        depth = 1 + (self.step % depth_max)              # 深度轮转 1..depth_max
+        self.step += 1
+        nxt = self.ref[self.pos + 1: self.pos + 1 + depth]
+        while len(nxt) < depth:
+            nxt.append(0)
+        if self.step % 2 == 0:                           # 偶数步末位改错 → matched<step_k
+            nxt = nxt[:-1] + [(nxt[-1] + 1) % self.vocab]
+        return nxt
+
+    def sync(self, prev_H, rH, replay_in, mtp_cache):
+        self.pos += int(replay_in.shape[1])
+
+
+def test_mtp_generate_adaptive_depth_lossless(monkeypatch):
+    """置信度门控动态深度:变长草稿(含拒绝步)主输出必须逐 token 等于贪婪,且确有多 token 步。"""
+    from mlx_streaming.mtp.generate import mtp_generate
+
+    monkeypatch.setenv("MTP_ADAPTIVE_DEPTH", "1")
+    monkeypatch.setenv("MTP_DEPTH_MAX", "4")            # 超过基础 K=3,测向上扩展
+    monkeypatch.delenv("TREE_TOP2", raising=False)
+    monkeypatch.delenv("MTP_VERIFY_MODE", raising=False)
+    monkeypatch.delenv("TREE_VERIFY", raising=False)
+    mx.random.seed(0)
+    model = _ToyModel(nl=2, vocab=40)
+    model.make_cache = lambda: [kvcache.KVCache() for _ in model.layers]
+    mx.eval(model.parameters())
+    prompt = mx.array([[1, 5, 9]])
+    ref = _naive_greedy(model, prompt, 20)
+
+    drafter = _OracleAdaptiveDraft(ref, vocab=40)
+    got, stats = mtp_generate(model, drafter, None, prompt, 20, K=3, ids_mode=True)
+
+    assert got == ref                           # 变长深度下仍 lossless
+    assert stats["avg_accept_len"] > 1.0        # 确有多 token 步(投机真的在跑)

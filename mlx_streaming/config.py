@@ -216,6 +216,16 @@ def tree_top2_p1() -> bool: return _b("TREE_TOP2_P1", "0")
 def tree_verify() -> bool: return _b("TREE_VERIFY", "0")
 # 树分支数(候选路径条数 P)。当前 drafter 在位置1 展开 top-P,P=2 即 top-2。
 def tree_branches() -> int: return _i("TREE_BRANCHES", 2)
+# 置信度门控动态深度(P-MTP 风格):逐位抽草稿时累计置信度 C_i=p0·…·p_i,C_i≥tau 且未到 depth_max
+# 就继续加深,否则本步只 verify 到当前深度。低置信步收缩(省专家加载/cap 压力),高置信步至多到
+# depth_max。探针实测置信度对接受率区分度极强(高低置信接受率差 +42~59pp)。消融结论(见
+# benchmarks/reports,_bench_adaptive):收益全部来自"向下收缩",τ=0.3、depth_max=3 即 +5~6% tok/s
+# 且 bit-lossless、零额外显存;向上扩到 K=4 反而更慢(第4 位专家加载成本 > 多接受的 token),且在
+# 生产 EXPERT_SLOTS=32 下 seq=4·top_k=40>cap 会溢出致有损。故 depth_max 默认 3(=基础 K,slots=32 安全),
+# 要扩到 4 必须同时把 EXPERT_SLOTS 提到 ≥40。默认关,作可选加速路径(与 tree_top2 互斥)。
+def adaptive_depth() -> bool: return _b("MTP_ADAPTIVE_DEPTH", "0")
+def conf_tau() -> float: return _f("MTP_CONF_TAU", 0.3)
+def depth_max() -> int: return _i("MTP_DEPTH_MAX", 3)
 
 
 def parse_layers_env(name: str) -> "set[int] | None":

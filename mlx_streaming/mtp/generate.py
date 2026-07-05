@@ -226,7 +226,7 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     direct_commits = fallback_replays = replayed_tokens = 0
     # matched 直方图:accept_hist[j] = 恰好命中 j 个草稿(j∈0..K)的步数。用于实测每位置接受率,
     # 不做几何分布假设。emitted/step = min(matched+1,K)，故上限为 K(本实现 verify 只喂 K-1 草稿)。
-    accept_hist = [0] * (K + 1)
+    accept_hist = [0] * (max(K, config.depth_max() if config.adaptive_depth() else K) + 1)
     # top-k 覆盖探针:每位置统计模型真实 token 落在 MTP top-1/2/3 的步数(树形救回上界)。
     topk_probe = config.accept_topk() if profile else 0
     tk_n = [0] * K
@@ -237,6 +237,11 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     tree_mode = config.tree_top2()
     tree_p1_mode = tree_mode and config.tree_top2_p1()   # 第2 位(pos1)救回,附加在 tree_top2 上
     tree_verify_mode = config.tree_verify()     # 完整树形验证(batch-of-paths),优先级最高
+    # 置信度门控动态深度:仅在 plain 单链路径生效(与 tree/tree_verify/step 互斥)。
+    adaptive_mode = config.adaptive_depth() and not tree_mode and not tree_verify_mode \
+        and verify_mode != "step"
+    conf_tau_v = config.conf_tau()
+    depth_max_v = max(1, config.depth_max())
     tree_P = max(1, config.tree_branches())
     tree_rescues = 0                            # 第1 位 top-2 成功救回(B 链首命中)的步数
     tree_rescues_p1 = 0                          # 第2 位 top-2 成功救回(C 链第2 token 命中)的步数
@@ -289,16 +294,22 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             _tic = time.perf_counter()
         tree_b = None
         tree_c = None
+        step_k = K                                                 # 本步验证深度(动态深度时可变)
         if tree_mode and verify_mode != "step":
             # chainA(全 top-1)、chainB(第1 位 top-2 → pos0 救回)、chainC(第2 位 top-2 → pos1 救回)
             drafts, tree_b, tree_c = drafter.draft_tree(
                 H_last, x_ids, mtp_cache, K, pos1=tree_p1_mode)
             draft_cands = None
+        elif adaptive_mode:
+            # 置信度门控:返回可变长度(1..depth_max)草稿链,本步深度随置信度自适应。
+            drafts = drafter.draft_adaptive(H_last, x_ids, mtp_cache, depth_max_v, conf_tau_v)
+            draft_cands = None
+            step_k = len(drafts)
         elif topk_probe > 0:
             drafts, draft_cands = drafter.draft(H_last, x_ids, mtp_cache, K, topk=topk_probe)
         else:
             drafts, draft_cands = drafter.draft(H_last, x_ids, mtp_cache, K), None  # 长度 K
-        verify_in = mx.array([[x] + drafts[: K - 1]])              # [x, d_1..d_{K-1}]
+        verify_in = mx.array([[x] + drafts[: step_k - 1]])         # [x, d_1..d_{step_k-1}]
         if profile:
             mx.eval(verify_in)
             t_draft += time.perf_counter() - _tic
@@ -368,7 +379,7 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             t_verify += time.perf_counter() - _tic
             _tic = time.perf_counter()
 
-        accepted_len = min(matched + 1, K)
+        accepted_len = min(matched + 1, step_k)
 
         if verify_snaps is not None:
             # step 模式：逐 token 解码路径产生的快照可精确 direct commit。
@@ -382,7 +393,7 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             #   （见 mtp/kv_cache.py 与 tests/test_gated_delta_multistate.py），可精确直提交。
             # commit_verified_prefix 一次处理混合 cache：KV 走 trim、Arrays 走 checkpoint 直提交。
             # 若任一递归 cache 缺 checkpoint（异常情况）则返回 False，自动回退到下方 replay。
-            committed = commit_verified_prefix(main_cache, verified_len=K,
+            committed = commit_verified_prefix(main_cache, verified_len=step_k,
                                                accepted_len=accepted_len)
         if snap_d is not None:
             _restore(mtp_cache, snap_d)
@@ -395,8 +406,8 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             direct_commits += 1
             # 直接使用验证前向产生的 hidden 同步 MTP cache,避免主模型 replay。
             rH = vH[:, :accepted_len, :]
-            if matched == K:
-                new_tokens = drafts[:K]
+            if matched == step_k:
+                new_tokens = drafts[:step_k]
                 x = drafts[-1]
             else:
                 new_tokens = drafts[:matched] + [preds[matched]]

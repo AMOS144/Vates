@@ -39,6 +39,28 @@ class MTPDrafter:
             return drafts, cands
         return drafts
 
+    def draft_adaptive(self, H_last, x_ids, mtp_cache, depth_max, tau):
+        """置信度门控动态深度:逐位贪婪抽,累计置信度 C=∏p_i 跌破 tau 即停,最多 depth_max 位。
+
+        返回可变长度(1..depth_max)的草稿链。C 用每位 top-1 softmax 概率连乘;低置信提前收敛
+        (本步只 verify 到当前深度,省后续位置的专家加载),高置信抽满到 depth_max。始终至少抽 1 位
+        (depth=1 即退化为普通单 token 解码:verify 只喂 [x]、恒接受模型真值 1 个)。
+        """
+        drafts = []
+        h, cur = H_last, x_ids
+        conf = 1.0
+        for i in range(depth_max):
+            logits, mh = mtp_step(self.mtp, h, cur, self.lm_head, mtp_cache[0])
+            lg = logits[0].reshape(-1)
+            d = int(mx.argmax(lg))
+            drafts.append(d)
+            h, cur = mh, mx.array([[d]])
+            if i + 1 < depth_max:                          # 末位无需再判是否加深
+                conf *= float(mx.softmax(lg)[d])
+                if conf < tau:
+                    break
+        return drafts
+
     def draft_tree(self, H_last, x_ids, mtp_cache, K, pos1=True):
         """最小树:第1(始终)、第2(pos1=True 时)草稿位置展开 top-2,返回三条链,各长 K。
 
