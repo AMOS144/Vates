@@ -28,11 +28,15 @@ from mlx_streaming import config
 # +5~6% tok/s 且 bit-lossless、零额外显存,稳定优于最小树 pos0 救回 → 设为用户主路径默认。
 # depth_max=3 与基础 K 一致,在生产 EXPERT_SLOTS=32 下 seq·top_k 不溢出 cap(扩到 4 须 slots>=40)。
 # 注:动态深度与 TREE_TOP2 互斥(adaptive 仅在非 tree 的 plain 路径生效),故此处不开 TREE_TOP2。
+# KV_QUANT:IsoQuant K4/V3 + SO(4) 块旋转,仅作用于 12 个全注意力层(线性层递归态不动)。
+# 极致压缩长上下文 KV:128k 3.0→~0.68 GiB;短会话收益小但无害。K4/V3/旋转均取默认值,
+# 开 KV_QUANT=1 即整套生效。质量验收:token 一致率≥95% + logits cosine≥0.99。
 _FASTPATH_ENV = {
     "STREAM_BLOB_LOADER": "1",
     "NATIVE_FUSED_PREFETCH": "1",
     "ZEROCOPY_DUAL_SOURCE": "1",
     "SIDEREGION_LFU": "1",
+    "KV_QUANT": "1",
     "MTP_ADAPTIVE_DEPTH": "1",
     "MTP_CONF_TAU": "0.3",
     "MTP_DEPTH_MAX": "3",
@@ -70,9 +74,17 @@ def _build_engine(args, on_status=None):
     import mlx.core as mx  # noqa: F401  确保 MLX 已就绪
     from mlx_lm.models.qwen3_next import ModelArgs
 
+    from mlx_streaming.core.mem import setup_memory_hygiene
     from mlx_streaming.model_builder import build_streaming_model
     from mlx_streaming.mtp.drafter import MTPDrafter
     from mlx_streaming.mtp.qwen3_next_mtp import load_mtp
+
+    # 长会话内存防御:封顶 MLX 可回收缓冲(默认 1GB),防长对话里缓冲缓存膨胀把常驻推过墙 /
+    # 触发 macOS 压缩器抖动。TUI 是典型长会话场景,故在用户主路径启动时就设上。
+    _applied = setup_memory_hygiene(cache_gb=config.mlx_cache_limit_gb(),
+                                    wired_gb=config.mlx_wired_limit_gb())
+    if _applied:
+        _emit(f"内存防御: {_applied}")
 
     _emit("正在加载主模型 + 专家(流式)...")
     model, tok, _store = build_streaming_model()

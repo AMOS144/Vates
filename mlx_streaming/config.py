@@ -33,10 +33,11 @@ def qn_config() -> str: return _s("QN_CONFIG", "models/qwen3_next_80b_4bit/confi
 def mtp_out() -> str: return _s("MTP_OUT", "models/qn_mtp_weights.safetensors")
 def expert_dir(default: str = "models/qwen3_next_experts_4bit_g64") -> str: return _s("EXPERT_DIR", default)
 def expert_slots() -> int: return _i("EXPERT_SLOTS", 64)
-# 长期运行内存防御:封顶 MLX 可回收缓冲(默认 2GB),防长会话缓存膨胀;
-# wired limit 默认 0=关(opt-in),设 >0 则 wire 该 GB 数的 GPU 缓冲防 macOS 压缩器,
-# 须 < 系统建议工作集(本机 26.8GB)。
-def mlx_cache_limit_gb() -> float: return _f("MLX_CACHE_LIMIT_GB", 2.0)
+# 长期运行内存防御:封顶 MLX 可回收缓冲(默认 1GB),防长会话缓存膨胀;
+# 双源侧区池的专家 buffer 走 C++ owned pool、不经 MLX 缓冲缓存,故 1GB 缓冲复用额度已够,
+# 再大只是白占常驻。wired limit 默认 0=关(opt-in),设 >0 则 wire 该 GB 数的 GPU 缓冲防 macOS
+# 压缩器,须 < 系统建议工作集(本机 26.8GB)。
+def mlx_cache_limit_gb() -> float: return _f("MLX_CACHE_LIMIT_GB", 1.0)
 def mlx_wired_limit_gb() -> float: return _f("MLX_WIRED_LIMIT_GB", 0.0)
 def expert_pool_profile() -> str: return _s("EXPERT_POOL_PROFILE", "")
 def hidden_variant() -> str: return _s("HIDDEN_VARIANT", "pre_final_norm")

@@ -18,10 +18,27 @@ from textual.app import App, ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Input, Static
 
+from mlx_streaming.core.mem import snapshot
 from mlx_streaming.tui.backend import ChatBackend, GenResult
 from mlx_streaming.tui.banner import LOGO
 
 _ACCENT = "#2dd4bf"
+
+
+def _fmt_gb(nbytes: int) -> str:
+    return f"{nbytes / 1e9:.2f} GB"
+
+
+def _mem_suffix(peak: bool = False) -> str:
+    """状态栏内存后缀。显存外置流式 MoE 的核心卖点是低内存,故常驻展示活跃占用;
+    结束时附带峰值。取 MLX 统一内存计数器,开销极低。取不到(0)时返回空串,不干扰状态栏。"""
+    snap = snapshot()
+    if snap.mlx_active_bytes <= 0:
+        return ""
+    s = f" · 内存 {_fmt_gb(snap.mlx_active_bytes)}"
+    if peak and snap.mlx_peak_bytes > 0:
+        s += f"(峰值 {_fmt_gb(snap.mlx_peak_bytes)})"
+    return s
 
 # 生成中状态栏用滑动窗口算「瞬时」tok/s 的时间窗(秒);越小越灵敏、越大越平滑。
 _TPS_WINDOW = 1.0
@@ -166,7 +183,7 @@ class VatesApp(App):
         self.call_after_refresh(inp.focus)
 
     def _on_load_done(self) -> None:
-        self._set_status("就绪")
+        self._set_status(f"就绪{_mem_suffix()}")
         self._enable_input()
 
     def _on_load_failed(self, err: str) -> None:
@@ -269,10 +286,11 @@ class VatesApp(App):
         # 生成中显示滑动窗口「瞬时」速度:一直在动,能反映后期变慢,不被历史平均拖住。
         self._record_sample(now, n_tokens)
         tps = self._window_tps(now)
+        mem = _mem_suffix()
         if tps is None:
-            self._set_status(f"思考中 · {n_tokens} tok")
+            self._set_status(f"思考中 · {n_tokens} tok{mem}")
         else:
-            self._set_status(f"思考中 · {n_tokens} tok · {tps:.1f} tok/s")
+            self._set_status(f"思考中 · {n_tokens} tok · {tps:.1f} tok/s{mem}")
 
     def _on_done(self, result: GenResult) -> None:
         if self._cur is not None:
@@ -289,7 +307,7 @@ class VatesApp(App):
         else:
             tps = result.tok_per_s
         self._set_status(
-            f"就绪 · {result.n_tokens} tok · {tps:.1f} tok/s{suffix}")
+            f"就绪 · {result.n_tokens} tok · {tps:.1f} tok/s{_mem_suffix(peak=True)}{suffix}")
         self._enable_input()
 
     def _on_error(self, err: str) -> None:
