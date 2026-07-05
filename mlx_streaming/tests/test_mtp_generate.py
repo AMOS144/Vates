@@ -465,14 +465,15 @@ class _OracleTreeDraft:
         from mlx_lm.models import cache as kvcache
         return [kvcache.KVCache()]
 
-    def draft_tree(self, H_last, x_ids, mtp_cache, K):
+    def draft_tree(self, H_last, x_ids, mtp_cache, K, pos1=True):
         nxt = self.ref[self.pos + 1: self.pos + 1 + K]   # 真实 preds[0..K-1]
         while len(nxt) < K:                              # 末尾补齐(会被拒,不破坏 lossless)
             nxt.append(0)
         wrong0 = (nxt[0] + 1) % self.vocab               # 保证 != preds[0]
         chain_a = [wrong0] + nxt[1:]                     # 首错 → matched==0
-        chain_b = list(nxt)                              # 首=真实 → 救回且全命中
-        return chain_a, chain_b
+        chain_b = list(nxt)                              # 首=真实 → pos0 救回且全命中
+        chain_c = list(nxt) if pos1 else None            # pos1 分支(此 oracle 恒走 pos0,不触发)
+        return chain_a, chain_b, chain_c
 
     def sync(self, prev_H, rH, replay_in, mtp_cache):
         self.pos += int(replay_in.shape[1])              # 按本步接受长度前进
@@ -601,3 +602,55 @@ def test_tree_top2_rescue_lossless_direct_commit_recurrent(monkeypatch):
     assert stats["tree_rescues"] > 0            # 救回确有触发
     assert stats["direct_commits"] > 0          # 走直接提交路径(非 fallback)
     assert got == ref                           # 直接提交下救回仍 lossless
+
+
+# ---------------------------------------------------------------- 第2 位(pos1)top-2 救回
+class _OracleTreeDraftP1:
+    """玩具 drafter:第1 草稿命中、第2 草稿故意置错 → matched==1;chainC 第2 token=真实,
+    触发 pos1 救回且全命中。用于确定性覆盖 pos1 救回分支,验证主输出仍逐 token 等于贪婪。
+    """
+
+    def __init__(self, ref, vocab):
+        self.ref = list(ref)
+        self.pos = 0
+        self.vocab = vocab
+
+    def make_cache(self):
+        from mlx_lm.models import cache as kvcache
+        return [kvcache.KVCache()]
+
+    def draft_tree(self, H_last, x_ids, mtp_cache, K, pos1=True):
+        nxt = self.ref[self.pos + 1: self.pos + 1 + K]   # 真实 preds[0..K-1]
+        while len(nxt) < K:
+            nxt.append(0)
+        wrong1 = (nxt[1] + 1) % self.vocab               # 保证 != preds[1]
+        chain_a = [nxt[0], wrong1] + nxt[2:]             # 首命中、第2 错 → matched==1
+        chain_b = [(nxt[0] + 1) % self.vocab] + nxt[1:]  # pos0 分支(matched!=0,不触发)
+        chain_c = list(nxt) if pos1 else None            # 第2 token=真实 → pos1 救回全命中
+        return chain_a, chain_b, chain_c
+
+    def sync(self, prev_H, rH, replay_in, mtp_cache):
+        self.pos += int(replay_in.shape[1])
+
+
+def test_mtp_generate_tree_pos1_lossless_and_rescues(monkeypatch):
+    """第2 位 top-2:强制每步走 pos1 救回分支,主输出必须逐 token 等于贪婪,且 pos1 救回确有触发。"""
+    from mlx_streaming.mtp.generate import mtp_generate
+
+    monkeypatch.setenv("TREE_TOP2", "1")
+    monkeypatch.setenv("TREE_TOP2_P1", "1")     # 默认关,本测试显式开 pos1 救回
+    monkeypatch.delenv("MTP_VERIFY_MODE", raising=False)
+    monkeypatch.delenv("TREE_VERIFY", raising=False)
+    mx.random.seed(0)
+    model = _ToyModel(nl=2, vocab=40)
+    model.make_cache = lambda: [kvcache.KVCache() for _ in model.layers]
+    mx.eval(model.parameters())
+    prompt = mx.array([[1, 5, 9]])
+    ref = _naive_greedy(model, prompt, 16)
+
+    drafter = _OracleTreeDraftP1(ref, vocab=40)
+    got, stats = mtp_generate(model, drafter, None, prompt, 16, K=3, ids_mode=True)
+
+    assert got == ref                           # lossless
+    assert stats["tree_rescues_p1"] > 0         # pos1 救回分支确实被覆盖
+    assert stats["tree_rescues"] == 0           # 本 oracle 首草稿恒命中,不走 pos0 救回

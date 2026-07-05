@@ -71,12 +71,13 @@ def _bench_prompt(model, drafter, tok, prompt, store):
 
     # tree-on:各轮 vs ref。
     os.environ["TREE_TOP2"] = "1"
-    on_tps, on_mm, on_rescues, on_direct, on_fallback = [], 0, 0, 0, 0
+    on_tps, on_mm, on_rescues, on_rescues_p1, on_direct, on_fallback = [], 0, 0, 0, 0, 0
     for _r in range(REPEAT):
         ids, stats, tps = _run_once(model, drafter, tok, enc, store)
         on_tps.append(tps)
         on_mm = max(on_mm, _mismatch(ids, ref))
         on_rescues = stats["tree_rescues"]
+        on_rescues_p1 = stats["tree_rescues_p1"]
         on_direct = stats["direct_commits"]
         on_fallback = stats["fallback_replays"]
 
@@ -91,6 +92,7 @@ def _bench_prompt(model, drafter, tok, prompt, store):
         "on_tps_runs": on_tps,
         "delta_pct": round(delta * 100, 2),
         "tree_rescues": on_rescues,
+        "tree_rescues_p1": on_rescues_p1,               # 第2 位(pos1)救回步数
         "on_direct_commits": on_direct,                 # 直接提交步数(诊断:生产走哪条提交路径)
         "on_fallback_replays": on_fallback,             # fallback replay 步数
         "control_mm": control_mm,                       # tree-off vs ref 最大失配(噪声地板)

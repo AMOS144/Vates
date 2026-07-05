@@ -39,33 +39,53 @@ class MTPDrafter:
             return drafts, cands
         return drafts
 
-    def draft_tree(self, H_last, x_ids, mtp_cache, K):
-        """最小树:位置1 展开 top-2,返回两条链 (chainA, chainB),各长 K。
+    def draft_tree(self, H_last, x_ids, mtp_cache, K, pos1=True):
+        """最小树:第1(始终)、第2(pos1=True 时)草稿位置展开 top-2,返回三条链,各长 K。
 
-        chainA = [d1a(top-1), d2a, d3a]（同 draft）；chainB = [d1b(top-2), d2b, d3b],
-        d2b/d3b 从 d1b 续抽。两链共享 pos1 之后的 MTP 隐状态 mh1,但各自从 d1a/d1b 分叉;
-        用 mtp_cache 快照在续抽 A 后回到 pos1 态再续抽 B,保证 B 不带 A 的递归污染。
+        - chainA = [d1a(top-1), d2a(top-1), d3a]           全 top-1,同 draft。
+        - chainB = [d1b(top-2), d2b, d3b]                  第1 草稿位置 top-2 分支 → pos0 救回。
+        - chainC = [d1a, d2c(第2 位次选), d3c] 或 None       第2 草稿位置 top-2 分支 → pos1 救回。
+
+        各分叉点用 mtp_cache 快照隔离,保证任一分支不带其它分支的递归污染:snap_after_x(x 处理后)
+        分叉 d1a/d1b;snap_after_d1a(d1a 处理后)分叉 d2a/d2c。探针实测第2 位「首选错次选对」比例
+        (~11%)高于第1 位(~7%),故 pos1 分支值得抽;但每步多一次 MTP 续抽,pos1=False 时退化为
+        仅 chainA/chainB(与旧最小树成本一致),便于 A/B 隔离 pos1 增量。
         """
         logits1, mh1 = mtp_step(self.mtp, H_last, x_ids, self.lm_head, mtp_cache[0])
         lg = logits1[0].reshape(-1)
         top2 = [int(i) for i in mx.argsort(lg)[-2:].tolist()][::-1]   # [d1a, d1b] 降序
         d1a, d1b = top2[0], top2[1]
-        snap_pos1 = _snapshot(mtp_cache)          # x 处理后、分叉前的 MTP 递归态
+        snap_after_x = _snapshot(mtp_cache)       # x 处理后、第1 位分叉前的 MTP 递归态
 
-        def _continue(first):
+        def _continue(first, h0, n):
+            """首 token first 已定,从隐状态 h0 再贪婪续抽 n 个,返回长度 1+n 的链。"""
             chain = [first]
-            h, cur = mh1, mx.array([[first]])
-            for _ in range(K - 1):
+            h, cur = h0, mx.array([[first]])
+            for _ in range(n):
                 lo, mh = mtp_step(self.mtp, h, cur, self.lm_head, mtp_cache[0])
                 d = int(mx.argmax(lo[0]))
                 chain.append(d)
                 h, cur = mh, mx.array([[d]])
             return chain
 
-        chainA = _continue(d1a)
-        _restore(mtp_cache, snap_pos1)            # 回到 pos1 态,B 链从同一起点分叉
-        chainB = _continue(d1b)
-        return chainA, chainB
+        chainC = None
+        if pos1:
+            # 从 d1a 续抽第2 位,捕获第2 位 top-2(d2a/d2c),供 chainA 与 chainC 分叉。
+            lo2, mh_after_d1a = mtp_step(self.mtp, mh1, mx.array([[d1a]]), self.lm_head, mtp_cache[0])
+            lg2 = lo2[0].reshape(-1)
+            top2_p1 = [int(i) for i in mx.argsort(lg2)[-2:].tolist()][::-1]   # [d2a, d2c] 降序
+            d2a, d2c = top2_p1[0], top2_p1[1]
+            snap_after_d1a = _snapshot(mtp_cache)     # d1a 处理后、第2 位分叉前的递归态
+            chainA = [d1a] + _continue(d2a, mh_after_d1a, K - 2)   # [d1a, d2a, d3a...]
+            _restore(mtp_cache, snap_after_d1a)                   # 回到 d1a 态,C 链从第2 位次选分叉
+            chainC = [d1a] + _continue(d2c, mh_after_d1a, K - 2)   # [d1a, d2c, d3c...]
+        else:
+            chainA = _continue(d1a, mh1, K - 1)                    # 仅全 top-1 链(旧最小树成本)
+
+        # chainB:回到 x 态,从第1 位次选 d1b 分叉续抽。
+        _restore(mtp_cache, snap_after_x)
+        chainB = _continue(d1b, mh1, K - 1)                        # [d1b, d2b, d3b...]
+        return chainA, chainB, chainC
 
     def draft_paths(self, H_last, x_ids, mtp_cache, K, P):
         """完整树 batch-of-paths:位置1 展开 top-P,返回 P 条链(各长 K)。

@@ -203,6 +203,12 @@ def accept_topk() -> int: return _i("ACCEPT_TOPK", 0)
 # 最小树:位置1 展开 top-2。仅当 A 链首草稿被拒且 B 候选=真实 token 时,额外跑一次 B 链前向救回。
 # 两分支各为独立 batch=1 seq=K 前向(线性层不能批处理树,故不拍平),per-forward union 不变。默认关。
 def tree_top2() -> bool: return _b("TREE_TOP2", "0")
+# 第2 草稿位置(pos1)top-2 救回:在 tree_top2 基础上,额外抽 chainC(第2 位次选分支),当第1 位
+# 命中但第2 位被拒、且 chainC 第2 token=模型真值时改验 chainC。探针实测 pos1「首选错次选对」比例
+# (~11%)高于 pos0(~7%),消融证实接受长度确实 +2.74%(bit-lossless);但每次救回要多一次主模型
+# 前向,该成本在当前硬件/批量下恰好抵消 token 收益,净 tok/s 无提升(见 benchmarks/_bench_p1_ablation)。
+# 故默认关,保护已验证的 pos0 纯路径 tok/s 收益;留作前向变廉价/批量变大时收益翻正的储备,一行 env 开。
+def tree_top2_p1() -> bool: return _b("TREE_TOP2_P1", "0")
 # 完整树形验证(batch-of-paths):把 P 条候选路径拍到 batch 维,一次 batched 前向并行验证所有路径,
 # 选接受最长的路径提交(提取赢家 row)。每条路径是普通线性序列,故线性层/全注意力层都走成熟的
 # batch 前向(无需改 kernel);单次前向的 batch=P 计算加宽了预取窗口,同时多路径提升接受长度

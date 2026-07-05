@@ -74,6 +74,40 @@ token0 完全一致，token1 完全不同 → `demand_dual` 把**错的专家**�
 贪婪即有损**（seq≥2 装错专家）；修复后 spec 与最小树救回均恢复 bit-lossless，且保留 schemeB 的
 +8% tok/s 基座——无需在 `acquire_gpu`（放弃提速）与 lossless 之间二选一。
 
+## 追加实验：第 2 位（pos1）top-2 救回消融（2026-07-05）
+
+修好 lossless 后追问"树形验证还能不能继续挖接受率"。用 `benchmarks/_probe_topk.py` 跑逐位置
+top-1/2/3 覆盖率探针（6 prompt，关树走 plain 单链采集每位置候选）：
+
+| 位置 | top1 | top2 | top3 | gap21（top2 可救回上界） |
+|---|---|---|---|---|
+| pos0（第 1 草稿） | 0.841 | 0.914 | 0.943 | **0.073** |
+| pos1（第 2 草稿） | 0.580 | 0.694 | 0.747 | **0.114** |
+| pos2（第 3 草稿） | 0.547 | 0.682 | 0.735 | 0.135 |
+
+探针预测：**pos1 的「首选错次选对」比例（11.4%）比 pos0（7.3%）还大**，是最肥的一块。据此实现
+pos1 救回（`drafter.draft_tree` 多返回 chainC 第 2 位次选分支；`generate.py` 在 `matched==1 且
+chainC[1]==preds[1]` 时改验 chainC，与 pos0 救回同构、纯重验 → bit-lossless），加 `TREE_TOP2_P1` 开关。
+
+三向消融（`_bench_p1_ablation.py`，生产 env，K=3 MAXTOK=128 REPEAT=4，6 prompt）：
+
+| 配置 | 接受长度 | tok/s（中位均值） | pos0 救回 | pos1 救回 | max_mm |
+|---|---|---|---|---|---|
+| off | 2.360 | 12.06 | 0 | 0 | 0 |
+| pos0（旧） | 2.512 | **12.51** | 28 | 0 | 0 |
+| pos0+pos1（新） | **2.580** | 12.12 | 29 | 20 | 0 |
+
+- 接受长度：pos0 vs off **+6.43%**；**pos0+pos1 vs pos0 +2.74%（pos1 净增量）**；合计 vs off +9.35%。
+- 全程 `max_mm=0` → pos1 救回 **bit-lossless 确认**。
+
+**结论：pos1 在接受率维度真实有效（+2.74%，无损），但换不来净 tok/s。** 每次 pos1 救回要多跑一次
+昂贵的主模型前向（MoE 专家加载），该成本在当前硬件/批量下恰好抵消多接受的 token，`pos0+pos1`
+(12.12) 甚至略低于 `pos0`(12.51)。对比 pos0 救回能净赚（第 1 位被拒更常见、一次常多接受 2 token，
+性价比高），pos1 边际收益不足以覆盖"多一次前向"的固定成本。
+
+**裁决：机制保留（有测试、lossless），`TREE_TOP2_P1` 默认关**，保护已验证的 pos0 纯路径 tok/s 收益；
+留作前向变廉价/批量变大时收益翻正的储备，一行 env 即可开。
+
 ## 已知次要 bug（未修，未在生产触发）
 
 - fallback replay 在 `matched==K` 时 replay K+1 个 token，真实模型上会触发专家池

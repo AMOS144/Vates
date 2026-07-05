@@ -235,9 +235,11 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     tk_cover3 = [0] * K
     verify_mode = config.mtp_verify_mode()
     tree_mode = config.tree_top2()
+    tree_p1_mode = tree_mode and config.tree_top2_p1()   # 第2 位(pos1)救回,附加在 tree_top2 上
     tree_verify_mode = config.tree_verify()     # 完整树形验证(batch-of-paths),优先级最高
     tree_P = max(1, config.tree_branches())
-    tree_rescues = 0                            # 位置1 top-2 成功救回(B 链首命中)的步数
+    tree_rescues = 0                            # 第1 位 top-2 成功救回(B 链首命中)的步数
+    tree_rescues_p1 = 0                          # 第2 位 top-2 成功救回(C 链第2 token 命中)的步数
     # 纯 batch 直接提交路径 + 模型保证 commit 恒成功时,跳过每步一次「全 cache 深拷贝 + eval」
     # (snap_m 只用于 tree 救回 / step / replay 回退,这些路径都不满足下方条件)。省 ~72MiB 在途
     # 峰值和一次同步栅栏,数值完全不变(bit-exact,只改内存调度)。模型结构恒定,循环外算一次即可。
@@ -286,8 +288,11 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
         if profile:
             _tic = time.perf_counter()
         tree_b = None
+        tree_c = None
         if tree_mode and verify_mode != "step":
-            drafts, tree_b = drafter.draft_tree(H_last, x_ids, mtp_cache, K)  # chainA, chainB
+            # chainA(全 top-1)、chainB(第1 位 top-2 → pos0 救回)、chainC(第2 位 top-2 → pos1 救回)
+            drafts, tree_b, tree_c = drafter.draft_tree(
+                H_last, x_ids, mtp_cache, K, pos1=tree_p1_mode)
             draft_cands = None
         elif topk_probe > 0:
             drafts, draft_cands = drafter.draft(H_last, x_ids, mtp_cache, K, topk=topk_probe)
@@ -332,6 +337,20 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             drafts = tree_b
             matched = accept_prefix(drafts, preds)
             tree_rescues += 1
+        # 第2 位(pos1)救回:A 链首草稿命中(matched==1)但第2 草稿被拒,且 chainC 的第2 token
+        # =模型真值 preds[1] 时,改验 chainC=[x, d1a, d2c, ...]。preds[1] 只依赖 [x, d1a],A/C
+        # 前缀一致故 preds[0]/preds[1] 不变、重验后 matched≥2;d3c 可能续命中把接受长度顶到 3。
+        # 与 pos0 救回同构(纯重验、只提交模型 argmax token → bit-lossless,并集不放大)。
+        elif tree_c is not None and matched == 1 and len(tree_c) > 1 and tree_c[1] == preds[1]:
+            _restore(main_cache, snap_m)
+            begin_speculative_checkpoints(main_cache)
+            verify_in = mx.array([[x] + tree_c[:K - 1]])
+            vlogits, vH = forward_with_hidden(model, verify_in, main_cache)
+            mx.eval(vlogits, vH)
+            preds = [int(t) for t in mx.argmax(vlogits[0], axis=-1)]
+            drafts = tree_c
+            matched = accept_prefix(drafts, preds)
+            tree_rescues_p1 += 1
         accept_hist[matched] += 1
         if draft_cands is not None:
             # preds[i]=模型在位置 i 的真实下一 token;查它是否在 MTP 该位置 top-1/2/3 候选里。
@@ -443,7 +462,8 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
         "fallback_replays": fallback_replays,
         "replayed_tokens": replayed_tokens,
         "accept_hist": accept_hist,               # [恰好命中0,1,...,K 个草稿的步数]
-        "tree_rescues": tree_rescues,             # 最小树位置1 成功救回步数(tree_top2 开时)
+        "tree_rescues": tree_rescues,             # 最小树第1 位成功救回步数(tree_top2 开时)
+        "tree_rescues_p1": tree_rescues_p1,       # 最小树第2 位成功救回步数(tree_top2 开时)
     }
     if topk_probe > 0:
         stats["topk_probe"] = {
