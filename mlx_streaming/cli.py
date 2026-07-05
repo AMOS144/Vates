@@ -23,14 +23,19 @@ from mlx_streaming import config
 
 # MTP 快路径环境变量兜底配方(benchmark 验证过的最优组合)。
 # 用 setdefault 兜底:用户显式导出的环境变量优先级更高,不会被覆盖。
-# TREE_TOP2:最小树 top-2 救回。2026-07-05 修复 demand_dual 非连续读 bug 后已 bit-lossless
-# (bench_tree.py 全 prompt control_mm=0/on_mm=0),median +10.8% tok/s → 纳入用户主路径默认。
+# MTP_ADAPTIVE_DEPTH:置信度门控动态深度。逐位累计置信度跌破 tau 即停,低置信步抽浅省专家加载
+# (本系统 IO 瓶颈)。消融(reports/adaptive-depth-2026-07-05)证 τ=0.3、depth_max=3 纯向下收缩
+# +5~6% tok/s 且 bit-lossless、零额外显存,稳定优于最小树 pos0 救回 → 设为用户主路径默认。
+# depth_max=3 与基础 K 一致,在生产 EXPERT_SLOTS=32 下 seq·top_k 不溢出 cap(扩到 4 须 slots>=40)。
+# 注:动态深度与 TREE_TOP2 互斥(adaptive 仅在非 tree 的 plain 路径生效),故此处不开 TREE_TOP2。
 _FASTPATH_ENV = {
     "STREAM_BLOB_LOADER": "1",
     "NATIVE_FUSED_PREFETCH": "1",
     "ZEROCOPY_DUAL_SOURCE": "1",
     "SIDEREGION_LFU": "1",
-    "TREE_TOP2": "1",
+    "MTP_ADAPTIVE_DEPTH": "1",
+    "MTP_CONF_TAU": "0.3",
+    "MTP_DEPTH_MAX": "3",
 }
 
 
