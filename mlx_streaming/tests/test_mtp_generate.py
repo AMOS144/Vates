@@ -468,3 +468,55 @@ def test_mtp_generate_tree_top2_lossless_and_rescues(monkeypatch):
 
     assert got == ref                       # lossless
     assert stats["tree_rescues"] > 0        # 救回分支确实被覆盖
+
+
+class _SpyTreeDraft(_OracleTreeDraft):
+    """在 oracle 基础上记录每步 sync 收到的 replay_in(即 accepted_in)的 token 序列。"""
+
+    def __init__(self, ref, vocab):
+        super().__init__(ref, vocab)
+        self.synced = []                    # 每步: (replay_in 的 python list)
+
+    def sync(self, prev_H, rH, replay_in, mtp_cache):
+        self.synced.append([int(t) for t in replay_in[0].tolist()])
+        super().sync(prev_H, rH, replay_in, mtp_cache)
+
+
+def test_tree_top2_rescue_accepted_in_uses_chain_b(monkeypatch):
+    """救回后喂给 sync 的 accepted_in 必须是 B 链 token,不能残留 chainA 的错误首草稿。
+
+    构造:每步必救回且全命中 → 接受长度=K=3 → accepted_in==[x, chain_b[0], chain_b[1]]。
+    chainA 首为 wrong0=(preds0+1)%vocab,若 bug 存在(用旧 verify_in),accepted_in[1] 会等于
+    wrong0 != preds0,断言失败。
+    """
+    from mlx_streaming.mtp.generate import mtp_generate
+
+    monkeypatch.setenv("TREE_TOP2", "1")
+    monkeypatch.delenv("MTP_VERIFY_MODE", raising=False)
+    monkeypatch.delenv("TREE_VERIFY", raising=False)
+    mx.random.seed(0)
+    model = _ToyModel(nl=2, vocab=40)
+    model.make_cache = lambda: [kvcache.KVCache() for _ in model.layers]
+    mx.eval(model.parameters())
+    prompt = mx.array([[1, 5, 9]])
+    ref = _naive_greedy(model, prompt, 16)
+
+    drafter = _SpyTreeDraft(ref, vocab=40)
+    got, stats = mtp_generate(model, drafter, None, prompt, 16, K=3, ids_mode=True)
+
+    assert got == ref
+    assert stats["tree_rescues"] > 0
+    # 至少一整步接受长度为 K:该步 accepted_in[1:] 必须等于 B 链真值(即 ref 的对应两个 token),
+    # 且不得等于 chainA 的 wrong0。逐步用其起始 x 复核。
+    checked_full_step = False
+    pos = 0
+    for step in drafter.synced:
+        assert step[0] == ref[pos]                 # accepted_in 首元恒为该步起始 x
+        acc_len = len(step)
+        if acc_len == 3:
+            wrong0 = (ref[pos + 1] + 1) % 40
+            assert step[1] == ref[pos + 1]         # 必为 B 链真值(bug 下会是 wrong0)
+            assert step[1] != wrong0
+            checked_full_step = True
+        pos += acc_len
+    assert checked_full_step                        # 至少覆盖到一整步 K 长接受

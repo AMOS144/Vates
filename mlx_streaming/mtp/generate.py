@@ -319,7 +319,10 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
         if tree_b is not None and matched == 0 and tree_b[0] == preds[0]:
             _restore(main_cache, snap_m)
             begin_speculative_checkpoints(main_cache)
-            vlogits, vH = forward_with_hidden(model, mx.array([[x] + tree_b[:K - 1]]), main_cache)
+            # 重建 verify_in 为 B 链:后续 accepted_in=verify_in[:, :accepted_len] 才会取到 chainB,
+            # 否则残留 chainA 的错误首草稿会经 sync 污染 MTP cache、拉低后续草稿质量(低估救回收益)。
+            verify_in = mx.array([[x] + tree_b[:K - 1]])
+            vlogits, vH = forward_with_hidden(model, verify_in, main_cache)
             mx.eval(vlogits, vH)
             preds = [int(t) for t in mx.argmax(vlogits[0], axis=-1)]
             drafts = tree_b
