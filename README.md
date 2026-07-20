@@ -1,253 +1,392 @@
+<div align="center">
+
 # vates
 
-**把 80B MoE 的运行内存压到 ~8 GB —— 相对 4-bit 全量 41 GB 约 5× 压缩，几乎任何型号的 Apple Silicon Mac 都能跑。**
+**在 Apple Silicon 上用约 8 GB 运行内存运行 80B MoE 模型**
 
-vates 是一套面向 Apple Silicon（MLX）的**显存外置流式 MoE 推理引擎** + **MTP 自投机解码**系统。核心思路：把 80B MoE 里绝大部分体积的专家权重留在磁盘（4-bit ≈ 41GB），运行时按需流式加载 + 预测式预取，配合 Qwen3-Next 自带的 MTP 头做自投机解码，让一台 32GB 的 Mac 也能跑完整的 80B 模型。
+面向 MLX 的显存外置流式 MoE 推理引擎，集成 Qwen3-Next MTP 自投机解码。
 
-> 模型规格：Qwen3-Next-80B-A3B（4-bit MLX）——512 专家 / 每 token top_k=10 / 48 个 MoE 层 + 12 个全注意力层。
+[![GitHub Stars](https://img.shields.io/github/stars/AMOS144/Vates?style=flat&logo=github&label=Stars)](https://github.com/AMOS144/Vates/stargazers)
+[![GitHub Forks](https://img.shields.io/github/forks/AMOS144/Vates?style=flat&logo=github&label=Forks)](https://github.com/AMOS144/Vates/forks)
+[![GitHub Issues](https://img.shields.io/github/issues/AMOS144/Vates?style=flat&logo=github&label=Issues)](https://github.com/AMOS144/Vates/issues)
+[![Last Commit](https://img.shields.io/github/last-commit/AMOS144/Vates?style=flat&logo=git&label=Last%20Commit)](https://github.com/AMOS144/Vates/commits/main)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat&logo=python&logoColor=white)](https://www.python.org/)
+[![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-Required-000000?style=flat&logo=apple&logoColor=white)](https://support.apple.com/guide/mac-help/about-this-mac-system-report-mchlp1176/mac)
+[![MLX](https://img.shields.io/badge/MLX-0.31%2B-8A2BE2?style=flat)](https://github.com/ml-explore/mlx)
+
+[演示](#演示) · [快速开始](#快速开始) · [详细使用](#详细使用) · [常见问题](#常见问题-faq) · [参与贡献](#开发与贡献)
+
+</div>
 
 ---
+
+## 项目简介
+
+大型混合专家模型（Mixture of Experts，MoE）的完整权重通常远大于 Mac 的可用统一内存。vates 将绝大部分专家权重保留在磁盘，仅在运行时按需加载并预测式预取当前需要的专家，从而显著降低常驻内存。
+
+项目面向 **Qwen3-Next-80B-A3B 4-bit MLX**：512 个专家、每个 token 激活 10 个专家、48 个 MoE 层和 12 个全注意力层。配合模型自带的 MTP 头，vates 通过自投机解码进一步提高生成吞吐。
+
+> [!NOTE]
+> 原始 4-bit 模型权重约为 41 GB，项目实测生产配置的运行内存峰值约为 8 GB。请确保设备有高于运行峰值的可用统一内存和充足的本地磁盘空间；实际占用与速度会受到硬件、上下文长度、模型文件和配置影响。
 
 ## 演示
 
+点击下方封面播放演示视频：
+
 [![vates 演示](https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo-poster.png)](https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo.mp4)
 
----
+## 功能亮点
 
-## 亮点
-
-- **装得下**：常驻内存峰值 ≈ **8 GB**（`EXPERT_SLOTS=32`），而模型 4-bit 全量 ≈ 41 GB。专家权重字节在磁盘，内存里只留一个小 LFU 缓存池。
-- **跑得动**：生产快路径 ≈ **13–15 tok/s**，叠加 MTP 投机优化后更高。
-- **不掉质量**：解码/验证走**逐字节无损**路径——容量不变性（换 cap 输出逐字节一致）+ `STG_VERIFY` 0 BAD 双重把关。
-- **长上下文友好**：KV 量化（IsoQuant K4/V3 + SO(4) 块旋转）把 128k 上下文 KV 从 3.0 GiB 压到 **~0.68 GiB**。
-- **开箱即用**：`vates` 一条命令进全屏 TUI，状态栏实时显示 token/s 与内存占用。
-
----
+- **低内存推理**：专家权重按需从磁盘流式读取，内存中仅保留小型常驻池与 LFU 侧区缓存。
+- **MTP 自投机解码**：使用 Qwen3-Next 自带的 MTP 头生成草稿，由主模型批量验证并接受或回退。
+- **零拷贝双源专家池**：真实区与侧区共享统一池，减少 Host 与 Device 之间的重复搬运。
+- **原生高性能路径**：C++ 扩展负责并行 `pread`、池状态管理、预测式预取与融合 MoE 计算。
+- **长上下文优化**：IsoQuant K4/V3 与 SO(4) 块旋转将 128k 上下文 KV 从约 3.0 GiB 压缩至约 0.68 GiB。
+- **正确性保障**：通过容量不变性、逐字节真值校验及完整测试集约束性能优化。
+- **交互式终端**：提供 Textual 全屏 TUI、纯文本 REPL、流式输出、吞吐与内存状态显示。
 
 ## 工作原理
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────┐
-│  vates TUI / CLI  (MTP 自投机快路径)                            │
+│  vates TUI / CLI                                             │
 ├──────────────────────────────────────────────────────────────┤
-│  MTP 自投机解码   drafter 草稿 → 主模型批量验证 → 接受/回退      │
-│    · 置信度门控动态深度   · 最小树 top-2 救回   · 跨轮 KV 复用   │
+│  MTP 自投机解码                                               │
+│  drafter 草稿 → 主模型批量验证 → 接受或回退                   │
 ├──────────────────────────────────────────────────────────────┤
-│  流式 MoE 专家池 (零拷贝双源)                                    │
-│    真实区(cap) ∪ 侧区(LFU 二级缓存)  ── 单次 GPU gather          │
-│    miss → C++ demand 按需 pread → 落池；预测式跨层预取           │
+│  流式 MoE 专家池                                              │
+│  真实区（cap）∪ 侧区（LFU）→ 单次 GPU gather                  │
+│  miss → C++ demand 按需 pread → 落池；跨层预测式预取          │
 ├──────────────────────────────────────────────────────────────┤
-│  C++ native 扩展 (nanobind + MLX Primitive)                     │
-│    统一池权威 · 后台并行 pread · 融合 MoE kernel · KV 量化       │
+│  C++ 原生扩展                                                 │
+│  统一池状态 · 后台并行 pread · 融合 MoE · KV 量化             │
 ├──────────────────────────────────────────────────────────────┤
-│  磁盘：per-expert blob（每专家一段连续字节，1 次 pread 取一个）  │
+│  磁盘：per-expert blob，每个专家对应一段连续字节               │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-几个关键设计：
+核心机制：
 
-- **零拷贝双源专家池**：每层内存里只保留一个小池 = 真实区（本轮路由命中）∪ 侧区（跨步持久 LFU 缓存）。命中直接用池内槽位做一次 GPU gather，专家字节全程只存一份，不做 host↔device 来回拷贝。
-- **C++ 统一池权威**：真实区槽状态、LFU 驱逐、按需 `pread`、预取全部下沉到 C++（`demand_dual`），主线程零落池工作，避免 per-layer 同步打断 MLX 流水线。
-- **MTP 自投机解码**：用 Qwen3-Next 自带的 MTP 头预测多个 token，主模型一次前向批量验证，接受则跳步。叠加置信度门控动态深度（低置信步少加载专家）与最小树 top-2 救回。
-- **KV 量化**：仅作用于 12 个全注意力层（线性注意力层的递归态不动），长上下文 KV 极致压缩。
+1. **零拷贝双源池**：每层仅维护真实区和跨步持久的 LFU 侧区，命中后直接按槽位执行 GPU gather。
+2. **C++ 统一池状态**：槽状态、驱逐、按需读取和预取均由原生扩展管理，降低 Python 主线程同步开销。
+3. **预测式跨层预取**：根据当前层路由结果预测后续层所需专家，在计算期间提前读取。
+4. **动态深度 MTP**：根据草稿置信度调整验证深度，减少低置信步骤中的无效专家加载。
+5. **KV 量化**：只压缩 12 个全注意力层的 KV，保持线性注意力层递归状态不变。
 
----
+## 技术栈
 
-## 目录结构
+| 类别 | 技术 | 用途 |
+| --- | --- | --- |
+| 运行时 | Python 3.11+ | CLI、模型装配、推理流程与工具 |
+| 推理框架 | MLX 0.31+、mlx-lm 0.31+ | Apple Silicon 统一内存推理 |
+| 数值计算 | NumPy 2.0+ | 数据准备与数值处理 |
+| 终端界面 | Textual 0.80+ | 全屏交互式 TUI |
+| 原生扩展 | C++、nanobind、MLX Primitive | 专家池、I/O、预取与融合计算 |
+| 构建工具 | uv、CMake、Make | 依赖管理与原生扩展构建 |
+| 测试 | pytest、pytest-asyncio | 单元测试、集成测试与正确性验证 |
 
-```
-mlx_streaming/
-├── cli.py               # vates 命令入口（默认进 TUI，MTP 快路径）
-├── config.py            # 所有环境变量默认值的单一真相源
-├── model_builder.py     # 装配层：流式加载主模型 + 挂专家池/预取/KV量化
-├── core/
-│   ├── cache/           # 专家池：resident_pool / virtual_pool / expert_store
-│   │                    #        blob_loader / KV 量化（quant_kv / kv_quant_patch）
-│   ├── moe/             # 流式 MoE 块、gate、融合计算、native kernel 封装
-│   ├── prefetch/        # 跨层预测式预取、native staging、后台预取
-│   ├── linear_attn/     # Qwen3-Next 门控 delta 多态线性注意力
-│   └── mem.py           # 内存度量 + 长会话内存防御（cache/wired 封顶）
-├── mtp/                 # MTP 自投机：drafter / generate / kv_cache / 裁决
-├── prep/                # 离线数据准备：拆专家、打 blob、抽 MTP 权重
-├── runtime/             # 各基准入口（环境变量驱动）
-├── tools/               # 分析探针：池容量曲线、逐层 profile、召回等
-├── tui/                 # Textual 全屏 TUI（opencode 风格）
-└── tests/               # 60 个测试文件
+## 快速开始
 
-native/
-├── ext/                 # 生产 C++ 扩展（nanobind + MLX）
-│   ├── pool/            #   demand / owned_pool / side_region（统一池权威）
-│   ├── io/              #   blob 直读 / 后台并行 pread / IO 计量
-│   ├── compute/         #   融合 MoE kernel
-│   └── prefetch/        #   预取
-└── bench/               # C++ 微基准
+### 环境要求
 
-docs/superpowers/        # 设计文档（spec）+ 实施计划（plan）
-benchmarks/reports/      # 每次优化的消融报告与 GO/NO-GO 裁决
-```
+- Apple Silicon Mac
+- Python 3.11 或更高版本
+- [uv](https://docs.astral.sh/uv/)
+- CMake、Make 与可用的 C++ 编译环境
+- 真实推理所需的模型文件和足够的本地磁盘空间
 
----
-
-## 安装
+### 安装
 
 ```bash
-# 0) 进项目根目录（后续所有命令都在这里跑；默认模型路径是相对路径）
-cd /path/to/vates/mlx-streaming-moe
+# 克隆仓库
+git clone https://github.com/AMOS144/Vates.git
+cd Vates
 
-# 1) 按锁文件安装依赖并创建虚拟环境（uv sync 会自动生成 .venv 并装 uv.lock 里验证过的版本）
+# 按 uv.lock 创建虚拟环境并安装依赖
 uv sync
 
-# 2) 激活虚拟环境（vates 命令依赖此步才在 PATH 上）
+# 激活虚拟环境
 source .venv/bin/activate
 
-# 3) 编译 native 扩展（生产快路径必需：统一池权威 / 融合 kernel / 并行 pread）
+# 编译生产快路径所需的原生扩展
 cd native/ext && make native_moe_ext && cd ../..
 ```
 
-依赖：Python ≥ 3.11、MLX ≥ 0.31、mlx-lm ≥ 0.31、textual ≥ 0.80；编译扩展需 `nanobind`（在 dev 依赖组）与 CMake。
+> [!TIP]
+> 推荐使用 `uv sync`，以复用仓库锁定的依赖版本，避免传递依赖升级后产生兼容性问题。
 
-> 用 `uv sync` 而非 `uv pip install -e .`：前者严格按 `uv.lock` 锁定版本，避免传递依赖（如 `transformers`）漂移到不兼容的新版导致加载失败。
+### 最简使用示例
 
-> 扩展未编译时会自动降级（关掉预取/统一池），但会明显变慢；生产使用请务必编译。
+无需准备模型即可启动演示界面：
 
-> **`vates: command not found`？** `vates` 是装进 `.venv/bin/` 的入口脚本，只有**激活 venv**（`source .venv/bin/activate`）后才在 PATH 上；没激活时用全路径 `.venv/bin/vates`。若 venv 是在别的目录名下创建后又移动/改名过，绝对路径会失效，用 `uv venv --clear && uv sync` 重建即可。
+```bash
+vates --demo
+```
 
----
+准备好模型与专家数据后，在项目根目录运行：
+
+```bash
+vates
+```
+
+> [!IMPORTANT]
+> 仓库不包含模型权重。真实推理前需要自行准备兼容的 Qwen3-Next-80B-A3B 4-bit MLX 主模型、专家数据和 MTP 权重；本项目当前未提供统一下载地址。
 
 ## 数据准备
 
-主模型（4-bit MLX）正常放 `models/`；专家权重需要离线拆成"每专家一段连续 blob"，这样运行时读一个专家 = 1 次 `pread`。
+默认文件位置：
+
+```text
+models/
+├── qwen3_next_80b_4bit/              # 4-bit MLX 主模型
+├── qwen3_next_experts_4bit_g64/      # 拆分后的专家文件或 blob
+└── qn_mtp_weights.safetensors        # MTP 权重
+```
+
+专家权重需要转换为每个专家对应一段连续字节的 blob，使运行时读取一个专家只需一次 `pread`：
 
 ```bash
-# 拆专家：把堆叠的 switch_mlp 权重拆成 per-expert 小文件
+# 将堆叠的 switch_mlp 权重拆分为 per-expert 文件
 .venv/bin/python -m mlx_streaming.prep.split_experts
 
-# 打 blob：per-expert 小文件 → 每层一个连续 blob 文件（+ blob_index.json）
+# 将 per-expert 文件打包为每层一个连续 blob，并生成 blob_index.json
 .venv/bin/python -m mlx_streaming.prep.pack_blob_from_experts
 
-# 抽 MTP 权重：从原版末分片抽取并整理成单文件
+# 从原始模型分片提取并整理 MTP 权重
 .venv/bin/python -m mlx_streaming.prep.extract_mtp
 ```
 
-字节布局由 `prep/blob_layout.py` 统一描述（v1 affine / v2 mxfp4），与运行时 `blob_loader` 完全一致。
+字节布局由 `mlx_streaming/prep/blob_layout.py` 统一定义，并与运行时 blob loader 保持一致。
 
----
+## 详细使用
 
-## 使用：交互式对话
+### 交互式对话
 
-在项目根目录、激活 venv 后，直接 `vates` 进入全屏 TUI（opencode 风格），默认走 MTP 自投机 + 零拷贝双源快路径：
+所有命令均应在项目根目录执行：
 
 ```bash
-cd /path/to/vates/mlx-streaming-moe   # 默认模型路径是相对路径，须在项目根目录运行
-source .venv/bin/activate             # 每开一个新终端都要先激活
+# 启动全屏 TUI
+vates
 
-vates                              # 进入交互式对话
-vates -k 4 -n 800 --stats          # 调宽投机 / 加长生成 / 打印吞吐
+# 调整 MTP 投机宽度、生成长度并输出统计信息
+vates -k 4 -n 800 --stats
+
+# 设置系统提示词
 vates --system "你是一个简洁的助手"
-vates --demo                       # 免模型秒开界面（验证 UI/流式/状态栏）
-vates chat --plain                 # 终端不兼容时用纯文本 REPL
+
+# 不加载模型，直接预览界面
+vates --demo
+
+# 终端不兼容时使用纯文本 REPL
+vates chat --plain
 ```
 
-未安装入口脚本时可用模块方式：`.venv/bin/python -m mlx_streaming.cli`。
+未激活虚拟环境时，也可以直接使用：
 
-交互：回车发送、`Esc` 中断当前生成、`Ctrl+C` 退出；斜杠命令 `/help`、`/reset`（清历史）、`/clear`（清屏）、`/exit`。状态栏实时显示 token 数 / tok·s / **内存占用（含峰值）**。
+```bash
+.venv/bin/vates --demo
+# 或以 Python 模块方式运行
+.venv/bin/python -m mlx_streaming.cli --demo
+```
+
+TUI 支持以下操作：
+
+| 操作 | 说明 |
+| --- | --- |
+| `Enter` | 发送消息 |
+| `Esc` | 中断当前生成 |
+| `Ctrl+C` | 退出程序 |
+| `/help` | 显示帮助 |
+| `/reset` | 清空对话历史 |
+| `/clear` | 清空屏幕 |
+| `/exit` | 退出程序 |
 
 ### 命令行参数
 
-| 参数 | 说明 | 默认 |
+| 参数 | 说明 | 默认值 |
 | --- | --- | --- |
-| `--model` | 主模型路径（4-bit MLX） | `models/qwen3_next_80b_4bit` |
-| `--expert-dir` | 拆分后的 per-expert / blob 目录 | `models/qwen3_next_experts_4bit_g64` |
+| `--model` | 4-bit MLX 主模型路径 | `models/qwen3_next_80b_4bit` |
+| `--expert-dir` | per-expert 文件或 blob 目录 | `models/qwen3_next_experts_4bit_g64` |
 | `--mtp-out` | MTP 权重文件 | `models/qn_mtp_weights.safetensors` |
-| `-k, --k` | MTP 投机宽度 | `3` |
-| `-n, --max-tokens` | 每轮最多生成 token 数 | `4096` |
-| `--expert-slots` | 常驻专家池容量（同时作侧区行数默认） | `32` |
-| `--spec-slots` | 侧区行数（默认跟随 `--expert-slots`） | 跟随 |
-| `--system` | 可选 system 提示词 | 无 |
-| `--stats` | 每轮打印 token 数 / tok·s / 接受长度 | 关 |
+| `--qn-config` | Qwen3-Next 配置文件 | `models/qwen3_next_80b_4bit/config.json` |
+| `-k`, `--k` | MTP 投机宽度 | `3` |
+| `-n`, `--max-tokens` | 每轮最多生成的新 token 数 | `4096` |
+| `--expert-slots` | 常驻专家池容量 | `32` |
+| `--spec-slots` | 侧区行数 | 跟随 `--expert-slots` |
+| `--system` | 系统提示词 | 无 |
+| `--stats` | 输出 token 数、吞吐与接受长度 | 关闭 |
+| `--plain` | 使用纯文本 REPL | 关闭 |
+| `--demo` | 使用模拟后端预览 TUI | 关闭 |
 
-### 生产快路径默认（`cli._FASTPATH_ENV`）
-
-`vates` 启动时用 `setdefault` 兜底以下经消融验证的最优组合（用户显式导出的环境变量优先级更高）：
-
-| 环境变量 | 作用 |
-| --- | --- |
-| `STREAM_BLOB_LOADER=1` | blob 直读接入池 miss-loader（低内存路径） |
-| `ZEROCOPY_DUAL_SOURCE=1` | 零拷贝双源专家池 |
-| `NATIVE_FUSED_PREFETCH=1` | native 预测式跨层预取 |
-| `SIDEREGION_LFU=1` | 侧区持久 LFU（单缓冲，省一半侧区内存） |
-| `KV_QUANT=1` | KV 极致压缩（K4/V3 + SO(4) 旋转） |
-| `MTP_ADAPTIVE_DEPTH=1` + `MTP_CONF_TAU=0.3` + `MTP_DEPTH_MAX=3` | 置信度门控动态深度 |
-
-启动时还会调用内存防御（`setup_memory_hygiene`）封顶 MLX 可回收缓冲（默认 1 GB），防长会话缓存膨胀。更多调优项见 `mlx_streaming/config.py`。
-
----
-
-## 基准测试
-
-各基准入口在 `mlx_streaming/runtime/`（环境变量驱动），例如生产配方端到端跑：
+使用以下命令查看当前版本的完整参数：
 
 ```bash
-STREAM_BLOB_LOADER=1 NATIVE_FUSED_PREFETCH=1 EXPERT_SLOTS=32 ZEROCOPY_DUAL_SOURCE=1 \
-  SIDEREGION_LFU=1 POOL_SPEC_SLOTS=32 K=3 \
-  .venv/bin/python -m mlx_streaming.runtime.run_mtp_spec
+vates chat --help
 ```
 
-`benchmarks/` 下有各专项消融脚本，`benchmarks/reports/` 存放每次优化的报告与裁决。
+## 配置说明
 
----
+CLI 会使用 `setdefault` 设置经基准验证的生产快路径，因此用户显式设置的环境变量具有更高优先级。
 
-## 研发历程与关键成果
+| 环境变量 | 默认生产值 | 作用 |
+| --- | --- | --- |
+| `STREAM_BLOB_LOADER` | `1` | 使用 blob 直读处理专家池 miss |
+| `ZEROCOPY_DUAL_SOURCE` | `1` | 启用零拷贝双源专家池 |
+| `NATIVE_FUSED_PREFETCH` | `1` | 启用原生预测式跨层预取 |
+| `SIDEREGION_LFU` | `1` | 启用持久 LFU 侧区缓存 |
+| `KV_QUANT` | `1` | 启用 K4/V3 KV 量化与 SO(4) 旋转 |
+| `MTP_ADAPTIVE_DEPTH` | `1` | 启用置信度门控动态深度 |
+| `MTP_CONF_TAU` | `0.3` | 动态深度置信度阈值 |
+| `MTP_DEPTH_MAX` | `3` | 动态深度上限 |
 
-这个项目是一系列"先量化瓶颈、再改、再用消融和字节真值校验裁决 GO/NO-GO"的迭代。以下是主要里程碑（数字均来自 `benchmarks/reports/`）：
+示例：
 
-### 1. 流式专家池基座
+```bash
+# 显式覆盖常驻池和侧区容量
+EXPERT_SLOTS=32 POOL_SPEC_SLOTS=16 vates --stats
+```
 
-- **侧区持久 LFU 二级缓存**：把侧区从"每步全清的一次性预取"改成跨步 LFU 持久缓存，命中率 0.76 → **0.81**，tok/s **+8~12%**；`spec_slots=8` 时可再省 **~1.9 GB** 内存。
-- **预取 width/budget 扫描**：量化 recall ↔ hit ↔ tok/s 的权衡曲线，为专家池容量下限提供数据支撑。
+更多实验性开关及默认值以 `mlx_streaming/config.py` 为准。
 
-### 2. 瓶颈定位与 C++ 统一池权威
+> [!WARNING]
+> `EXPERT_SLOTS` 会影响内存、速度和正确性。当前 K=3、top-k=10 的生产路径将 `32` 作为经过验证的容量下限；修改后应重新执行容量不变性和字节真值校验。
 
-- **VirtualPool Phase 0 探针**：证实主瓶颈是 **per-layer 同步 + 主线程落池**（消除后理论上界 +174%~+387%），而非物理 I/O。
-- **demand_dual 异步版**：C++ worker 线程并行 `pread`，cap=32 **+5.9%**、cap=64 **+38.7%**。
-- **C++ 统一池权威（Phase 4）**：真实区 + 侧区 + demand + prefetch 全部收进 C++，主线程零落池工作 → tok/s **+8.0%**（13.70 → 14.80），侧区内存**减半**（双缓冲→单缓冲）。随后彻底退役 Python decode 权威路径（净删 ~316 行，tok/s 无回归）。
+## 项目结构
 
-### 3. 正确性工程体系
+```text
+.
+├── mlx_streaming/
+│   ├── cli.py                 # vates 命令入口
+│   ├── config.py              # 环境变量与默认值
+│   ├── model_builder.py       # 流式模型装配
+│   ├── core/
+│   │   ├── cache/             # 专家池、blob loader 与 KV 量化
+│   │   ├── moe/               # 流式 MoE、gate 与融合计算
+│   │   ├── prefetch/          # 跨层预测与后台预取
+│   │   └── linear_attn/       # Qwen3-Next 线性注意力
+│   ├── mtp/                   # MTP 草稿、验证与 KV 复用
+│   ├── prep/                  # 专家拆分、blob 打包与权重提取
+│   ├── runtime/               # 基准与运行入口
+│   ├── tools/                 # 分析和诊断工具
+│   ├── tui/                   # Textual 全屏界面
+│   └── tests/                 # Python 测试
+├── native/
+│   ├── ext/                   # 生产 C++/nanobind 扩展
+│   └── bench/                 # 原生微基准
+├── benchmarks/
+│   └── reports/               # 消融实验与性能报告
+├── docs/
+│   └── superpowers/           # 设计规范与实施计划
+├── pyproject.toml             # 项目元数据和依赖
+└── uv.lock                    # 锁定的依赖版本
+```
 
-- **容量不变性 oracle**：同 prompt、greedy，换 `cap` 输出必须逐字节一致；坐实错槽类 bug。
-- **字节真值校验**：`DUAL_VERIFY` / `STG_VERIFY` 以"0 BAD"为硬验收线。
-- **并集实测定 cap 下限**：单前向单层最大专家并集 **U_max=30**（=K3×top_k10），故 `EXPERT_SLOTS=32` 是正确性下限（仅 2 槽裕度）。
-- **错槽修复链**：侧区 Route 1（稳定缓冲 + scatter 发布）→ Route 3（C++ 拥有池 buffer 直写，修复 Route 1 引入的 **15× 性能回归**：0.89 → 13.22 tok/s）→ `demand_dual` 修 `contiguous(inds)`（修复 seq≥2 按连续内存读非连续 `inds` 导致装错专家的隐蔽回归）。
+## 性能与关键成果
 
-### 4. MTP 投机解码提速
+以下数据来自仓库中的消融报告。不同结果来自独立实验，**不能直接相加**；实际性能取决于设备、模型文件、上下文和配置。
 
-- **最小树 top-2 救回（`TREE_TOP2`）**：串行第二次 1×K 前向、不放大专家并集，修 bug 后 **+10.8% tok/s，逐字节无损**。
-- **置信度门控动态深度（`MTP_ADAPTIVE_DEPTH`）**：低置信步向下收缩草稿深度、少加载专家，**+5~6% tok/s，逐字节无损** → 设为默认。
-- **峰值内存优化**：批量验证路径跳过无用的 cache 快照（每步 72 MiB 深拷贝），峰值 **−0.2 GB**，零速度代价。
+| 项目 | 结果 |
+| --- | --- |
+| 运行内存 | 4-bit 全量约 41 GB；流式生产配置峰值约 8 GB |
+| 生成速度 | 生产快路径约 13–15 tok/s |
+| KV 占用 | 128k 上下文由约 3.0 GiB 降至约 0.68 GiB |
+| 持久 LFU | 命中率由 0.76 提升至约 0.81，实测吞吐提升约 8%–12% |
+| C++ 统一池 | 13.70 → 14.80 tok/s，侧区由双缓冲改为单缓冲 |
+| MTP top-2 救回 | 逐字节无损条件下吞吐提升约 10.8% |
+| 动态深度 MTP | 逐字节无损条件下吞吐提升约 5%–6% |
+| 峰值优化 | 避免无用 KV 快照，峰值内存降低约 0.2 GB |
 
-### 5. 已探索但否决的方向（诚实存档）
+正确性验证包括：
 
-- **完整树形验证（多路径 batch）**：并集放大致 cap 溢出，cap=32 时 tok/s 仅 **0.46×** 且有损 → **NO-GO**。
-- **事件门控异步 demand**：机制正确性成立（spike 0/200），但端到端零加速——真瓶颈是 **~17s 的 miss 磁盘 I/O**，非 per-layer 同步 → 实现回滚。
-- **滑动窗口专家池**：想靠"只常驻 N 层、其余按需搬运"进一步省内存，实测 SSD 只有 ~25% 空闲带宽、无可利用"气泡"，重载量超预算 11–22× → **NO-GO**。
-- **逐层容量 profile（`pool_profile.json`）**：当年 cap=256 时代的省内存工具；实测当前每层真实工作集 122–339（均值 192）远超 cap=32，无"用不满"的层可回收，在 cap=32 下是 no-op → 不启用。
+- 同一提示词在不同池容量下输出逐字节一致；
+- `DUAL_VERIFY` 与 `STG_VERIFY` 以 `0 BAD` 为验收条件；
+- 单次前向单层最大专家并集实测为 30，因此生产配置使用 32 个槽；
+- Python 与原生路径均有测试覆盖。
 
-> 各优化收益为独立测得、非严格可加；且部分互斥（如动态深度与 pos0 救回不能叠加，`−5.34%`），生产路径需按场景取舍。
+完整实验记录位于 [`benchmarks/reports/`](benchmarks/reports/)。
 
----
+已经验证但未纳入生产路径的方向包括完整树形验证、事件门控异步 demand、滑动窗口专家池和逐层容量回收。相关实现或实验因吞吐回归、I/O 预算不足或当前配置无收益而被否决，详情请参阅基准报告。
 
 ## 测试
 
+安装开发依赖后运行完整 Python 测试集：
+
 ```bash
-.venv/bin/python -m pytest        # 60 个测试文件，覆盖池/双源/MTP/KV量化/TUI 等
+.venv/bin/python -m pytest
 ```
 
-C++ 侧关键路径另有 native 单测（如 `io_meter`、`demand_dual` 布线）与字节真值校验。
+仓库当前包含 60 个测试文件，覆盖专家池、双源缓存、blob 布局、MTP、KV 量化、TUI 和配置等模块。性能路径还使用原生测试、容量不变性与逐字节真值校验。
+
+## 常见问题 FAQ
+
+<details>
+<summary><strong>为什么只支持 Apple Silicon？</strong></summary>
+
+项目基于 MLX，并依赖 Apple Silicon 的统一内存架构及 MLX 原生能力。当前没有 CUDA、ROCm 或 CPU-only 后端。
+
+</details>
+
+<details>
+<summary><strong>为什么提示 <code>vates: command not found</code>？</strong></summary>
+
+`vates` 安装在 `.venv/bin/` 中。请先运行 `source .venv/bin/activate`，或直接执行 `.venv/bin/vates`。如果虚拟环境创建后被移动或重命名，请使用 `uv venv --clear && uv sync` 重建。
+
+</details>
+
+<details>
+<summary><strong>不编译 native 扩展可以运行吗？</strong></summary>
+
+可以降级运行，但预测式预取、统一池等生产快路径会被关闭，速度会明显下降。正式推理建议执行 `cd native/ext && make native_moe_ext && cd ../..`。
+
+</details>
+
+<details>
+<summary><strong>为什么推荐使用 <code>uv sync</code>？</strong></summary>
+
+`uv sync` 会按 `uv.lock` 安装经过验证的依赖组合，避免 `transformers` 等传递依赖漂移到不兼容版本。
+
+</details>
+
+<details>
+<summary><strong>模型文件应该放在哪里？</strong></summary>
+
+默认路径位于仓库根目录的 `models/`。也可以通过 `--model`、`--expert-dir`、`--mtp-out` 和 `--qn-config` 指定其他位置。
+
+</details>
+
+<details>
+<summary><strong>如何在没有模型的情况下检查界面？</strong></summary>
+
+运行 `vates --demo`。该模式使用模拟后端，不读取模型文件，可用于检查 TUI、流式显示和状态栏。
+
+</details>
+
+## 开发与贡献
+
+欢迎提交 Issue 和 Pull Request。
+
+1. 在开始较大改动前，建议先创建 Issue，说明问题、目标和预期方案。
+2. 从 `main` 创建独立分支，避免在一个 PR 中混入无关改动。
+3. 保持改动聚焦，并为行为变化补充或更新测试。
+4. 提交前运行 `.venv/bin/python -m pytest`。
+5. PR 描述应包含改动背景、实现方式、验证结果和潜在影响。
+6. 性能优化应附可复现的基准命令、对照数据和正确性验证结果。
+7. Bug 报告请提供设备型号、macOS 版本、Python 版本、复现命令和完整错误信息。
+
+> [!NOTE]
+> 仓库当前没有独立的 `CONTRIBUTING.md`、Issue 模板或 PR 模板；相关规范可在后续补充。
+
+## License
+
+**【待补充】** 仓库当前未提供许可证文件。在许可证明确之前，请勿假定代码可按特定开源协议使用、修改或再分发。
+
+## 作者与联系方式
+
+- 作者：[AMOS144](https://github.com/AMOS144)
+- 仓库：[github.com/AMOS144/Vates](https://github.com/AMOS144/Vates)
+- Issue：[github.com/AMOS144/Vates/issues](https://github.com/AMOS144/Vates/issues)
+- 其他联系方式：**【待补充】**
 
 ---
 
-## 设计理念
-
-- **测量优先**：每个优化先做探针量化瓶颈上界，再决定要不要做。
-- **字节不变量为准**：性能优化一律以逐字节无损 / 容量不变性为验收线，不接受"看起来差不多"。
-- **诚实存档**：否决的方向连同数字一起记进 `benchmarks/reports/`，避免重复踩坑。
+如果 vates 对你有帮助，欢迎 Star 项目并通过 Issue 分享使用反馈。
