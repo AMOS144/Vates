@@ -13,6 +13,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat&logo=python&logoColor=white)](https://www.python.org/)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-Required-000000?style=flat&logo=apple&logoColor=white)](https://support.apple.com/guide/mac-help/about-this-mac-system-report-mchlp1176/mac)
 [![MLX](https://img.shields.io/badge/MLX-0.31%2B-8A2BE2?style=flat)](https://github.com/ml-explore/mlx)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 [演示](#演示) · [快速开始](#快速开始) · [详细使用](#详细使用) · [常见问题](#常见问题-faq) · [参与贡献](#开发与贡献)
 
@@ -363,7 +364,7 @@ EXPERT_SLOTS=32 POOL_SPEC_SLOTS=16 vates --stats
 
 ## 开发与贡献
 
-欢迎提交 Issue 和 Pull Request。
+欢迎提交 Issue 和 Pull Request。开始前请阅读 [贡献指南](CONTRIBUTING.md)和[行为准则](CODE_OF_CONDUCT.md)。
 
 1. 在开始较大改动前，建议先创建 Issue，说明问题、目标和预期方案。
 2. 从 `main` 创建独立分支，避免在一个 PR 中混入无关改动。
@@ -373,19 +374,18 @@ EXPERT_SLOTS=32 POOL_SPEC_SLOTS=16 vates --stats
 6. 性能优化应附可复现的基准命令、对照数据和正确性验证结果。
 7. Bug 报告请提供设备型号、macOS 版本、Python 版本、复现命令和完整错误信息。
 
-> [!NOTE]
-> 仓库当前没有独立的 `CONTRIBUTING.md`、Issue 模板或 PR 模板；相关规范可在后续补充。
-
 ## License
 
-**【待补充】** 仓库当前未提供许可证文件。在许可证明确之前，请勿假定代码可按特定开源协议使用、修改或再分发。
+本项目采用 [Apache License 2.0](LICENSE)。
+
+Copyright 2026 AMOS144
 
 ## 作者与联系方式
 
 - 作者：[AMOS144](https://github.com/AMOS144)
 - 仓库：[github.com/AMOS144/Vates](https://github.com/AMOS144/Vates)
 - Issue：[github.com/AMOS144/Vates/issues](https://github.com/AMOS144/Vates/issues)
-- 其他联系方式：**【待补充】**
+- 邮箱：[3108424075@qq.com](mailto:3108424075@qq.com)
 
 ---
 

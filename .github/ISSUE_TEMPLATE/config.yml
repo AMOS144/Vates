@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 私密联系
+    url: https://github.com/AMOS144/Vates#作者与联系方式
+    about: 查看项目邮箱，用于报告不适合公开讨论的社区行为问题；请勿通过邮件提交普通 Bug。
