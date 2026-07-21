@@ -2,9 +2,11 @@
 
 # vates
 
-**在 Apple Silicon 上用约 8 GB 运行内存运行 80B MoE 模型**
+**English** | [简体中文](README.zh-CN.md)
 
-面向 MLX 的显存外置流式 MoE 推理引擎，集成 Qwen3-Next MTP 自投机解码。
+**Run an 80B MoE model on Apple Silicon with about an 8.3 GiB MLX in-flight tensor-allocation high-water mark**
+
+An out-of-core streaming MoE inference engine for MLX, with Qwen3-Next MTP self-speculative decoding.
 
 [![GitHub Stars](https://img.shields.io/github/stars/AMOS144/Vates?style=flat&logo=github&label=Stars)](https://github.com/AMOS144/Vates/stargazers)
 [![GitHub Forks](https://img.shields.io/github/forks/AMOS144/Vates?style=flat&logo=github&label=Forks)](https://github.com/AMOS144/Vates/forks)
@@ -15,378 +17,419 @@
 [![MLX](https://img.shields.io/badge/MLX-0.31%2B-8A2BE2?style=flat)](https://github.com/ml-explore/mlx)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-[演示](#演示) · [快速开始](#快速开始) · [详细使用](#详细使用) · [常见问题](#常见问题-faq) · [参与贡献](#开发与贡献)
+[Demo](#demo) · [Quick Start](#quick-start) · [Usage](#usage) · [FAQ](#faq) · [Contributing](#contributing)
 
 </div>
 
 ---
 
-## 项目简介
+## Overview
 
-大型混合专家模型（Mixture of Experts，MoE）的完整权重通常远大于 Mac 的可用统一内存。vates 将绝大部分专家权重保留在磁盘，仅在运行时按需加载并预测式预取当前需要的专家，从而显著降低常驻内存。
+The complete weights of a large Mixture-of-Experts (MoE) model often exceed the unified memory available on a Mac. vates keeps most expert weights on disk, loading them on demand and predictively prefetching the experts needed at runtime. This substantially reduces the model's resident memory requirement.
 
-项目面向 **Qwen3-Next-80B-A3B 4-bit MLX**：512 个专家、每个 token 激活 10 个专家、48 个 MoE 层和 12 个全注意力层。配合模型自带的 MTP 头，vates 通过自投机解码进一步提高生成吞吐。
+vates targets **Qwen3-Next-80B-A3B 4-bit MLX**, which has 48 MoE transformer layers. Of those layers, 12 use full attention and the remaining 36 use linear attention. Each layer selects 10 routed experts from 512 and also uses a resident shared expert. vates uses the model's built-in MTP head for self-speculative decoding to improve generation throughput.
 
 > [!NOTE]
-> 原始 4-bit 模型权重约为 41 GB，项目实测生产配置的运行内存峰值约为 8 GB。请确保设备有高于运行峰值的可用统一内存和充足的本地磁盘空间；实际占用与速度会受到硬件、上下文长度、模型文件和配置影响。
+> The 4-bit main-model weights occupy approximately 41 GB on disk. The approximately 8.23–8.27 GiB figure comes from MLX `get_peak_memory` results in the repository's benchmark reports and measures the in-flight tensor-allocation high-water mark for the reported configuration. It is not process RSS, total system memory use, or evidence that a machine with only that much unified memory has sufficient capacity. The end-to-end configuration was tested on a MacBook Pro with an Apple M5 (10-core CPU), 32 GB of physical unified memory, and a 1 TB internal Apple SSD. The system requires additional memory headroom for macOS and non-MLX allocations. Actual memory use and speed depend on hardware, context length, model files, and configuration. The repository does not include the main model, expert data, or MTP weights, and there is no single download location for all three.
 
-## 演示
+## Demo
 
-点击下方封面播放演示视频：
+Click the image below to play the demo:
 
-[![vates 演示](https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo-poster.png)](https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo.mp4)
+[![vates demo](https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo-poster.png)](https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo.mp4)
 
-## 功能亮点
+## Features
 
-- **低内存推理**：专家权重按需从磁盘流式读取，内存中仅保留小型常驻池与 LFU 侧区缓存。
-- **MTP 自投机解码**：使用 Qwen3-Next 自带的 MTP 头生成草稿，由主模型批量验证并接受或回退。
-- **零拷贝双源专家池**：真实区与侧区共享统一池，减少 Host 与 Device 之间的重复搬运。
-- **原生高性能路径**：C++ 扩展负责并行 `pread`、池状态管理、预测式预取与融合 MoE 计算。
-- **长上下文优化**：IsoQuant K4/V3 与 SO(4) 块旋转将 128k 上下文 KV 从约 3.0 GiB 压缩至约 0.68 GiB。
-- **正确性保障**：通过容量不变性、逐字节真值校验及完整测试集约束性能优化。
-- **交互式终端**：提供 Textual 全屏 TUI、纯文本 REPL、流式输出、吞吐与内存状态显示。
+- **Low-memory inference:** streams expert weights from disk on demand while retaining only a small resident pool and an LFU side-region cache.
+- **MTP self-speculative decoding:** drafts tokens with Qwen3-Next's built-in MTP head, then batch-verifies them with the main model and either accepts or falls back.
+- **Zero-copy dual-source expert pool:** the capacity and side regions share one expert pool, with no pool-to-pool copy when selecting between those regions. Disk reads still copy expert bytes into the pool.
+- **Native benchmark-validated path:** a C++ extension handles parallel `pread`, pool-state management, predictive prefetching, and fused MoE computation.
+- **Long-context optimization:** IsoQuant K4/V3 with SO(4) block rotations reduces KV storage for a 128k context from approximately 3.0 GiB to approximately 0.68 GiB.
+- **Correctness checks:** runs capacity-invariance tests, byte-level pool-oracle checks, and the full test suite for the configurations covered by the repository's reports.
+- **Interactive terminal:** includes a full-screen Textual TUI, a plain-text REPL, streaming output, and throughput and memory status.
 
-## 工作原理
+## Architecture and data flow
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
 │  vates TUI / CLI                                             │
 ├──────────────────────────────────────────────────────────────┤
-│  MTP 自投机解码                                               │
-│  drafter 草稿 → 主模型批量验证 → 接受或回退                   │
+│  MTP self-speculative decoding                               │
+│  drafter → main-model batch verification → accept/fallback   │
 ├──────────────────────────────────────────────────────────────┤
-│  流式 MoE 专家池                                              │
-│  真实区（cap）∪ 侧区（LFU）→ 单次 GPU gather                  │
-│  miss → C++ demand 按需 pread → 落池；跨层预测式预取          │
+│  Streaming MoE expert pool                                   │
+│  capacity region ∪ LFU side region → one GPU gather          │
+│  miss → C++ on-demand pread → pool; cross-layer prefetch     │
 ├──────────────────────────────────────────────────────────────┤
-│  C++ 原生扩展                                                 │
-│  统一池状态 · 后台并行 pread · 融合 MoE · KV 量化             │
+│  Native C++ extension                                        │
+│  unified pool state · parallel pread · fused MoE · KV quant  │
 ├──────────────────────────────────────────────────────────────┤
-│  磁盘：per-expert blob，每个专家对应一段连续字节               │
+│  Disk: per-expert blobs, one contiguous byte range each      │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-核心机制：
+Core mechanisms:
 
-1. **零拷贝双源池**：每层仅维护真实区和跨步持久的 LFU 侧区，命中后直接按槽位执行 GPU gather。
-2. **C++ 统一池状态**：槽状态、驱逐、按需读取和预取均由原生扩展管理，降低 Python 主线程同步开销。
-3. **预测式跨层预取**：根据当前层路由结果预测后续层所需专家，在计算期间提前读取。
-4. **动态深度 MTP**：根据草稿置信度调整验证深度，减少低置信步骤中的无效专家加载。
-5. **KV 量化**：只压缩 12 个全注意力层的 KV，保持线性注意力层递归状态不变。
+1. **Zero-copy dual-source pool:** each layer maintains a capacity region and a persistent LFU side region inside one unified expert pool. Selecting experts from either region requires no pool-to-pool copy; loading a miss from SSD into the pool is still a data transfer.
+2. **Unified C++ pool state:** the native extension owns slot state, eviction, demand reads, and prefetching, reducing synchronization work on the Python main thread.
+3. **Predictive cross-layer prefetching:** routing results from the current layer predict experts needed by later layers, allowing reads to overlap computation.
+4. **Adaptive-depth MTP:** draft confidence controls verification depth, avoiding unnecessary expert loads during low-confidence steps.
+5. **KV quantization:** only the 12 full-attention layers have their KV caches compressed; recurrent state in the linear-attention layers remains unchanged.
 
-## 技术栈
+## Tech stack
 
-| 类别 | 技术 | 用途 |
+| Category | Technology | Role |
 | --- | --- | --- |
-| 运行时 | Python 3.11+ | CLI、模型装配、推理流程与工具 |
-| 推理框架 | MLX 0.31+、mlx-lm 0.31+ | Apple Silicon 统一内存推理 |
-| 数值计算 | NumPy 2.0+ | 数据准备与数值处理 |
-| 终端界面 | Textual 0.80+ | 全屏交互式 TUI |
-| 原生扩展 | C++、nanobind、MLX Primitive | 专家池、I/O、预取与融合计算 |
-| 构建工具 | uv、CMake、Make | 依赖管理与原生扩展构建 |
-| 测试 | pytest、pytest-asyncio | 单元测试、集成测试与正确性验证 |
+| Runtime | Python 3.11+ | CLI, model assembly, inference flow, and tooling |
+| Inference | MLX 0.31+, mlx-lm 0.31+ | Unified-memory inference on Apple Silicon |
+| Numerical computing | NumPy 2.0+ | Data preparation and numerical processing |
+| Terminal UI | Textual 0.80+ | Full-screen interactive TUI |
+| Native extension | C++, nanobind, MLX Primitive | Expert pool, I/O, prefetching, and fused computation |
+| Build tools | uv, CMake, Make | Dependency management and native builds |
+| Testing | pytest, pytest-asyncio | Unit, integration, and correctness testing |
 
-## 快速开始
+## Quick Start
 
-### 环境要求
+### Requirements
 
-- Apple Silicon Mac
-- Python 3.11 或更高版本
+- An Apple Silicon Mac
+- Python 3.11 or newer
 - [uv](https://docs.astral.sh/uv/)
-- CMake、Make 与可用的 C++ 编译环境
-- 真实推理所需的模型文件和足够的本地磁盘空间
+- CMake, Make, and a working C++ build environment
+- Model files and sufficient local disk space for real inference
+- Sufficient unified-memory headroom beyond the MLX allocation high-water mark
 
-### 安装
+### Installation and native build
+
+Clone the repository:
 
 ```bash
-# 克隆仓库
 git clone https://github.com/AMOS144/Vates.git
 cd Vates
+```
 
-# 按 uv.lock 创建虚拟环境并安装依赖
+Create the virtual environment and install the dependencies pinned by `uv.lock`:
+
+```bash
 uv sync
-
-# 激活虚拟环境
 source .venv/bin/activate
+```
 
-# 编译生产快路径所需的原生扩展
-cd native/ext && make native_moe_ext && cd ../..
+Build the native extension used by the benchmark-validated path. The Makefile's default `PY_SITE` is version-specific, so derive the active virtual environment's `purelib` path and override it:
+
+```bash
+PY_SITE="$("./.venv/bin/python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+make -C native/ext PY_SITE="$PY_SITE" native_moe_ext
 ```
 
 > [!TIP]
-> 推荐使用 `uv sync`，以复用仓库锁定的依赖版本，避免传递依赖升级后产生兼容性问题。
+> Use `uv sync` to reproduce the repository's locked dependency set and avoid incompatibilities introduced by transitive dependency upgrades.
 
-### 最简使用示例
+### Minimal examples
 
-无需准备模型即可启动演示界面：
+Preview the interface without preparing a model:
 
 ```bash
 vates --demo
 ```
 
-准备好模型与专家数据后，在项目根目录运行：
+After preparing the model and expert data, run this from the repository root:
 
 ```bash
 vates
 ```
 
-> [!IMPORTANT]
-> 仓库不包含模型权重。真实推理前需要自行准备兼容的 Qwen3-Next-80B-A3B 4-bit MLX 主模型、专家数据和 MTP 权重；本项目当前未提供统一下载地址。
+## Data preparation
 
-## 数据准备
-
-默认文件位置：
+The example below uses separate directories for intermediate per-expert files and the final runtime blobs:
 
 ```text
 models/
-├── qwen3_next_80b_4bit/              # 4-bit MLX 主模型
-├── qwen3_next_experts_4bit_g64/      # 拆分后的专家文件或 blob
-└── qn_mtp_weights.safetensors        # MTP 权重
+├── qwen3_next_80b_4bit/                  # 4-bit MLX main model
+├── qwen3_next_expert_files_4bit_g64/     # Intermediate per-expert files
+├── qwen3_next_experts_4bit_g64/          # CLI default expert directory
+│   └── blobs/                            # Final runtime blobs
+└── qn_mtp_weights.safetensors            # MTP weights
 ```
 
-专家权重需要转换为每个专家对应一段连续字节的 blob，使运行时读取一个专家只需一次 `pread`：
+Expert weights must be converted into blobs where each expert occupies one contiguous byte range, allowing a runtime expert read to use a single `pread`.
+
+Split the stacked `switch_mlp` weights from the main model into the intermediate per-expert directory:
 
 ```bash
-# 将堆叠的 switch_mlp 权重拆分为 per-expert 文件
-.venv/bin/python -m mlx_streaming.prep.split_experts
+.venv/bin/python -m mlx_streaming.prep.split_experts \
+  models/qwen3_next_80b_4bit \
+  models/qwen3_next_expert_files_4bit_g64
+```
 
-# 将 per-expert 文件打包为每层一个连续 blob，并生成 blob_index.json
-.venv/bin/python -m mlx_streaming.prep.pack_blob_from_experts
+Pack those files into one contiguous blob per layer under the CLI's default expert directory, and generate `blob_index.json`. With the default `--expert-dir models/qwen3_next_experts_4bit_g64`, `model_builder.py` resolves runtime blobs from its `blobs/` subdirectory:
 
-# 从原始模型分片提取并整理 MTP 权重
+```bash
+EXPERT_DIR=models/qwen3_next_expert_files_4bit_g64 \
+BLOB_DIR=models/qwen3_next_experts_4bit_g64/blobs \
+BITS=4 GROUP=64 LAYERS=all \
+  .venv/bin/python -m mlx_streaming.prep.pack_blob_from_experts
+```
+
+Extract and organize MTP weights. This command downloads the original `model-00041-of-00041.safetensors` shard, approximately 3.30 GB (3.07 GiB), and writes the default `models/qn_mtp_weights.safetensors` output:
+
+```bash
 .venv/bin/python -m mlx_streaming.prep.extract_mtp
 ```
 
-字节布局由 `mlx_streaming/prep/blob_layout.py` 统一定义，并与运行时 blob loader 保持一致。
+`mlx_streaming/prep/blob_layout.py` is the single definition of the byte layout and stays aligned with the runtime blob loader.
 
-## 详细使用
+> [!WARNING]
+> Data preparation needs substantially more disk space than the approximately 41 GB main-model directory alone. The split files and final blobs coexist during packing, and the MTP source shard adds approximately 3.30 GB (3.07 GiB). After validating `models/qwen3_next_experts_4bit_g64/blobs` and its `blob_index.json`, you may delete the intermediate `models/qwen3_next_expert_files_4bit_g64` directory. The 41 GB figure describes only the main-model weights, not peak preparation storage.
 
-### 交互式对话
+## Usage
 
-所有命令均应在项目根目录执行：
+### Interactive chat
+
+Run all commands from the repository root.
+
+Start the full-screen TUI:
 
 ```bash
-# 启动全屏 TUI
 vates
+```
 
-# 调整 MTP 投机宽度、生成长度并输出统计信息
+Set the MTP speculative width and generation length, and print statistics:
+
+```bash
 vates -k 4 -n 800 --stats
+```
 
-# 设置系统提示词
-vates --system "你是一个简洁的助手"
+Set a system prompt:
 
-# 不加载模型，直接预览界面
+```bash
+vates --system "You are a concise assistant."
+```
+
+Preview the interface without loading a model:
+
+```bash
 vates --demo
+```
 
-# 终端不兼容时使用纯文本 REPL
+Use the plain-text REPL when the terminal is incompatible with the TUI:
+
+```bash
 vates chat --plain
 ```
 
-未激活虚拟环境时，也可以直接使用：
+Without activating the virtual environment, run either:
 
 ```bash
 .venv/bin/vates --demo
-# 或以 Python 模块方式运行
 .venv/bin/python -m mlx_streaming.cli --demo
 ```
 
-TUI 支持以下操作：
+TUI controls:
 
-| 操作 | 说明 |
+| Input | Action |
 | --- | --- |
-| `Enter` | 发送消息 |
-| `Esc` | 中断当前生成 |
-| `Ctrl+C` | 退出程序 |
-| `/help` | 显示帮助 |
-| `/reset` | 清空对话历史 |
-| `/clear` | 清空屏幕 |
-| `/exit` | 退出程序 |
+| `Enter` | Send the message |
+| `Esc` | Interrupt the current generation |
+| `Ctrl+C` | Exit |
+| `/help` | Show help |
+| `/reset` | Clear conversation history |
+| `/clear` | Clear the screen |
+| `/exit` | Exit |
 
-### 命令行参数
+### CLI options
 
-| 参数 | 说明 | 默认值 |
+| Option | Description | Default |
 | --- | --- | --- |
-| `--model` | 4-bit MLX 主模型路径 | `models/qwen3_next_80b_4bit` |
-| `--expert-dir` | per-expert 文件或 blob 目录 | `models/qwen3_next_experts_4bit_g64` |
-| `--mtp-out` | MTP 权重文件 | `models/qn_mtp_weights.safetensors` |
-| `--qn-config` | Qwen3-Next 配置文件 | `models/qwen3_next_80b_4bit/config.json` |
-| `-k`, `--k` | MTP 投机宽度 | `3` |
-| `-n`, `--max-tokens` | 每轮最多生成的新 token 数 | `4096` |
-| `--expert-slots` | 常驻专家池容量 | `32` |
-| `--spec-slots` | 侧区行数 | 跟随 `--expert-slots` |
-| `--system` | 系统提示词 | 无 |
-| `--stats` | 输出 token 数、吞吐与接受长度 | 关闭 |
-| `--plain` | 使用纯文本 REPL | 关闭 |
-| `--demo` | 使用模拟后端预览 TUI | 关闭 |
+| `--model` | Path to the 4-bit MLX main model | `models/qwen3_next_80b_4bit` |
+| `--expert-dir` | Expert root directory; blobs are read from its `blobs/` subdirectory by default. If specifying the blob directory directly, set `BLOB_DIR` | `models/qwen3_next_experts_4bit_g64` |
+| `--mtp-out` | MTP weights file | `models/qn_mtp_weights.safetensors` |
+| `--qn-config` | Qwen3-Next configuration file | `models/qwen3_next_80b_4bit/config.json` |
+| `-k`, `--k` | MTP speculative width | `3` |
+| `-n`, `--max-tokens` | Maximum new tokens per turn | `4096` |
+| `--expert-slots` | Resident expert-pool capacity | `32` |
+| `--spec-slots` | Number of side-region rows | Same as `--expert-slots` |
+| `--system` | System prompt | None |
+| `--stats` | Print token count, throughput, and accepted length | Off |
+| `--plain` | Use the plain-text REPL | Off |
+| `--demo` | Preview the TUI with a mock backend | Off |
 
-使用以下命令查看当前版本的完整参数：
+View the complete option set for the installed version:
 
 ```bash
 vates chat --help
 ```
 
-## 配置说明
+## Configuration
 
-CLI 会使用 `setdefault` 设置经基准验证的生产快路径，因此用户显式设置的环境变量具有更高优先级。
+The CLI uses `setdefault` to select the benchmark-validated configuration. Explicitly defined environment variables therefore take precedence.
 
-| 环境变量 | 默认生产值 | 作用 |
+| Environment variable | Production default | Purpose |
 | --- | --- | --- |
-| `STREAM_BLOB_LOADER` | `1` | 使用 blob 直读处理专家池 miss |
-| `ZEROCOPY_DUAL_SOURCE` | `1` | 启用零拷贝双源专家池 |
-| `NATIVE_FUSED_PREFETCH` | `1` | 启用原生预测式跨层预取 |
-| `SIDEREGION_LFU` | `1` | 启用持久 LFU 侧区缓存 |
-| `KV_QUANT` | `1` | 启用 K4/V3 KV 量化与 SO(4) 旋转 |
-| `MTP_ADAPTIVE_DEPTH` | `1` | 启用置信度门控动态深度 |
-| `MTP_CONF_TAU` | `0.3` | 动态深度置信度阈值 |
-| `MTP_DEPTH_MAX` | `3` | 动态深度上限 |
+| `STREAM_BLOB_LOADER` | `1` | Handle expert-pool misses with direct blob reads |
+| `ZEROCOPY_DUAL_SOURCE` | `1` | Enable the zero-copy dual-source expert pool |
+| `NATIVE_FUSED_PREFETCH` | `1` | Enable native predictive cross-layer prefetching |
+| `SIDEREGION_LFU` | `1` | Enable the persistent LFU side-region cache |
+| `KV_QUANT` | `1` | Enable K4/V3 KV quantization with SO(4) rotations |
+| `MTP_ADAPTIVE_DEPTH` | `1` | Enable confidence-gated adaptive depth |
+| `MTP_CONF_TAU` | `0.3` | Adaptive-depth confidence threshold |
+| `MTP_DEPTH_MAX` | `3` | Maximum adaptive depth |
 
-示例：
+For example, explicitly override the resident-pool and side-region capacities:
 
 ```bash
-# 显式覆盖常驻池和侧区容量
 EXPERT_SLOTS=32 POOL_SPEC_SLOTS=16 vates --stats
 ```
 
-更多实验性开关及默认值以 `mlx_streaming/config.py` 为准。
+See `mlx_streaming/config.py` for additional experimental switches and their defaults.
 
 > [!WARNING]
-> `EXPERT_SLOTS` 会影响内存、速度和正确性。当前 K=3、top-k=10 的生产路径将 `32` 作为经过验证的容量下限；修改后应重新执行容量不变性和字节真值校验。
+> `EXPERT_SLOTS` affects memory use, speed, and correctness. For K=3 and top-k=10, the default configuration uses `32` as the validated capacity floor. Rerun capacity-invariance and byte-level pool-oracle checks after changing it. The cap=48 unified-pool ablation below is a separate experiment, not the CLI default.
 
-## 项目结构
+## Repository layout
 
 ```text
 .
 ├── mlx_streaming/
-│   ├── cli.py                 # vates 命令入口
-│   ├── config.py              # 环境变量与默认值
-│   ├── model_builder.py       # 流式模型装配
+│   ├── cli.py                 # vates command entry point
+│   ├── config.py              # Environment variables and defaults
+│   ├── model_builder.py       # Streaming model assembly
 │   ├── core/
-│   │   ├── cache/             # 专家池、blob loader 与 KV 量化
-│   │   ├── moe/               # 流式 MoE、gate 与融合计算
-│   │   ├── prefetch/          # 跨层预测与后台预取
-│   │   └── linear_attn/       # Qwen3-Next 线性注意力
-│   ├── mtp/                   # MTP 草稿、验证与 KV 复用
-│   ├── prep/                  # 专家拆分、blob 打包与权重提取
-│   ├── runtime/               # 基准与运行入口
-│   ├── tools/                 # 分析和诊断工具
-│   ├── tui/                   # Textual 全屏界面
-│   └── tests/                 # Python 测试
+│   │   ├── cache/             # Expert pools, blob loader, and KV quantization
+│   │   ├── moe/               # Streaming MoE, gate, and fused computation
+│   │   ├── prefetch/          # Cross-layer prediction and background prefetch
+│   │   └── linear_attn/       # Qwen3-Next linear attention
+│   ├── mtp/                   # MTP drafting, verification, and KV reuse
+│   ├── prep/                  # Expert splitting, blob packing, and weight extraction
+│   ├── runtime/               # Benchmarks and runtime entry points
+│   ├── tools/                 # Analysis and diagnostic tools
+│   ├── tui/                   # Full-screen Textual interface
+│   └── tests/                 # Python tests
 ├── native/
-│   ├── ext/                   # 生产 C++/nanobind 扩展
-│   └── bench/                 # 原生微基准
+│   ├── ext/                   # C++/nanobind extension used by the benchmarked path
+│   └── bench/                 # Native microbenchmarks
 ├── benchmarks/
-│   └── reports/               # 消融实验与性能报告
+│   └── reports/               # Ablation studies and performance reports
 ├── docs/
-│   └── superpowers/           # 设计规范与实施计划
-├── pyproject.toml             # 项目元数据和依赖
-└── uv.lock                    # 锁定的依赖版本
+│   └── superpowers/           # Design specifications and implementation plans
+├── pyproject.toml             # Project metadata and dependencies
+└── uv.lock                    # Locked dependency versions
 ```
 
-## 性能与关键成果
+## Benchmarks, correctness, and rejected experiments
 
-以下数据来自仓库中的消融报告。不同结果来自独立实验，**不能直接相加**；实际性能取决于设备、模型文件、上下文和配置。
+The figures below come from the ablation reports in this repository. Each ablation was measured in an independent experiment; the results were not obtained in one common hardware run and **must not be added together**. The observed 13–15 tok/s range comes from several end-to-end experiments with different configurations, prompts, warmup lengths, and output lengths. It is not a single standardized benchmark. Actual performance depends on the device, model files, context, and configuration.
 
-| 项目 | 结果 |
+**End-to-end production configuration test device:** MacBook Pro, Apple M5 (10-core CPU), 32 GB of physical unified memory, and a 1 TB internal Apple SSD.
+
+| Item | Result |
 | --- | --- |
-| 运行内存 | 4-bit 全量约 41 GB；流式生产配置峰值约 8 GB |
-| 生成速度 | 生产快路径约 13–15 tok/s |
-| KV 占用 | 128k 上下文由约 3.0 GiB 降至约 0.68 GiB |
-| 持久 LFU | 命中率由 0.76 提升至约 0.81，实测吞吐提升约 8%–12% |
-| C++ 统一池 | 13.70 → 14.80 tok/s，侧区由双缓冲改为单缓冲 |
-| MTP top-2 救回 | 逐字节无损条件下吞吐提升约 10.8% |
-| 动态深度 MTP | 逐字节无损条件下吞吐提升约 5%–6% |
-| 峰值优化 | 避免无用 KV 快照，峰值内存降低约 0.2 GB |
+| Storage and memory | 4-bit main-model weights: approximately 41 GB on disk; reported configuration: approximately 8.23–8.27 GiB from MLX `get_peak_memory`, measuring the in-flight tensor-allocation high-water mark—not process RSS or total system memory. Additional system headroom is required. See the [peak-memory report](benchmarks/reports/peak-shrink-2026-07-03.md). |
+| Observed generation range | Approximately 13–15 tok/s across several end-to-end experiments; configurations, prompts, warmup lengths, and output lengths differ, so this is not a standardized benchmark |
+| KV storage | Approximately 3.0 GiB to approximately 0.68 GiB at 128k context |
+| Persistent LFU | Hit rate from 0.76 to approximately 0.81; measured throughput gain of approximately 8%–12% |
+| Unified C++ pool ablation | With cap=48, K=3, MAXTOK=48, WARMUP=48, and REPEAT=2: 13.70 to 14.80 tok/s; the side region changed from double buffering to single buffering. This cap differs from the default cap=32. See the [unified-pool report](benchmarks/reports/cpp-unified-pool-final-2026-07-04.md). |
+| MTP top-2 rescue | Approximately 10.8% throughput gain with zero output mismatches on the deterministic greedy prompts and configurations covered by the [top-2 rescue report](benchmarks/reports/tree-top2-rescue-2026-07-05.md) |
+| Adaptive-depth MTP | Approximately 5%–6% throughput gain with zero output mismatches on the deterministic greedy prompts and configurations covered by the [adaptive-depth report](benchmarks/reports/adaptive-depth-2026-07-05.md) |
+| Peak optimization | Avoiding unnecessary KV snapshots reduced the MLX allocation high-water mark by approximately 0.18–0.22 GiB |
 
-正确性验证包括：
+Correctness validation includes:
 
-- 同一提示词在不同池容量下输出逐字节一致；
-- `DUAL_VERIFY` 与 `STG_VERIFY` 以 `0 BAD` 为验收条件；
-- 单次前向单层最大专家并集实测为 30，因此生产配置使用 32 个槽；
-- Python 与原生路径均有测试覆盖。
+- byte-for-byte identical output for the deterministic greedy prompts and configurations exercised by the capacity-invariance reports;
+- `0 BAD` as the acceptance condition for the byte-level pool-oracle checks `DUAL_VERIFY` and `STG_VERIFY` in the reports that used them;
+- a measured maximum per-layer routed-expert union of 30 in a single forward pass, which is why the default configuration uses 32 slots; and
+- test coverage for both Python and native paths.
 
-完整实验记录位于 [`benchmarks/reports/`](benchmarks/reports/)。
+These oracles cover the documented deterministic greedy prompts, pool states, and benchmark configurations. They are regression evidence for those cases, not a mathematical guarantee of byte-identical output for every prompt, decoding mode, hardware state, or configuration.
 
-已经验证但未纳入生产路径的方向包括完整树形验证、事件门控异步 demand、滑动窗口专家池和逐层容量回收。相关实现或实验因吞吐回归、I/O 预算不足或当前配置无收益而被否决，详情请参阅基准报告。
+Complete experimental records are available in [`benchmarks/reports/`](benchmarks/reports/).
 
-## 测试
+Evaluated approaches that were rejected from the benchmark-validated path include full tree verification, event-gated asynchronous demand loading, sliding-window expert pools, and per-layer capacity reclamation. They were excluded because of throughput regressions, insufficient I/O budget, or no benefit under the current configuration. See the benchmark reports for details.
 
-安装开发依赖后运行完整 Python 测试集：
+## Tests
+
+After installing development dependencies, run the complete Python test suite:
 
 ```bash
 .venv/bin/python -m pytest
 ```
 
-仓库当前包含 60 个测试文件，覆盖专家池、双源缓存、blob 布局、MTP、KV 量化、TUI 和配置等模块。性能路径还使用原生测试、容量不变性与逐字节真值校验。
+The repository currently contains 60 test files covering expert pools, dual-source caching, blob layout, MTP, KV quantization, the TUI, configuration, and related modules. The benchmarked path is also validated with native tests, capacity-invariance checks, and byte-level pool-oracle checks.
 
-## 常见问题 FAQ
+## FAQ
 
 <details>
-<summary><strong>为什么只支持 Apple Silicon？</strong></summary>
+<summary><strong>Why is only Apple Silicon supported?</strong></summary>
 
-项目基于 MLX，并依赖 Apple Silicon 的统一内存架构及 MLX 原生能力。当前没有 CUDA、ROCm 或 CPU-only 后端。
+The project is built on MLX and depends on Apple Silicon's unified-memory architecture and native MLX capabilities. There is currently no CUDA, ROCm, or CPU-only backend.
 
 </details>
 
 <details>
-<summary><strong>为什么提示 <code>vates: command not found</code>？</strong></summary>
+<summary><strong>Why do I get <code>vates: command not found</code>?</strong></summary>
 
-`vates` 安装在 `.venv/bin/` 中。请先运行 `source .venv/bin/activate`，或直接执行 `.venv/bin/vates`。如果虚拟环境创建后被移动或重命名，请使用 `uv venv --clear && uv sync` 重建。
-
-</details>
-
-<details>
-<summary><strong>不编译 native 扩展可以运行吗？</strong></summary>
-
-可以降级运行，但预测式预取、统一池等生产快路径会被关闭，速度会明显下降。正式推理建议执行 `cd native/ext && make native_moe_ext && cd ../..`。
+`vates` is installed in `.venv/bin/`. Run `source .venv/bin/activate` first, or invoke `.venv/bin/vates` directly. If the virtual environment was moved or renamed after creation, rebuild it with `uv venv --clear && uv sync`.
 
 </details>
 
 <details>
-<summary><strong>为什么推荐使用 <code>uv sync</code>？</strong></summary>
+<summary><strong>Can vates run without compiling the native extension?</strong></summary>
 
-`uv sync` 会按 `uv.lock` 安装经过验证的依赖组合，避免 `transformers` 等传递依赖漂移到不兼容版本。
+It can fall back to a slower path, but native features such as predictive prefetching and the unified pool will be disabled. For real inference, derive the virtual environment's Python library path and pass it to Make:
 
-</details>
-
-<details>
-<summary><strong>模型文件应该放在哪里？</strong></summary>
-
-默认路径位于仓库根目录的 `models/`。也可以通过 `--model`、`--expert-dir`、`--mtp-out` 和 `--qn-config` 指定其他位置。
+```bash
+PY_SITE="$("./.venv/bin/python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
+make -C native/ext PY_SITE="$PY_SITE" native_moe_ext
+```
 
 </details>
 
 <details>
-<summary><strong>如何在没有模型的情况下检查界面？</strong></summary>
+<summary><strong>Why is <code>uv sync</code> recommended?</strong></summary>
 
-运行 `vates --demo`。该模式使用模拟后端，不读取模型文件，可用于检查 TUI、流式显示和状态栏。
+`uv sync` installs the dependency set validated in `uv.lock`, preventing transitive packages such as `transformers` from drifting to incompatible versions.
 
 </details>
 
-## 开发与贡献
+<details>
+<summary><strong>Where should model files be placed?</strong></summary>
 
-欢迎提交 Issue 和 Pull Request。开始前请阅读 [贡献指南](CONTRIBUTING.md)和[行为准则](CODE_OF_CONDUCT.md)。
+The defaults are under `models/` at the repository root. Use `--model`, `--expert-dir`, `--mtp-out`, and `--qn-config` to select other locations.
 
-1. 在开始较大改动前，建议先创建 Issue，说明问题、目标和预期方案。
-2. 从 `main` 创建独立分支，避免在一个 PR 中混入无关改动。
-3. 保持改动聚焦，并为行为变化补充或更新测试。
-4. 提交前运行 `.venv/bin/python -m pytest`。
-5. PR 描述应包含改动背景、实现方式、验证结果和潜在影响。
-6. 性能优化应附可复现的基准命令、对照数据和正确性验证结果。
-7. Bug 报告请提供设备型号、macOS 版本、Python 版本、复现命令和完整错误信息。
+</details>
+
+<details>
+<summary><strong>How can I inspect the interface without a model?</strong></summary>
+
+Run `vates --demo`. This mode uses a mock backend and reads no model files, so it can be used to inspect the TUI, streaming display, and status bar.
+
+</details>
+
+## Contributing
+
+Issues and pull requests are welcome. Read the [Contributing Guide](CONTRIBUTING.md) and [Code of Conduct](CODE_OF_CONDUCT.md) before getting started.
+
+1. For substantial changes, open an Issue first to describe the problem, goal, and proposed approach.
+2. Create a dedicated branch from `main` and keep unrelated changes out of the pull request.
+3. Keep each change focused, and add or update tests for behavioral changes.
+4. Run `.venv/bin/python -m pytest` before submitting.
+5. In the pull request description, explain the context, implementation, validation results, and potential impact.
+6. Performance changes should include reproducible benchmark commands, comparison data, and correctness results.
+7. Bug reports should include the device model, macOS version, Python version, reproduction command, and complete error output.
 
 ## License
 
-本项目采用 [Apache License 2.0](LICENSE)。
+This project is licensed under the [Apache License 2.0](LICENSE).
 
 Copyright 2026 AMOS144
 
-## 作者与联系方式
+## Contact
 
-- 作者：[AMOS144](https://github.com/AMOS144)
-- 仓库：[github.com/AMOS144/Vates](https://github.com/AMOS144/Vates)
-- Issue：[github.com/AMOS144/Vates/issues](https://github.com/AMOS144/Vates/issues)
-- 邮箱：[3108424075@qq.com](mailto:3108424075@qq.com)
+- Author: [AMOS144](https://github.com/AMOS144)
+- Repository: [github.com/AMOS144/Vates](https://github.com/AMOS144/Vates)
+- Issues: [github.com/AMOS144/Vates/issues](https://github.com/AMOS144/Vates/issues)
+- Email: [3108424075@qq.com](mailto:3108424075@qq.com)
 
 ---
 
-如果 vates 对你有帮助，欢迎 Star 项目并通过 Issue 分享使用反馈。
+Technical feedback and contributions are welcome through [Issues](https://github.com/AMOS144/Vates/issues).
