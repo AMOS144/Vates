@@ -20,6 +20,24 @@ from mlx_streaming.mtp.kv_cache import (
     tile_caches, commit_tree_row)
 
 
+def _route_delta_trace_if_enabled():
+    """仅在显式开启时加载 route delta 诊断模块。"""
+    if not config.route_delta_trace():
+        return None
+    from mlx_streaming.core.prefetch import route_delta_trace
+    return route_delta_trace
+
+
+def _begin_route_delta_verify(trace, token_ids):
+    """开始诊断前向，并在任何 pread 前绑定完整输入 token。"""
+    if trace is None:
+        return None
+    forward_id = trace.next_forward_id()
+    trace.begin_verify(forward_id)
+    trace.record_verify_tokens(forward_id, token_ids)
+    return forward_id
+
+
 def _batch_direct_commit_guaranteed(model) -> bool:
     """判断该模型的 batch verify 是否「必定」能直接提交(commit_verified_prefix 恒成功)。
 
@@ -134,7 +152,8 @@ def accept_prefix(drafts, preds):
 
 
 # --------------------------------------------------------- 完整树形验证(batch-of-paths)
-def tree_verify_step(model, drafter, x, H_last, x_ids, mtp_cache, main_cache, K, P, snap_d):
+def tree_verify_step(model, drafter, x, H_last, x_ids, mtp_cache, main_cache, K, P, snap_d,
+                     route_delta_trace=None):
     """一次 batched 前向并行验证 P 条候选路径,提交接受最长的赢家路径。
 
     返回 (new_tokens, x_new, rH, accepted_in, matched)。
@@ -150,6 +169,10 @@ def tree_verify_step(model, drafter, x, H_last, x_ids, mtp_cache, main_cache, K,
     snap_m = _snapshot(main_cache)                                # tile 前的 batch=1 快照(回退用)
     tile_caches(main_cache, len(paths))
     begin_speculative_checkpoints(main_cache)
+    route_forward_id = _begin_route_delta_verify(
+        route_delta_trace,
+        verify_in,
+    )
     vlogits, vH = forward_with_hidden(model, verify_in, main_cache)
     mx.eval(vlogits, vH)
 
@@ -169,13 +192,27 @@ def tree_verify_step(model, drafter, x, H_last, x_ids, mtp_cache, main_cache, K,
 
     if not committed:
         # 理论上 checkpoint 齐全不会走到;稳妥回退:恢复 batch=1 主 cache 后重放赢家 accepted prefix。
+        if route_delta_trace is not None:
+            route_delta_trace.discard_verify(route_forward_id)
         _restore(main_cache, snap_m)
         accepted_in = mx.array([[x] + drafts[:matched]])
+        route_forward_id = _begin_route_delta_verify(
+            route_delta_trace,
+            accepted_in,
+        )
         rlogits, rH = forward_with_hidden(model, accepted_in, main_cache)
         mx.eval(rlogits)
+        if route_delta_trace is not None:
+            route_delta_trace.commit_verify(
+                route_forward_id, accepted_len=accepted_len,
+            )
         bonus = int(mx.argmax(rlogits[:, -1, :]))
         return drafts[:matched] + [bonus], bonus, rH, accepted_in, matched
 
+    if route_delta_trace is not None:
+        route_delta_trace.commit_verify(
+            route_forward_id, accepted_len=accepted_len, row=best_w,
+        )
     rH = vH[best_w:best_w + 1, :accepted_len, :]
     accepted_in = verify_in[best_w:best_w + 1, :accepted_len]
     if matched == K:
@@ -201,6 +238,7 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     调用方可据此拼下轮的 cached prefix。main_cache=None 时内部新建(默认,整段 prefill)。
     """
     enable_qwen3next_speculative_checkpoints()
+    route_delta_trace = _route_delta_trace_if_enabled()
     if main_cache is None:
         main_cache = model.make_cache()
         cached_len = 0
@@ -264,7 +302,8 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             if profile:
                 _tic = time.perf_counter()
             new_tokens, x, rH, accepted_in, matched = tree_verify_step(
-                model, drafter, x, H_last, x_ids, mtp_cache, main_cache, K, tree_P, snap_d)
+                model, drafter, x, H_last, x_ids, mtp_cache, main_cache, K, tree_P, snap_d,
+                route_delta_trace=route_delta_trace)
             accept_hist[matched] += 1
             direct_commits += 1
             if profile:
@@ -327,6 +366,10 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             _tic = time.perf_counter()
 
         verify_snaps = None
+        route_forward_id = _begin_route_delta_verify(
+            route_delta_trace,
+            verify_in,
+        )
         if verify_mode == "step":
             vlogits, vH, verify_snaps = forward_with_hidden_stepwise(
                 model, verify_in, main_cache, capture_snapshots=True)
@@ -343,11 +386,17 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
         # 按连续读 data() 致 seq≥2 的 token≥1 装错专家,spec/救回全体失真。修 demand_dual 用
         # contiguous() 物化后,seq=K verify 与 seq=1 解码逐位等价,spec 与本救回均 bit-lossless。
         if tree_b is not None and matched == 0 and tree_b[0] == preds[0]:
+            if route_delta_trace is not None:
+                route_delta_trace.discard_verify(route_forward_id)
             _restore(main_cache, snap_m)
             begin_speculative_checkpoints(main_cache)
             # 重建 verify_in 为 B 链:后续 accepted_in=verify_in[:, :accepted_len] 才会取到 chainB,
             # 否则残留 chainA 的错误首草稿会经 sync 污染 MTP cache、拉低后续草稿质量(低估救回收益)。
             verify_in = mx.array([[x] + tree_b[:step_k - 1]])
+            route_forward_id = _begin_route_delta_verify(
+                route_delta_trace,
+                verify_in,
+            )
             vlogits, vH = forward_with_hidden(model, verify_in, main_cache)
             mx.eval(vlogits, vH)
             preds = [int(t) for t in mx.argmax(vlogits[0], axis=-1)]
@@ -359,9 +408,15 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
         # 前缀一致故 preds[0]/preds[1] 不变、重验后 matched≥2;d3c 可能续命中把接受长度顶到 3。
         # 与 pos0 救回同构(纯重验、只提交模型 argmax token → bit-lossless,并集不放大)。
         elif tree_c is not None and matched == 1 and len(tree_c) > 1 and tree_c[1] == preds[1]:
+            if route_delta_trace is not None:
+                route_delta_trace.discard_verify(route_forward_id)
             _restore(main_cache, snap_m)
             begin_speculative_checkpoints(main_cache)
             verify_in = mx.array([[x] + tree_c[:step_k - 1]])
+            route_forward_id = _begin_route_delta_verify(
+                route_delta_trace,
+                verify_in,
+            )
             vlogits, vH = forward_with_hidden(model, verify_in, main_cache)
             mx.eval(vlogits, vH)
             preds = [int(t) for t in mx.argmax(vlogits[0], axis=-1)]
@@ -409,6 +464,10 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             t_commit += time.perf_counter() - _tic
             _tic = time.perf_counter()
         if committed:
+            if route_delta_trace is not None:
+                route_delta_trace.commit_verify(
+                    route_forward_id, accepted_len=accepted_len,
+                )
             direct_commits += 1
             # 直接使用验证前向产生的 hidden 同步 MTP cache,避免主模型 replay。
             rH = vH[:, :accepted_len, :]
@@ -420,6 +479,8 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
                 x = preds[matched]
         else:
             fallback_replays += 1
+            if route_delta_trace is not None:
+                route_delta_trace.discard_verify(route_forward_id)
             if snap_m is None:
                 # 理论不可达:batch 直接提交路径 checkpoint 齐全,commit 必成功。若真走到这里,
                 # 说明前提被破坏(如未捕获 checkpoint),此时无快照可回退,直接抛错定位而非静默错算。
@@ -428,8 +489,16 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             _restore(main_cache, snap_m)
             accepted_in = mx.array([[x0] + drafts[:matched]])
             replayed_tokens += accepted_in.shape[1]
+            route_forward_id = _begin_route_delta_verify(
+                route_delta_trace,
+                accepted_in,
+            )
             rlogits, rH = forward_with_hidden(model, accepted_in, main_cache)
             mx.eval(rlogits)
+            if route_delta_trace is not None:
+                route_delta_trace.commit_verify(
+                    route_forward_id, accepted_len=accepted_len,
+                )
             bonus = int(mx.argmax(rlogits[:, -1, :]))
             new_tokens = drafts[:matched] + [bonus]
             x = bonus

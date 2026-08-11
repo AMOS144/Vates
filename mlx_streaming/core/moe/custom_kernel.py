@@ -126,7 +126,8 @@ def _custom_fused_moe_indexed(x: mx.array, indices: mx.array,
                               up_w: mx.array, up_s: mx.array, up_b: mx.array,
                               down_w: mx.array, down_s: mx.array, down_b: mx.array,
                               hidden: int, moe_inter: int, group_size: int,
-                              bits: int) -> mx.array:
+                              bits: int,
+                              active_mask: "mx.array | None" = None) -> mx.array:
     """fused MoE expert: x[p] 用 indices[p] 选择专家，输出 down 后的 hidden。"""
     lanes_per_row = config.custom_fused_moe_lanes()
     block_size = config.custom_fused_moe_block()
@@ -137,6 +138,12 @@ def _custom_fused_moe_indexed(x: mx.array, indices: mx.array,
             uint tid = thread_position_in_threadgroup.x;
             uint pair = thread_position_in_grid.x / block_size;
             if (pair >= pairs) return;
+            if (active_mask[pair] == 0) {
+                for (uint row = tid; row < hidden; row += block_size) {
+                    y[pair * hidden + row] = 0.0f;
+                }
+                return;
+            }
             uint expert = indices[pair];
             constexpr uint rows_per_step = block_size / lanes_per_row;
             uint local_row = tid / lanes_per_row;
@@ -233,6 +240,7 @@ def _custom_fused_moe_indexed(x: mx.array, indices: mx.array,
             name=f"custom_fused_moe_h{hidden}_i{moe_inter}_b{bits}_l{lanes_per_row}",
             input_names=[
                 "x", "indices",
+                "active_mask",
                 "gate_w", "gate_s", "gate_b",
                 "up_w", "up_s", "up_b",
                 "down_w", "down_s", "down_b",
@@ -242,9 +250,16 @@ def _custom_fused_moe_indexed(x: mx.array, indices: mx.array,
         )
         _CUSTOM_FUSED_MOE_CACHE[key] = kernel
     pairs = int(indices.size)
+    if active_mask is None:
+        active_mask = mx.ones((pairs,), dtype=mx.uint8)
+    else:
+        active_mask = active_mask.reshape(-1).astype(mx.uint8)
+        if int(active_mask.size) != pairs:
+            raise ValueError("active_mask must have one value per route pair")
     (y,) = kernel(
         inputs=[
             x, indices.astype(mx.uint32),
+            active_mask,
             gate_w, gate_s, gate_b,
             up_w, up_s, up_b,
             down_w, down_s, down_b,

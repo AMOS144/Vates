@@ -13,9 +13,20 @@ mx::array prefetch_on_complete(
 mx::array prefetch_into_staging(
     const mx::array& staging, const mx::array& expert_ids, int layer, long gen,
     const std::string& path, int stride, const std::vector<int>& resident, int cap,
-    bool parallel, mx::StreamOrDevice s);
+    bool parallel, int source_layer, int64_t forward_id, int priority,
+    mx::StreamOrDevice s);
 // 取走某层就绪记录：[gen, e0,r0,e1,r1,...]；空表示无就绪。
-std::vector<long> prefetch_staging_take(int layer);
+std::vector<long> prefetch_staging_take(int layer, long generation = -1);
+bool prefetch_staging_finished(int layer, long generation);
+void prefetch_staging_forget(int layer, long generation);
+void prefetch_staging_wait_experts(
+    int64_t forward_id, int layer, const mx::array& expert_ids);
+void prefetch_staging_note_prejoin(
+    int64_t forward_id, int layer, const mx::array& expert_ids);
+void prefetch_staging_finish_demand(int64_t forward_id, int layer);
+std::vector<long> prefetch_staging_wait_stats();
+void prefetch_staging_wait_stats_reset();
+void prefetch_staging_drain();
 
 // handler 触发时刻探针(诊断用)：enable 开关并清零；now 取同时钟当前秒；get 取 (gen,layer,t) 日志。
 void staging_hprof_enable(bool on);

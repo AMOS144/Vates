@@ -91,7 +91,13 @@ def _build_engine(args, on_status=None):
     _emit("正在加载 MTP drafter...")
     with open(args.qn_config) as f:
         margs = ModelArgs.from_dict(json.load(f))
-    mtp = load_mtp(margs, args.mtp_out, quantize=True)
+    mtp = load_mtp(
+        margs, args.mtp_out, quantize=True, bits=config.mtp_bits(),
+        group_size=config.mtp_group_size(),
+        stream_experts=config.mtp_stream_experts(),
+        expert_dir=config.mtp_expert_dir(),
+        expert_slots=config.mtp_expert_slots(),
+    )
     mtp.embed_tokens = model.model.embed_tokens          # 共享主模型 embedding
     drafter = MTPDrafter(mtp, model.lm_head)
     return model, tok, drafter

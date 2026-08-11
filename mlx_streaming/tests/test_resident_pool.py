@@ -11,6 +11,30 @@ def _loader_factory():
     return load
 
 
+def test_direct_slot_layer0_uses_same_unified_capacity(monkeypatch):
+    monkeypatch.setenv("PREFETCH_DIRECT_SLOTS", "1")
+    monkeypatch.setenv("LAYER0_SLOTS", "64")
+    pool = ResidentExpertPool(
+        capacity=32,
+        loader=_loader_factory(),
+        spec_slots=32,
+        spec_gens=1,
+    )
+    assert pool.native_real_cap_for(0) == 32
+    assert pool.native_real_cap_for(1) == 32
+
+
+def test_non_direct_layer0_keeps_real_capacity(monkeypatch):
+    monkeypatch.setenv("PREFETCH_DIRECT_SLOTS", "0")
+    pool = ResidentExpertPool(
+        capacity=32,
+        loader=_loader_factory(),
+        spec_slots=32,
+        spec_gens=1,
+    )
+    assert pool.native_real_cap_for(0) == 32
+
+
 def test_batch_loader_equiv_to_serial():
     # batch_loader 路径应与逐专家串行加载得到完全相同的槽位与内容
     calls = []

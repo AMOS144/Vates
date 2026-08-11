@@ -23,6 +23,12 @@ class _RPDual:
 
 
 class _Stg:
+    def __init__(self):
+        self.late_promoter = None
+
+    def register_late_promoter(self, promoter):
+        self.late_promoter = promoter
+
     def sideregion_kv(self, layer, gen):
         return (mx.array([], dtype=mx.uint32), mx.array([], dtype=mx.int32))
 
@@ -57,18 +63,35 @@ class _RPHost:
 
 
 def test_acquire_dual_returns_n_experts(monkeypatch):
-    # dual：派发到 C++ demand_dual（_acquire_native），n_experts = layer_cap + spec_gens*spec_slots
+    monkeypatch.setenv("PREFETCH_DIRECT_SLOTS", "0")
+    # unified：旧侧区容量已并入 layer_cap，staging 不增加可寻址行。
     rp = _RPDual()
     vp = VirtualPool(rp, _Stg(), spec_slots=16)
     vp.begin_forward(0)
     # stub _acquire_native（避开 native 依赖），记录派发入参
     monkeypatch.setattr(vp, "_acquire_native",
-                        lambda layer, inds, side_gen, cap: rp.calls.append((layer, side_gen, cap))
-                        or ("POOL_DUAL", "LOCAL_DUAL"))
+                        lambda layer, inds, side_gen, cap, **_kw: rp.calls.append((layer, side_gen, cap))
+                        or ("POOL_DUAL", "LOCAL_DUAL", 32))
     pool, local, n_exp = vp.acquire(0, "INDS", 128, seq_len=4, layer_cap=32)
     assert pool == "POOL_DUAL" and local == "LOCAL_DUAL"
-    assert n_exp == 32 + 2 * 16
+    assert n_exp == 32
     assert rp.calls == [(0, vp.read_gen(), 32)]      # 用读代 + cap
+
+
+def test_progressive_retains_late_staging_as_speculative_cache(monkeypatch):
+    monkeypatch.setenv("PREFETCH_DIRECT_SLOTS", "0")
+    monkeypatch.setenv("PREFETCH_PROGRESSIVE", "1")
+    staging = _Stg()
+    VirtualPool(_RPDual(), staging, spec_slots=16)
+    assert staging.late_promoter is not None
+
+
+def test_nonprogressive_can_retain_late_staging(monkeypatch):
+    monkeypatch.setenv("PREFETCH_DIRECT_SLOTS", "0")
+    monkeypatch.setenv("PREFETCH_PROGRESSIVE", "0")
+    staging = _Stg()
+    VirtualPool(_RPDual(), staging, spec_slots=16)
+    assert staging.late_promoter is not None
 
 
 def test_acquire_nondual_gpu_remap():
@@ -99,3 +122,50 @@ def test_acquire_host_over_cap_uses_fetch():
     assert pool == "POOL_FETCH" and n_exp == 5
     assert sorted(set(int(v) for v in local.reshape(-1).tolist())) == [0, 1, 2, 3, 4]
     assert rp.calls == [("fetch", (10, 11, 12, 13, 14))]
+
+
+def test_dual_overcap_temporary_fetch_preserves_route_order():
+    class _RPTemporary:
+        stacked_batch_loader = None
+        batch_loader = None
+
+        @staticmethod
+        def loader(_layer, expert):
+            return {"weight": mx.array([expert, expert + 100], dtype=mx.int32)}
+
+    vp = VirtualPool(_RPTemporary(), staging=None, spec_slots=0)
+    inds = mx.array([[5, 7, 5, 9]], dtype=mx.uint32)
+    pool, local, n_exp = vp._temporary_fetch(3, inds)
+    assert n_exp == 3
+    assert pool["weight"].tolist() == [[5, 105], [7, 107], [9, 109]]
+    assert local.tolist() == [[0, 1, 0, 2]]
+
+
+def test_early_rerank_acceptance_is_deferred_until_target_truth(monkeypatch):
+    from mlx_streaming.core.prefetch import progressive_acceptance
+
+    captured = []
+    monkeypatch.setattr(
+        progressive_acceptance, "record",
+        lambda layer, **values: captured.append((layer, values)),
+    )
+    vp = VirtualPool(_RPRemap(), staging=None, spec_slots=0)
+    vp.begin_forward(0)
+    candidates = mx.array([[0, 1, 2, 3]], dtype=mx.uint32)
+    selected = mx.array([0, 2, 2], dtype=mx.uint32)
+    width = mx.array(2, dtype=mx.int32)
+    vp.record_rerank_acceptance(
+        2,
+        candidate_ids=candidates,
+        selected_ids=selected,
+        online_width=width,
+        resident=(7,),
+    )
+
+    assert captured == []
+    actual = mx.array([[0, 2, 7]], dtype=mx.uint32)
+    assert vp._defer_progressive_acceptance(2, actual)
+    assert vp.flush_progressive_acceptance() == 1
+    assert captured[0][0] == 2
+    assert captured[0][1]["actual_ids"] is actual
+    assert captured[0][1]["resident"] == (7,)

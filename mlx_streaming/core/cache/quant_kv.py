@@ -136,6 +136,25 @@ class AsymmetricQuantizedKVCache:
             tree_map(lambda x: x[..., :self.offset, :], self.values),
         )
 
+    def fork(self):
+        """Return an isolated append-only view for speculative attention.
+
+        The committed prefix may be shared because it is immutable from the
+        fork's point of view.  Trimming the visible capacity to ``offset``
+        forces the next ``update_and_fetch`` to allocate through concatenate,
+        so its slice assignments cannot mutate the live cache arrays.
+        """
+        clone = type(self)(self.group_size, self.k_bits, self.v_bits)
+        clone.offset = self.offset
+        if self.keys is not None:
+            clone.keys = tree_map(
+                lambda x: x[..., :self.offset, :], self.keys,
+            )
+            clone.values = tree_map(
+                lambda x: x[..., :self.offset, :], self.values,
+            )
+        return clone
+
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 

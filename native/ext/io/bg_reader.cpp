@@ -48,11 +48,13 @@ class BgReader {
       if (job.prio > 0) high_q_.push(std::move(job)); else low_q_.push(std::move(job)); }
     cv_.notify_all();
   }
-  void submit_task(std::function<void()> fn) {
+  void submit_task(std::function<void()> fn, int prio) {
     ensure_started(4);
     BgJob job;
     job.task = std::move(fn);
-    { std::lock_guard<std::mutex> lk(m_); low_q_.push(std::move(job)); }   // 通用任务走低优
+    job.prio = prio;
+    { std::lock_guard<std::mutex> lk(m_);
+      if (job.prio > 0) high_q_.push(std::move(job)); else low_q_.push(std::move(job)); }
     cv_.notify_all();
   }
   bool ready(long ticket) {
@@ -128,7 +130,9 @@ class BgReader {
 BgReader g_bg;
 }  // namespace
 
-void bg_submit_task(std::function<void()> fn) { g_bg.submit_task(std::move(fn)); }
+void bg_submit_task(std::function<void()> fn, int prio) {
+  g_bg.submit_task(std::move(fn), prio);
+}
 
 void bg_reader_start(int workers, int low_cap) { g_bg.start(workers, low_cap); }
 

@@ -1,22 +1,46 @@
 from mlx_streaming.core.cache.virtual_pool import VirtualPool
 
 
-def test_ahead_for_cutoff():
+def test_ahead_for_target_cutoff():
     vp = VirtualPool(num_layers=48, cutoff=6, ahead_lo=1, ahead_hi=3)
-    assert vp.ahead_for(0) == 1
-    assert vp.ahead_for(5) == 1
-    assert vp.ahead_for(6) == 3
-    assert vp.ahead_for(40) == 3
+    assert vp.ahead_for(1) == 1
+    assert vp.ahead_for(6) == 1
+    assert vp.ahead_for(7) == 3
+    assert vp.ahead_for(47) == 3
 
 
-def test_target_for_skip_no_clamp():
+def test_target_ahead_profile_overrides_cutoff_schedule():
+    vp = VirtualPool(
+        num_layers=8, cutoff=2, ahead_lo=1, ahead_hi=3,
+        ahead_profile={3: 2, 7: 2},
+    )
+    assert vp.ahead_for(1) == 1
+    assert vp.ahead_for(3) == 2
+    assert vp.ahead_for(4) == 3
+    assert vp.ahead_for(7) == 2
+    assert vp.targets_for(1) == (2, 3, 4)
+
+
+def test_targets_for_covers_every_target_once_without_shortening():
     vp = VirtualPool(num_layers=48, cutoff=6, ahead_lo=1, ahead_hi=3)
-    assert vp.target_for(0) == 1        # 0+1
-    assert vp.target_for(10) == 13      # 10+3
-    assert vp.target_for(44) == 47      # 44+3=47 恰好命中末层 → 预读
-    assert vp.target_for(45) == 0       # 45+3=48 越界 → 跳过（不再 clamp 堆叠到 47）
-    assert vp.target_for(46) == 0       # 46+3=49 越界 → 跳过
-    assert vp.target_for(47) == 0       # 末层无可预读 → 0
+    assert vp.targets_for(0) == (1,)
+    assert vp.targets_for(4) == (5, 7)
+    assert vp.targets_for(5) == (6, 8)
+    assert vp.targets_for(6) == (9,)
+    assert vp.targets_for(44) == (47,)
+    assert vp.targets_for(45) == ()
+    assert vp.targets_for(47) == ()
+
+    scheduled = [
+        (source, target)
+        for source in range(48)
+        for target in vp.targets_for(source)
+    ]
+    assert sorted(target for _, target in scheduled) == list(range(1, 48))
+    assert all(
+        target - source == (1 if target <= 6 else 3)
+        for source, target in scheduled
+    )
 
 
 # ---- 双源双缓冲协调器（dual-source coordinator）----
@@ -34,8 +58,8 @@ class _FakeRP:
 class _FakeStg:
     def __init__(self):
         self.submits = []
-    def submit_pool_sideregion(self, layer, pred, resident, pool_list, base_row, gen=0):
-        self.submits.append((layer, base_row, gen))
+    def submit(self, layer, pred, resident, **metadata):
+        self.submits.append((layer, pred, tuple(resident), metadata))
         return None
 
 
@@ -57,18 +81,21 @@ def test_read_fill_gen_disjoint():
     assert vp.read_gen() != vp.fill_gen()
 
 
-def test_acquire_uses_read_gen_prefetch_uses_fill_gen_base(monkeypatch):
+def test_acquire_uses_native_and_prefetch_uses_global_staging(monkeypatch):
+    monkeypatch.setenv("PREFETCH_DIRECT_SLOTS", "0")
     rp, stg = _FakeRP(), _FakeStg()
     vp = VirtualPool(rp, stg, spec_slots=16)
     vp.begin_forward(0)                                  # gen=0：read_gen=1, fill_gen=0
     monkeypatch.setattr(vp, "_acquire_native",
-                        lambda layer, inds, side_gen, cap: rp.dual_calls.append((layer, side_gen))
-                        or ("POOL", "LOCAL"))
+                        lambda layer, inds, side_gen, cap, **_kw: rp.dual_calls.append((layer, side_gen))
+                        or ("POOL", "LOCAL", 64))
     vp.acquire(5, "INDS", 128)
     vp.prefetch(6, "PRED", [1, 2], ["A", "B"])
     assert rp.dual_calls == [(5, vp.read_gen())]         # 取用走读代
-    # 预取走填代，base_row = cap_for + fill_gen*spec
-    assert stg.submits == [(6, 32 + vp.fill_gen() * 16, vp.fill_gen())]
+    # 全局 staging 不再计算/写入每层侧区 base_row。
+    assert stg.submits == [(
+        6, "PRED", (1, 2), {"source_layer": -1, "forward_id": vp._gen},
+    )]
 
 
 def test_single_gen_read_equals_fill():

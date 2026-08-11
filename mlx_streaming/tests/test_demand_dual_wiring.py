@@ -34,6 +34,25 @@ def test_spec_mode_enables_native_demand():
     assert rp._native_demand is True
 
 
+@pytest.mark.skipif(not _HAS, reason="native 未编译")
+def test_layer0_native_capacity_is_the_single_owned_main_pool(monkeypatch):
+    """Direct prefetch no longer appends or advertises hidden side rows."""
+    monkeypatch.setenv("PREFETCH_DIRECT_SLOTS", "1")
+    monkeypatch.setenv("LAYER0_SLOTS", "128")
+    N.real_reset()
+    rp = ResidentExpertPool(
+        32,
+        loader=lambda _layer, _expert: {
+            "weight": mx.zeros((3,), dtype=mx.uint32),
+        },
+        spec_slots=32,
+        spec_gens=1,
+    )
+    rp._bootstrap_dual_pool(0)
+    assert rp.native_real_cap_for(0) == 32
+    assert int(rp._pools[0]["weight"].shape[0]) == 32
+
+
 class _RPNoNative:
     """native 缺失的 rp mock：_native_demand=False → dual 模式下 acquire 应报错（无 Python 退路）。"""
     spec_gens = 2
@@ -72,11 +91,37 @@ def test_resident_experts_reads_cpp_when_native():
     assert {flat[i] for i in range(0, len(flat), 2)} == {10, 11, 12}
 
 
-def test_pin_hot_rejected_in_dual():
-    # dual 模式（demand_dual 唯一权威）弃用 PIN_HOT：pin 非空应明确报错。
+def test_native_real_pin_is_visible_and_not_evicted():
     if not _HAS:
         pytest.skip("native 未编译")
-    rp = _rp(spec=8)
-    assert rp._native_demand is True
-    with pytest.raises(RuntimeError):
-        rp.pin(0, [1, 2, 3])
+    if not hasattr(N, "real_pin"):
+        pytest.skip("native extension 尚未编译 real_pin")
+    N.real_reset()
+    assert list(N.real_pin(0, [1, 2], 4)) == [0, 1]
+    assert list(N.real_pinned_contents(0)) == [1, 2]
+    # 剩余两个槽反复驱逐，pin 必须始终保留在 g_real 权威账本中。
+    N.real_debug_place(0, [3, 4], 4, True, 0)
+    N.real_debug_place(0, [5], 4, True, 0)
+    assert {1, 2} <= {
+        int(value) for value in N.real_region_contents(0)[::2]
+    }
+
+
+def test_resident_pool_native_pin_writes_owned_pool_bytes():
+    if not _HAS or not hasattr(N, "real_pin"):
+        pytest.skip("native extension 尚未编译 real_pin")
+    N.real_reset()
+
+    def loader(_layer, expert):
+        return {"weight": mx.full((3,), int(expert) + 17, dtype=mx.uint32)}
+
+    rp = ResidentExpertPool(4, loader=loader, spec_slots=2)
+    rp.pin(0, [2, 5])
+    contents = list(N.real_region_contents(0))
+    slots = {
+        int(contents[index]): int(contents[index + 1])
+        for index in range(0, len(contents), 2)
+    }
+    assert set(N.real_pinned_contents(0)) == {2, 5}
+    assert rp._pools[0]["weight"][slots[2]].tolist() == [19, 19, 19]
+    assert rp._pools[0]["weight"][slots[5]].tolist() == [22, 22, 22]

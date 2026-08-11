@@ -18,6 +18,7 @@ long bg_pread_into_pool(
     long slot, long expert,
     const std::string& path, long stride, long ticket, int prio = 0, bool nocache = true);
 
-// 通用后台任务入口：把任意闭包派到后台线程池（低优队列）。侧区/staging 预取的 GPU 完成回调
-// 用它把 pread 派离 Metal 回调线程 → 真正与计算重叠。内部接口，不绑 Python。
-void bg_submit_task(std::function<void()> fn);
+// 通用后台任务入口。普通 early 预取进低优队列；progressive T-1 最终补位可用
+// prio>0 进入高优队列，避免已经失去大部分计算窗口的少量关键字节排在后续层 early
+// 批次之后。内部接口，不绑 Python。
+void bg_submit_task(std::function<void()> fn, int prio = 0);

@@ -298,6 +298,12 @@ class FileExpertStore:
         return self._lru.resident_count() + pinned
 
     def pinned_count(self) -> int:
+        if self._resident._native_demand:
+            import mlx_streaming.native_moe_ext as N
+            return sum(
+                len(N.real_pinned_contents(int(layer)))
+                for layer in self._resident._pools
+            )
         return sum(len(d) for d in self._pinned.values())
 
     def path(self, layer: int, e: int) -> str:
@@ -437,6 +443,11 @@ class FileExpertStore:
 
     def pin(self, layer: int, expert_ids: List[int]) -> None:
         """把这些专家加载并钉为常驻（不计入 LRU、不可驱逐）。"""
+        if self._resident._native_demand:
+            # dual 模式只保留 owned resident pool 中的一份字节；避免旧
+            # FileExpertStore._pinned 再持有一整份重复专家张量。
+            self._resident.pin(layer, expert_ids)
+            return
         d = self._pinned.setdefault(layer, {})
         for e in expert_ids:
             e = int(e)
@@ -530,6 +541,9 @@ class FileExpertStore:
         self.prefetch_submitted = 0
         self.prefetch_dropped = 0
         self.staging_hits = 0
+        staging = getattr(self, "_staging", None)
+        if staging is not None and hasattr(staging, "reset_stats"):
+            staging.reset_stats()
 
     def acquire(self, layer: int, expert_ids: List[int]):
         """连续常驻池取专家：返回 (pool_arrays, slots)。命中零拷贝，miss 单槽写。"""
