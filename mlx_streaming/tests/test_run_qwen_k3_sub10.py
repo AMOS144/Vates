@@ -1,3 +1,5 @@
+import os
+
 from mlx_streaming.runtime.run_qwen_k3_sub10 import (
     FINAL_DEFAULTS,
     _chat_argv,
@@ -6,16 +8,17 @@ from mlx_streaming.runtime.run_qwen_k3_sub10 import (
 
 
 def test_final_profile_defaults(monkeypatch):
-    for name in FINAL_DEFAULTS:
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(os, "environ", {})
     configure()
-    assert FINAL_DEFAULTS.items() <= __import__("os").environ.items()
+    assert FINAL_DEFAULTS.items() <= os.environ.items()
+    assert FINAL_DEFAULTS["MTP_BITS"] == "4"
+    assert FINAL_DEFAULTS["MTP_EXPERT_DIR"].endswith("_4bit_g64")
 
 
 def test_final_profile_preserves_explicit_overrides(monkeypatch):
-    monkeypatch.setenv("EXPERT_SLOTS", "999")
+    monkeypatch.setattr(os, "environ", {"EXPERT_SLOTS": "999"})
     configure()
-    assert __import__("os").environ["EXPERT_SLOTS"] == "999"
+    assert os.environ["EXPERT_SLOTS"] == "999"
 
 
 def test_final_profile_short_chat_entry():

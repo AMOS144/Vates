@@ -1,4 +1,4 @@
-"""Reproducible Qwen3-Next K=3 streaming profile: ~42 tok/s below 10 GiB."""
+"""Reproducible Qwen3-Next K=3 streaming profile for interactive use."""
 import os
 import sys
 
@@ -16,11 +16,11 @@ FINAL_DEFAULTS = {
     "PREFETCH_DIRECT_SLOTS": "1",
     "DEMAND_ASYNC": "1",
     "DEMAND_WORKERS": "8",
-    "MTP_BITS": "2",
+    "MTP_BITS": "4",
     "MTP_GROUP_SIZE": "64",
     "MTP_STREAM_EXPERTS": "1",
     "MTP_EXPERT_SLOTS": "64",
-    "MTP_EXPERT_DIR": "models/qn_mtp_experts_2bit_g64",
+    "MTP_EXPERT_DIR": "models/qn_mtp_experts_4bit_g64",
     "MTP_ADAPTIVE_DEPTH": "1",
     "MTP_CONF_TAU": "0.4",
     "MTP_DEPTH_MAX": "3",

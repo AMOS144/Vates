@@ -276,6 +276,7 @@ def main():
         "exact_match": ids == base,
         "n_mismatch": sum(1 for a, b in zip(ids, base) if a != b),
         "avg_accept_len": stats["avg_accept_len"],
+        "accept_hist": stats.get("accept_hist"),
         "steps": stats["steps"],
         "verify_mode": stats.get("verify_mode"),
         "direct_commits": stats.get("direct_commits"),
