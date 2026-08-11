@@ -1,5 +1,6 @@
 """Reproducible Qwen3-Next K=3 streaming profile: ~42 tok/s below 10 GiB."""
 import os
+import sys
 
 
 FINAL_DEFAULTS = {
@@ -51,8 +52,23 @@ def configure() -> None:
         os.environ.setdefault(name, value)
 
 
+def _chat_argv(argv: list[str]) -> list[str] | None:
+    if not argv or argv[0] not in ("chat", "--chat"):
+        return None
+    return [
+        "chat",
+        "--expert-slots", FINAL_DEFAULTS["EXPERT_SLOTS"],
+        "--spec-slots", FINAL_DEFAULTS["POOL_SPEC_SLOTS"],
+        *argv[1:],
+    ]
+
+
 def main() -> None:
     configure()
+    chat_argv = _chat_argv(sys.argv[1:])
+    if chat_argv is not None:
+        from mlx_streaming.cli import main as chat
+        raise SystemExit(chat(chat_argv))
     # Configuration modules read several constants while importing, so the
     # final profile must be installed before importing the generic runner.
     from mlx_streaming.runtime.run_mtp_spec import main as run
