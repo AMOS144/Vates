@@ -221,15 +221,30 @@ class FileStreamingMoeBlock:
                 else (None,)
             )
             for _target in _targets:
-                _dummy = self._native_fused_prefetch(
-                    x, source_routes=inds, source_scores=scores,
-                    source_logits=raw_gates,
-                    target_layer=_target,
-                )
-                if _dummy is not None:
-                    # 多个 dummy 都折进当前层真实路由图；同一次 demand eval 会触发全部
-                    # target callback，不增加 host 同步，也不把任一提交挪到 source MoE 后。
-                    inds = inds + (_dummy.reshape(()).astype(inds.dtype) * 0)
+                if config.prefetch_async_predict() and _vpool is not None:
+                    # The target predictor is speculative and independent of
+                    # this layer's expert output.  Launch it on the auxiliary
+                    # stream so the current MoE is not serialized behind a
+                    # full 2048->512 gate.  Target demand remains the sole
+                    # correctness join for pending direct rows.
+                    with mx.stream(_vpool.progressive_stream()):
+                        _dummy = self._native_fused_prefetch(
+                            x, source_routes=inds, source_scores=scores,
+                            source_logits=raw_gates,
+                            target_layer=_target,
+                        )
+                        if _dummy is not None:
+                            mx.async_eval(_dummy)
+                else:
+                    _dummy = self._native_fused_prefetch(
+                        x, source_routes=inds, source_scores=scores,
+                        source_logits=raw_gates,
+                        target_layer=_target,
+                    )
+                    if _dummy is not None:
+                        # 多个 dummy 都折进当前层真实路由图；同一次 demand eval 会触发全部
+                        # target callback，不增加 host 同步，也不把任一提交挪到 source MoE 后。
+                        inds = inds + (_dummy.reshape(()).astype(inds.dtype) * 0)
         # route-delta 会物化路由与 raw logits，必须在当前块预取提交构造完成后执行。
         if route_forward_id is not None:
             route_delta_trace.record_target(

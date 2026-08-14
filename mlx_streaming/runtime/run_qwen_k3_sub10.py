@@ -25,24 +25,21 @@ FINAL_DEFAULTS = {
     "MTP_CONF_TAU": "0.4",
     "MTP_DEPTH_MAX": "3",
     "NATIVE_FUSED_PREFETCH": "1",
-    "NATIVE_NO_SUBMIT": "1",
+    "NATIVE_NO_SUBMIT": "0",
+    "PREFETCH_PREDICT_GATE_BITS": "4",
+    "PREFETCH_ASYNC_PREDICT": "1",
     "PREFETCH_ADAPTIVE": "1",
     "PREFETCH_ADAPTIVE_FILL": "0.85",
     "PREFETCH_ADAPTIVE_COOLDOWN": "8",
-    "PREFETCH_PROGRESSIVE": "1",
-    "PREFETCH_PROGRESSIVE_MODE": "k3",
-    "PREFETCH_PROGRESSIVE_TARGET_LAYERS": "1,2,5,6,7,17,18,19,30",
-    "PREFETCH_PROGRESSIVE_LATE_LAYERS": "5,6,17,18,19,30",
-    "PREFETCH_PROGRESSIVE_TARGET_CACHE_LAYERS": "1,2,5,6,7,17,18,19,30",
+    "PREFETCH_PROGRESSIVE": "0",
+    "CROSS_LAYER_AHEAD_PROFILE": "5-6:2",
+    "POOL_LAYER_CAP_OVERRIDES": "2:216,5:152",
     "PREFETCH_RERANK": "noisy_or",
-    "PREFETCH_RERANK_ROUTER_ALLOW_OVERRIDE": "1",
-    "PREFETCH_RERANK_ROUTER_PATHS": (
-        "models/qn_forecast_router_fixed64_ridge_l01_12.safetensors,"
-        "models/qn_forecast_router_fixed64_ridge_l13_47.safetensors,"
-        "models/qn_forecast_router_cap32_k3_diverse_ridge_l01_02.safetensors"
-    ),
+    "PREFETCH_RERANK_ROUTER_PATHS": "",
     "PREFETCH_RERANK_CANDIDATE_WIDTH": "64",
-    "PREFETCH_PROGRESSIVE_MAX_WIDTH": "26",
+    "PREFETCH_RERANK_WIDTH_POLICY": "predicted_route_union",
+    "PREFETCH_RERANK_RANKING_POLICY": "topk_union_fast",
+    "PREFETCH_RERANK_UNION_MARGIN": "4",
     "K": "3",
 }
 

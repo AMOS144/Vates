@@ -301,6 +301,11 @@ def prefetch_rerank_history_beta_overrides() -> "dict[int, float]":
 # logits; it trades predictor ranking fidelity for substantially less gate
 # bandwidth.  8 preserves the loaded Qwen checkpoint exactly.
 def prefetch_predict_gate_bits() -> int: return max(2, min(8, _i("PREFETCH_PREDICT_GATE_BITS", 8)))
+# Evaluate the predictor/callback on the VirtualPool's auxiliary Metal stream.
+# Demand already joins pending rows at the target boundary, so the source
+# layer need not serialize its own expert compute behind this speculative work.
+def prefetch_async_predict() -> bool:
+    return _b("PREFETCH_ASYNC_PREDICT", "0")
 # Stop rebuilding a target predictor once that layer's unified pool has a
 # stable working set.  A true demand load rearms prediction for a few forwards.
 def prefetch_adaptive() -> bool: return _b("PREFETCH_ADAPTIVE", "0")

@@ -13,6 +13,10 @@ def test_final_profile_defaults(monkeypatch):
     assert FINAL_DEFAULTS.items() <= os.environ.items()
     assert FINAL_DEFAULTS["MTP_BITS"] == "4"
     assert FINAL_DEFAULTS["MTP_EXPERT_DIR"].endswith("_4bit_g64")
+    assert FINAL_DEFAULTS["NATIVE_NO_SUBMIT"] == "0"
+    assert FINAL_DEFAULTS["PREFETCH_ASYNC_PREDICT"] == "1"
+    assert FINAL_DEFAULTS["PREFETCH_PROGRESSIVE"] == "0"
+    assert FINAL_DEFAULTS["PREFETCH_RERANK_RANKING_POLICY"] == "topk_union_fast"
 
 
 def test_final_profile_preserves_explicit_overrides(monkeypatch):
