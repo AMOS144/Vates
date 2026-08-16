@@ -160,4 +160,3 @@ def test_progressive_direct_base_matches_isolated_demand_capacity(monkeypatch):
     assert vp._direct_prefetch_base(4, 0) == 50
     # Layer zero has no predecessor/isolated admission tail.
     assert vp._direct_prefetch_base(0, 0) == -82
-
