@@ -6,13 +6,16 @@
 #include "demand.h"
 #include "side_region.h"
 #include "../io/bg_reader.h"
+#include "../prefetch/prefetch.h"
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -25,6 +28,7 @@ struct RealLayer {
   std::unordered_set<int> speculative;       // 尚未被真实路由命中的预测驻留
   std::unordered_set<int> pinned;            // 启动期安全集：真实区内不可驱逐
   std::unordered_map<int, int> pending_e2r;  // 已预留但字节尚未完整就位
+  std::unordered_set<int> partial_ready;     // pending row whose gate/up prefix is complete
   int cap = 0;
   long access = 0;                           // 累计访问(decay 用)
   bool inited = false;
@@ -38,6 +42,69 @@ static std::map<int, int> g_predict_budget;
 static std::condition_variable g_real_progress;
 static std::mutex g_pred_pending_mutex;
 static std::map<int, std::unordered_map<int, uint32_t>> g_pred_pending;
+
+// Logical rerank width and physical I/O width are intentionally separate.
+// The former is evaluated against the recall/1.5x contract; the latter caps
+// how many currently-missing rows one callback is allowed to pull from SSD.
+// A zero/negative value preserves the historical unlimited behavior.
+static int parse_positive_budget(const char* value) {
+  if (!value || !value[0]) return 0;
+  char* end = nullptr;
+  long parsed = std::strtol(value, &end, 10);
+  if (end == value || parsed <= 0) return 0;
+  return parsed > std::numeric_limits<int>::max()
+      ? std::numeric_limits<int>::max()
+      : static_cast<int>(parsed);
+}
+
+static int physical_prefetch_read_budget(int layer, int priority) {
+  // A late candidate correction is an additional submission, not a reason to
+  // reuse the early callback's whole budget.  Keeping the cap independent
+  // makes early1+late2 a true three-read policy instead of six speculative
+  // reads. Exact progressive refinement retains its established knob.
+  const char* priority_value = std::getenv(
+      priority < 0 ? "PREFETCH_MULTISTAGE_EARLY_READ_BUDGET"
+      : priority >= 2 ? "PREFETCH_REFINEMENT_READ_BUDGET"
+                    : priority == 1
+                        ? "PREFETCH_LATE_CANDIDATE_READ_BUDGET"
+                        : "");
+  if (priority_value && priority_value[0])
+    return parse_positive_budget(priority_value);
+  // Optional ``layer[-layer]:budget`` overrides let accurate/high-churn
+  // targets use a wider physical prefix without making weak layers flood the
+  // same SSD worker pool.  Parse on each call so pytest/env-driven A/B runs
+  // can change the profile in-process, matching the existing global knob.
+  const char* profile = std::getenv("PREFETCH_PHYSICAL_READ_BUDGET_PROFILE");
+  if (profile && profile[0]) {
+    const char* item = profile;
+    while (*item) {
+      const char* comma = std::strchr(item, ',');
+      const char* stop = comma ? comma : item + std::strlen(item);
+      const char* colon = static_cast<const char*>(
+          std::memchr(item, ':', static_cast<size_t>(stop - item)));
+      if (colon) {
+        std::string layer_spec(item, colon);
+        std::string budget_spec(colon + 1, stop);
+        int first = -1;
+        int last = -1;
+        const size_t dash = layer_spec.find('-');
+        if (dash == std::string::npos) {
+          first = last = std::atoi(layer_spec.c_str());
+        } else {
+          first = std::atoi(layer_spec.substr(0, dash).c_str());
+          last = std::atoi(layer_spec.substr(dash + 1).c_str());
+        }
+        if (first <= layer && layer <= last) {
+          return parse_positive_budget(budget_spec.c_str());
+        }
+      }
+      if (!comma) break;
+      item = comma + 1;
+    }
+  }
+  const char* value = std::getenv("PREFETCH_PHYSICAL_READ_BUDGET");
+  return parse_positive_budget(value);
+}
 
 // demand 统计：累计 + 本次(供 Python 更新 rp.hits/misses/gpu_fastpath/gpu_fallback)。
 static std::mutex g_dstat_mutex;
@@ -53,6 +120,22 @@ static std::atomic<long> g_async_true_fallback{0};
 static std::atomic<long> g_async_pending_rescued{0};
 static std::atomic<long> g_async_pending_wait_us{0};
 static std::atomic<long> g_async_fallback_wait_us{0};
+static std::atomic<long> g_async_layer_calls[64]{};
+static std::atomic<long> g_async_layer_fallback[64]{};
+static std::atomic<long> g_async_layer_loads[64]{};
+static std::atomic<long> g_async_layer_entry_misses[64]{};
+static std::atomic<long> g_async_layer_max_entry_misses[64]{};
+static std::atomic<long> g_async_layer_wait_us[64]{};
+static std::atomic<long> g_async_layer_pending_wait_us[64]{};
+static std::atomic<long> g_unified_prefetch_reads[64]{};
+// Entry-miss positions per target-layer call. Index 128 is the overflow
+// bucket; Qwen K<=8/top_k=10 fits without overflow.
+static std::array<std::atomic<long>, 129> g_async_miss_hist{};
+// Entry misses grouped by the actual main-model sequence length.  K=3 uses
+// seq 1..3; bucket 30 is overflow.  This lets the fixed-shape sparse compute
+// partition reserve only the safe tail needed by each sequence length.
+static std::array<std::array<std::atomic<long>, 31>, 4>
+    g_async_seq_miss_hist{};
 static std::mutex g_async_error_mutex;
 static std::string g_async_error;
 static std::mutex g_async_active_mutex;
@@ -203,7 +286,9 @@ void demand_timing_enable(bool on) {
 static void real_ensure_locked(RealLayer& c, int cap) {
   if (c.inited) {
     if (c.cap != cap)
-      throw std::invalid_argument("real region cap changed after initialization");
+      throw std::invalid_argument(
+          "real region cap changed after initialization: old=" +
+          std::to_string(c.cap) + " new=" + std::to_string(cap));
     return;
   }
   c.cap = cap;
@@ -227,7 +312,27 @@ static void real_table_set_locked(RealLayer& layer, int expert, int slot) {
 static bool real_row_leased_locked(const RealLayer& layer, int row) {
   return row >= 0 && row < 1024 && layer.lease_table &&
       __atomic_load_n(
-          layer.lease_table->data<uint32_t>() + row, __ATOMIC_ACQUIRE) != 0;
+      layer.lease_table->data<uint32_t>() + row, __ATOMIC_ACQUIRE) != 0;
+}
+
+// Close the table-read/row-overwrite race with demand_gpu_remap. The GPU
+// acquires a row lease and then confirms that expert->row is unchanged. CPU
+// eviction therefore invalidates the mapping first and rechecks the lease;
+// either the GPU observes -1, or its lease is visible and ownership is
+// restored before any bytes are overwritten.
+static bool real_try_unmap_unleased_locked(
+    RealLayer& layer, int expert, int row) {
+  if (real_row_leased_locked(layer, row)) return false;
+  int32_t expected = row;
+  int32_t* table = layer.slot_table->data<int32_t>() + expert;
+  if (!__atomic_compare_exchange_n(
+          table, &expected, -1, false,
+          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return false;
+  if (real_row_leased_locked(layer, row)) {
+    __atomic_store_n(table, row, __ATOMIC_RELEASE);
+    return false;
+  }
+  return true;
 }
 
 static int alloc_slot_locked(
@@ -305,6 +410,18 @@ std::vector<int> real_region_contents(int layer) {
   if (it != g_real.end())
     for (auto& p : it->second.e2r) { out.push_back(p.first); out.push_back(p.second); }
   return out;
+}
+
+std::vector<int> real_present_experts(int layer) {
+  std::lock_guard<std::mutex> lock(g_real_mutex);
+  std::vector<int> output;
+  auto found = g_real.find(layer);
+  if (found == g_real.end()) return output;
+  output.reserve(found->second.e2r.size() + found->second.pending_e2r.size());
+  for (const auto& item : found->second.e2r) output.push_back(item.first);
+  for (const auto& item : found->second.pending_e2r)
+    if (!found->second.e2r.count(item.first)) output.push_back(item.first);
+  return output;
 }
 
 std::vector<int> real_verified_contents(int layer) {
@@ -558,7 +675,7 @@ static int alloc_speculative_locked(
 
 std::vector<std::pair<int, int>> real_prefetch_reserve(
     const uint32_t* expert_ids, size_t count, int layer, int cap,
-    int speculative_limit, const std::vector<int>& resident) {
+    int speculative_limit, const std::vector<int>& resident, int priority) {
   std::vector<int> order;
   // ``resident`` is an audit snapshot, not an immutable ownership set.  Once
   // the unified pool is full, protecting every source-time row leaves no slot
@@ -580,11 +697,19 @@ std::vector<std::pair<int, int>> real_prefetch_reserve(
   std::lock_guard<std::mutex> lock(g_real_mutex);
   RealLayer& real = g_real[layer];
   real_ensure_locked(real, cap);
+  // Do not clear row leases here.  A prediction callback may run while Metal
+  // still consumes an older command buffer that references this target pool.
+  // Lease lifetime is closed by ``real_release_before_layer`` only after the
+  // following layer's remap command buffer completes.  Clearing the whole
+  // table at reservation time lets a background prefetch overwrite a row
+  // that is still live on the GPU, causing nondeterministic token drift.
   merge_prediction_freq_locked(layer, real);
+  const int read_budget = physical_prefetch_read_budget(layer, priority);
   for (int expert : order) real.pred_freq[expert] += 1;
 
   for (int expert : order) {
     if (real.e2r.count(expert) || real.pending_e2r.count(expert)) continue;
+    if (read_budget > 0 && static_cast<int>(reads.size()) >= read_budget) break;
     int row = -1;
     const int speculative_inflight = static_cast<int>(
         real.speculative.size() + real.pending_e2r.size());
@@ -594,19 +719,45 @@ std::vector<std::pair<int, int>> real_prefetch_reserve(
     } else {
       int victim = -1;
       uint32_t best = 0;
-      for (int candidate : real.order) {
-        if (!real.e2r.count(candidate) ||
-            !real.speculative.count(candidate) ||
-            real.pinned.count(candidate) || protect.count(candidate) ||
-            real_row_leased_locked(real, real.e2r[candidate])) continue;
+      bool victim_is_speculative = false;
+      // Prefix-only false positives have no published table entry and no
+      // active writer once partial_ready is set. Recycle one before evicting
+      // a complete expert. A demanded prefix is removed from partial_ready by
+      // real_prefetch_take_partial_route, so its down-tail cannot race this.
+      for (int candidate : real.partial_ready) {
+        auto pending = real.pending_e2r.find(candidate);
+        if (pending == real.pending_e2r.end() || protect.count(candidate))
+          continue;
         uint32_t frequency = real.pred_freq.count(candidate)
             ? real.pred_freq[candidate] : 0;
         if (victim < 0 || frequency < best) {
           victim = candidate;
           best = frequency;
+          victim_is_speculative = true;
         }
       }
-      if (victim < 0 && speculative_inflight < speculative_limit) {
+      if (victim >= 0) {
+        row = real.pending_e2r[victim];
+        real.pending_e2r.erase(victim);
+        real.partial_ready.erase(victim);
+        real.pred_freq.erase(victim);
+      }
+      if (row < 0) {
+        for (int candidate : real.order) {
+          if (!real.e2r.count(candidate) ||
+              !real.speculative.count(candidate) ||
+              real.pinned.count(candidate) || protect.count(candidate) ||
+              real_row_leased_locked(real, real.e2r[candidate])) continue;
+          uint32_t frequency = real.pred_freq.count(candidate)
+              ? real.pred_freq[candidate] : 0;
+          if (victim < 0 || frequency < best) {
+            victim = candidate;
+            best = frequency;
+            victim_is_speculative = true;
+          }
+        }
+      }
+      if (row < 0 && victim < 0 && speculative_inflight < speculative_limit) {
         for (int candidate : real.order) {
           if (!real.e2r.count(candidate) || real.speculative.count(candidate) ||
               real.pinned.count(candidate) || protect.count(candidate) ||
@@ -616,25 +767,44 @@ std::vector<std::pair<int, int>> real_prefetch_reserve(
           if (victim < 0 || frequency < best) {
             victim = candidate;
             best = frequency;
+            victim_is_speculative = false;
           }
         }
       }
-      if (victim < 0) continue;
-      // The current occurrence's selected set is authoritative.  LFU chooses
-      // which stale prediction leaves; it must not veto admission entirely,
-      // otherwise logical rerank recall never becomes physical byte coverage.
-      row = real.e2r[victim];
-      real_table_set_locked(real, victim, -1);
-      real.e2r.erase(victim);
-      real.speculative.erase(victim);
-      real.pred_freq.erase(victim);
-      for (auto it = real.order.begin(); it != real.order.end(); ++it) {
-        if (*it == victim) { real.order.erase(it); break; }
+      if (row < 0) {
+        if (victim < 0) continue;
+        // Once the bounded speculative share is established, do not replace
+        // a proven/hot prediction with a one-off candidate merely because the
+        // latter is newest.
+        const char* admission_guard = std::getenv(
+            "UNIFIED_SPEC_ADMISSION_LFU_GUARD");
+        const char* guard_min_env = std::getenv(
+            "UNIFIED_SPEC_ADMISSION_LFU_GUARD_MIN");
+        const uint32_t guard_min = guard_min_env && guard_min_env[0]
+            ? static_cast<uint32_t>(std::max(1, std::atoi(guard_min_env)))
+            : 1u;
+        if (victim_is_speculative && admission_guard &&
+            admission_guard[0] == '1' && best >= guard_min) {
+          const uint32_t incoming = real.pred_freq.count(expert)
+              ? real.pred_freq[expert] : 0;
+          if (incoming <= best) continue;
+        }
+        row = real.e2r[victim];
+        if (!real_try_unmap_unleased_locked(real, victim, row)) continue;
+        real.e2r.erase(victim);
+        real.speculative.erase(victim);
+        real.pred_freq.erase(victim);
+        for (auto it = real.order.begin(); it != real.order.end(); ++it) {
+          if (*it == victim) { real.order.erase(it); break; }
+        }
       }
     }
     real.pending_e2r[expert] = row;
     reads.emplace_back(expert, row);
   }
+  if (layer >= 0 && layer < 64)
+    g_unified_prefetch_reads[layer].fetch_add(
+        static_cast<long>(reads.size()), std::memory_order_relaxed);
   return reads;
 }
 
@@ -646,10 +816,25 @@ void real_prefetch_publish(int layer, int expert, int row, int cap) {
     auto pending = real.pending_e2r.find(expert);
     if (pending == real.pending_e2r.end() || pending->second != row) return;
     real.pending_e2r.erase(pending);
+    real.partial_ready.erase(expert);
     real.e2r[expert] = row;
     real.order.push_back(expert);
     real.speculative.insert(expert);
     real_table_set_locked(real, expert, row);
+  }
+  g_real_progress.notify_all();
+}
+
+void real_prefetch_publish_partial(int layer, int expert, int row, int cap) {
+  {
+    std::lock_guard<std::mutex> lock(g_real_mutex);
+    RealLayer& real = g_real[layer];
+    real_ensure_locked(real, cap);
+    auto pending = real.pending_e2r.find(expert);
+    if (pending == real.pending_e2r.end() || pending->second != row) return;
+    // Deliberately keep the row out of e2r: an ordinary full-MoE consumer
+    // must never observe a row whose down projection has not arrived.
+    real.partial_ready.insert(expert);
   }
   g_real_progress.notify_all();
 }
@@ -662,9 +847,56 @@ void real_prefetch_abort(int layer, int expert, int row, int cap) {
     auto pending = real.pending_e2r.find(expert);
     if (pending == real.pending_e2r.end() || pending->second != row) return;
     real.pending_e2r.erase(pending);
+    real.partial_ready.erase(expert);
     real.free_rows.push_back(row);
   }
   g_real_progress.notify_all();
+}
+
+std::unordered_map<int, int> real_prefetch_take_partial_route(
+    int layer, const uint32_t* expert_ids, size_t count,
+    std::vector<std::pair<int, int>>* all_partial) {
+  std::unordered_set<int> route;
+  for (size_t index = 0; index < count; ++index)
+    route.insert(static_cast<int>(expert_ids[index]));
+  std::unique_lock<std::mutex> lock(g_real_mutex);
+  const char* demand_tail_env = std::getenv(
+      "PREFETCH_PARTIAL_DEMAND_TAIL");
+  const bool demand_tail = demand_tail_env && demand_tail_env[0] == '1';
+  // The original projection-split experiment drains the complete physical
+  // batch. Demand-tail waits only prefixes used by this real route; false
+  // positives stay prefix-only and can be recycled by the next reservation.
+  g_real_progress.wait(lock, [&] {
+    auto found = g_real.find(layer);
+    if (found == g_real.end()) return true;
+    const RealLayer& real = found->second;
+    for (const auto& pending : real.pending_e2r) {
+      if (demand_tail && !route.count(pending.first)) continue;
+      if (!real.partial_ready.count(pending.first)) return false;
+    }
+    return true;
+  });
+  std::unordered_map<int, int> selected;
+  auto found = g_real.find(layer);
+  if (found == g_real.end()) return selected;
+  RealLayer& real = found->second;
+  for (const auto& item : real.pending_e2r) {
+    const int expert = item.first;
+    const int row = item.second;
+    if (!real.partial_ready.count(expert)) continue;
+    if (!demand_tail && all_partial)
+      all_partial->emplace_back(expert, row);
+    if (route.count(expert)) {
+      selected[expert] = row;
+      if (demand_tail) {
+        if (all_partial) all_partial->emplace_back(expert, row);
+        // Removing it from the recyclable set protects its row while the
+        // handler reads down_proj. pending_e2r remains until full publish.
+        real.partial_ready.erase(expert);
+      }
+    }
+  }
+  return selected;
 }
 
 void real_prefetch_wait_pending(
@@ -673,6 +905,35 @@ void real_prefetch_wait_pending(
   for (size_t index = 0; index < count; ++index)
     route.insert(static_cast<int>(expert_ids[index]));
   std::unique_lock<std::mutex> lock(g_real_mutex);
+  const char* partial = std::getenv("PREFETCH_PARTIAL_PROJECTIONS");
+  const char* async = std::getenv("DEMAND_ASYNC");
+  if (partial && partial[0] == '1' && (!async || async[0] != '1')) {
+    // A previous decode request may end with ahead predictions whose prefix
+    // completed after its final token. Prompt ingestion intentionally uses
+    // synchronous full-MoE demand, so discard such prefix-only rows instead
+    // of waiting forever for a down-tail consumer that no longer exists.
+    g_real_progress.wait(lock, [&] {
+      auto found = g_real.find(layer);
+      if (found == g_real.end()) return true;
+      for (int expert : route) {
+        auto pending = found->second.pending_e2r.find(expert);
+        if (pending != found->second.pending_e2r.end() &&
+            !found->second.partial_ready.count(expert)) return false;
+      }
+      return true;
+    });
+    auto found = g_real.find(layer);
+    if (found != g_real.end()) {
+      RealLayer& real = found->second;
+      for (int expert : route) {
+        if (!real.partial_ready.erase(expert)) continue;
+        auto pending = real.pending_e2r.find(expert);
+        if (pending == real.pending_e2r.end()) continue;
+        real.free_rows.push_back(pending->second);
+        real.pending_e2r.erase(pending);
+      }
+    }
+  }
   g_real_progress.wait(lock, [&] {
     auto found = g_real.find(layer);
     if (found == g_real.end()) return true;
@@ -772,8 +1033,33 @@ static std::vector<long> submit_demand_reads(
     const std::vector<std::pair<int, int>>& placements,
     const std::string& path, long stride) {
   std::vector<long> tickets;
-  tickets.reserve(placements.size() * pools.size());
+  const char* preadv_env = std::getenv("DEMAND_PREADV");
+  const bool use_preadv = preadv_env && preadv_env[0] == '1';
+  const char* groups_env = std::getenv("DEMAND_PREADV_GROUPS");
+  const size_t preadv_groups = use_preadv
+      ? std::max<size_t>(
+            1, std::min<size_t>(
+                   pools.size(), groups_env ? std::atoi(groups_env) : 1))
+      : 0;
+  tickets.reserve(
+      placements.size() * (use_preadv ? preadv_groups : pools.size()));
   for (const auto& placement : placements) {
+    if (use_preadv) {
+      const size_t group_size = (
+          pools.size() + preadv_groups - 1) / preadv_groups;
+      for (size_t begin = 0; begin < pools.size(); begin += group_size) {
+        const size_t end = std::min(pools.size(), begin + group_size);
+        const long ticket = g_demand_ticket.fetch_add(1);
+        bg_preadv_into_pool(
+            std::vector<mx::array>(pools.begin() + begin, pools.begin() + end),
+            std::vector<long>(seg_off.begin() + begin, seg_off.begin() + end),
+            std::vector<long>(seg_nb.begin() + begin, seg_nb.begin() + end),
+            placement.second, placement.first, path, stride, ticket,
+            /*prio=*/1, /*nocache=*/false);
+        tickets.push_back(ticket);
+      }
+      continue;
+    }
     // A typical routed layer misses only one expert.  One job per expert then
     // leaves seven of eight readers idle while that worker performs all six
     // projection/quantization-segment reads serially.  Each segment targets a
@@ -816,6 +1102,12 @@ mx::array demand_dual(
   std::unordered_map<int, int> side = use_side
       ? sideregion_snapshot(layer, side_gen)
       : std::unordered_map<int, int>{};
+  // Unified direct prefetch removes the victim from e2r while its replacement
+  // row is being filled.  A synchronous demand for that same expert must join
+  // the in-flight read before allocating, otherwise a full pool can report no
+  // evictable row even though the required row has already been reserved.
+  if (!use_side)
+    real_prefetch_wait_pending(layer, ip, n);
   double ta = g_dt_on ? dt_now_us() : 0;
   long stats[3];
   std::vector<int32_t> local;
@@ -850,7 +1142,7 @@ mx::array demand_dual(
     auto tickets = submit_demand_reads(
         pool_list, seg_off, seg_nb, placements, path,
         static_cast<long>(stride));
-    for (long tk : tickets) bg_reader_wait(tk);   // 并行 pread 完成 → 池槽字节就绪
+    bg_reader_wait_all(tickets);                  // 一次锁等待整批并行 pread
   }
   if (!placements.empty()) {
     std::lock_guard<std::mutex> lock(g_real_mutex);
@@ -883,6 +1175,7 @@ namespace {
 
 struct AsyncDemandState {
   NS::SharedPtr<MTL::SharedEvent> event;
+  uint64_t prefix_value = 0;
   uint64_t demand_value = 0;
 };
 
@@ -949,6 +1242,17 @@ static void force_async_commit(
     // a normal evaluator-owned submission boundary.  Do not pad that buffer.
     return;
   }
+  const char* direct_commit = std::getenv("DEMAND_DIRECT_COMMIT");
+  if (direct_commit && direct_commit[0] == '1') {
+    // Current MLX exposes CommandEncoder::commit() as a supported public API.
+    // Committing here closes exactly the producer buffer whose completion
+    // handler owns demand I/O; the following wait primitive is then encoded
+    // into a fresh buffer.  This replaces the historical max-ops worth of
+    // synthetic no-op dispatches without changing handler/event ordering.
+    encoder.end_encoding();
+    encoder.commit();
+    return;
+  }
   auto library = device.get_library(
       "streaming_async_demand", [] { return async_demand_metal_source(); });
   auto noop = device.get_kernel("demand_async_noop", library);
@@ -972,12 +1276,14 @@ class AsyncDemandPrimitive : public mx::Primitive {
       std::string path, int stride, int cap, bool lfu,
       int decay_interval, int64_t forward_id, int sequence_length,
       bool use_side, bool wait_for_pending, bool wait_for_refinement,
-      bool evaluator_submit,
+      bool evaluator_submit, bool partial_projection = false,
       std::vector<int> prefetch_seg_nbytes = {},
       int prefetch_layer = -1, std::string prefetch_path = {},
       int prefetch_stride = 0, int prefetch_cap = 0,
       int prefetch_spec_limit = 0,
-      std::vector<int> prefetch_resident = {})
+      std::vector<int> prefetch_resident = {},
+      std::vector<long> staging_generations = {},
+      int staging_spec_limit = 0)
       : Primitive(stream), state_(std::move(state)),
         seg_nbytes_(std::move(seg_nbytes)), layer_(layer),
         side_gen_(side_gen), path_(std::move(path)), stride_(stride),
@@ -986,12 +1292,15 @@ class AsyncDemandPrimitive : public mx::Primitive {
         use_side_(use_side), wait_for_pending_(wait_for_pending),
         wait_for_refinement_(wait_for_refinement),
         evaluator_submit_(evaluator_submit),
+        partial_projection_(partial_projection),
         prefetch_seg_nbytes_(std::move(prefetch_seg_nbytes)),
         prefetch_layer_(prefetch_layer),
         prefetch_path_(std::move(prefetch_path)),
         prefetch_stride_(prefetch_stride), prefetch_cap_(prefetch_cap),
         prefetch_spec_limit_(prefetch_spec_limit),
-        prefetch_resident_(std::move(prefetch_resident)) {}
+        prefetch_resident_(std::move(prefetch_resident)),
+        staging_generations_(std::move(staging_generations)),
+        staging_spec_limit_(staging_spec_limit) {}
 
   const char* name() const override { return "AsyncDemandPrimitive"; }
 
@@ -1004,17 +1313,22 @@ class AsyncDemandPrimitive : public mx::Primitive {
       std::vector<mx::array>& outputs) override {
     const bool fused_prefetch = prefetch_layer_ >= 0;
     const size_t demand_input_count = seg_nbytes_.size() + 4;
-    const size_t expected_inputs = demand_input_count + (
+    const size_t staging_input_count = staging_generations_.size();
+    const size_t expected_inputs = demand_input_count + staging_input_count + (
         fused_prefetch ? 1 + prefetch_seg_nbytes_.size() : 0);
     if (inputs.size() < 5 || expected_inputs != inputs.size())
       throw std::invalid_argument("async demand input/segment mismatch");
-    if (outputs.size() != 2)
-      throw std::invalid_argument("async demand requires entry/final outputs");
+    if (outputs.size() != (partial_projection_ ? 3 : 2))
+      throw std::invalid_argument("async demand output count mismatch");
     outputs[0].set_data(mx::allocator::malloc(outputs[0].nbytes()));
     outputs[1].set_data(mx::allocator::malloc(outputs[1].nbytes()));
+    if (partial_projection_)
+      outputs[2].set_data(mx::allocator::malloc(outputs[2].nbytes()));
     auto entry_local = outputs[0];
-    auto final_local = outputs[1];
+    auto prefix_local = partial_projection_ ? outputs[1] : outputs[0];
+    auto final_local = partial_projection_ ? outputs[2] : outputs[1];
     int32_t* entry_ptr = entry_local.data<int32_t>();
+    int32_t* prefix_ptr = prefix_local.data<int32_t>();
     int32_t* final_ptr = final_local.data<int32_t>();
     const mx::array ids = inputs[0];
     const uint32_t* id_ptr = ids.data<uint32_t>();
@@ -1024,6 +1338,9 @@ class AsyncDemandPrimitive : public mx::Primitive {
     const mx::array real_table = inputs[1 + seg_nbytes_.size()];
     const mx::array side_table = inputs[2 + seg_nbytes_.size()];
     const mx::array row_leases = inputs[3 + seg_nbytes_.size()];
+    std::vector<mx::array> staging_buffers(
+        inputs.begin() + demand_input_count,
+        inputs.begin() + demand_input_count + staging_input_count);
     std::vector<uint8_t*> pool_ptrs;
     pool_ptrs.reserve(pools.size());
     for (auto pool : pools) pool_ptrs.push_back(pool.data<uint8_t>());
@@ -1032,11 +1349,12 @@ class AsyncDemandPrimitive : public mx::Primitive {
     size_t prefetch_count = 0;
     std::vector<mx::array> prefetch_pools;
     if (fused_prefetch) {
-      prefetch_ids = inputs[demand_input_count];
+      const size_t prefetch_offset = demand_input_count + staging_input_count;
+      prefetch_ids = inputs[prefetch_offset];
       prefetch_id_ptr = prefetch_ids.data<uint32_t>();
       prefetch_count = prefetch_ids.size();
       prefetch_pools.assign(
-          inputs.begin() + demand_input_count + 1, inputs.end());
+          inputs.begin() + prefetch_offset + 1, inputs.end());
     }
 
     auto& device = mx::metal::device(stream().device);
@@ -1050,6 +1368,9 @@ class AsyncDemandPrimitive : public mx::Primitive {
         g_async_event_value.store(1, std::memory_order_relaxed);
       }
       state->event = g_async_event;
+      if (partial_projection_)
+        state->prefix_value =
+            g_async_event_value.fetch_add(1, std::memory_order_relaxed);
       state->demand_value =
           g_async_event_value.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1058,6 +1379,7 @@ class AsyncDemandPrimitive : public mx::Primitive {
     const bool lfu = lfu_, use_side = use_side_;
     const bool wait_for_pending = wait_for_pending_;
     const bool wait_for_refinement = wait_for_refinement_;
+    const bool partial_projection = partial_projection_;
     const int decay = decay_interval_, sequence_length = sequence_length_;
     const int64_t forward_id = forward_id_;
     const std::string path = path_;
@@ -1068,6 +1390,8 @@ class AsyncDemandPrimitive : public mx::Primitive {
     const int prefetch_cap = prefetch_cap_;
     const int prefetch_spec_limit = prefetch_spec_limit_;
     const auto prefetch_resident = prefetch_resident_;
+    const auto staging_generations = staging_generations_;
+    const int staging_spec_limit = staging_spec_limit_;
     // Persistent shared tables are updated when real/side ownership changes.
     // Remap therefore follows gate computation in the same command buffer;
     // there is no host table snapshot or pre-remap SharedEvent round trip.
@@ -1075,55 +1399,52 @@ class AsyncDemandPrimitive : public mx::Primitive {
         "streaming_async_demand", [] { return async_demand_metal_source(); });
     auto remap = device.get_kernel("demand_gpu_remap", library);
     encoder.set_compute_pipeline_state(remap);
-    encoder.set_input_array(ids, 0);
-    encoder.set_input_array(real_table, 1);
-    encoder.set_input_array(side_table, 2);
-    encoder.set_input_array(row_leases, 3);
-    encoder.set_output_array(outputs[0], 4);
-    const char* lease_env = std::getenv("SIDEREGION_ROW_LEASES");
-    struct LeaseParams {
-      int side_enabled; int real_cap; int real_enabled; int side_lease_enabled;
-    };
-    const LeaseParams lease_params = {
-        use_side ? 1 : 0,
-        cap,
-        use_side ? 0 : 1,
-        use_side && lease_env && lease_env[0] == '1' ? 1 : 0,
-    };
-    encoder.set_bytes(lease_params, 5);
-    encoder.dispatch_threads(
-        MTL::Size(count, 1, 1),
-        MTL::Size(std::min<size_t>(count, 256), 1, 1));
-
-    // Submit the route-producing buffer before encoding the separate
-    // final-local wait primitive.
-    force_async_commit(device, encoder, outputs[0], evaluator_submit_);
+    // The completion handler reads entry_local, so it must be attached to the
+    // command buffer containing demand_gpu_remap.
     MTL::CommandBuffer* command_buffer = encoder.get_command_buffer();
     {
       std::lock_guard<std::mutex> lock(g_async_active_mutex);
       ++g_async_active;
     }
     command_buffer->addCompletedHandler(
-        [inputs, pools, pool_ptrs, prefetch_ids, prefetch_pools,
-         prefetch_id_ptr, prefetch_count, entry_local, final_local, entry_ptr,
-         final_ptr, id_ptr, count,
+        [inputs, pools, pool_ptrs, staging_buffers, staging_generations,
+         prefetch_ids, prefetch_pools,
+         prefetch_id_ptr, prefetch_count, entry_local, prefix_local, final_local,
+         entry_ptr, prefix_ptr, final_ptr, id_ptr, count,
          state, seg_nbytes, layer, side_gen, path, stride, cap, lfu,
          decay, forward_id, sequence_length, use_side,
          wait_for_pending, wait_for_refinement, prefetch_seg_nbytes,
          prefetch_layer, prefetch_path, prefetch_stride, prefetch_cap,
-         prefetch_spec_limit, prefetch_resident](MTL::CommandBuffer*) {
+         prefetch_spec_limit, prefetch_resident,
+         partial_projection, staging_spec_limit](MTL::CommandBuffer*) {
           try {
+            sideregion_mark_target_consumed(forward_id, layer);
             if (use_side) sideregion_release_before_layer(layer);
             else real_release_before_layer(layer);
             long stats[3] = {0, 0, 0};
             bool overcap = false;
             std::vector<int32_t> local;
             std::vector<std::pair<int, int>> placements;
+            std::unordered_map<int, int> partial_route;
+            std::vector<std::pair<int, int>> all_partial;
             bool any_miss = false;
             long entry_hit_positions = 0;
             for (size_t index = 0; index < count; ++index) {
               any_miss = any_miss || entry_ptr[index] < 0;
               entry_hit_positions += entry_ptr[index] >= 0;
+            }
+            struct StagedRow { size_t bank; int row; };
+            std::unordered_map<int, StagedRow> staged_rows;
+            for (size_t bank = 0; bank < staging_generations.size(); ++bank) {
+              const auto ready = prefetch_staging_take_for_demand(
+                  layer, staging_generations[bank]);
+              for (size_t index = 1; index + 1 < ready.size(); index += 2) {
+                const int expert = static_cast<int>(ready[index]);
+                const int row = static_cast<int>(ready[index + 1]);
+                if (row >= 0 && static_cast<size_t>(row + 1) * stride
+                        <= staging_buffers[bank].nbytes())
+                  staged_rows.emplace(expert, StagedRow{bank, row});
+              }
             }
             // The GPU remap is the authoritative entry snapshot.  Do not copy
             // the complete side ownership map or take the real-pool lock on
@@ -1143,7 +1464,19 @@ class AsyncDemandPrimitive : public mx::Primitive {
             }
             note_deadline_from_gpu_local(
                 layer, id_ptr, entry_ptr, count, cap);
-            if (any_miss && wait_for_pending) {
+            if (any_miss && partial_projection) {
+              auto pending_t0 = std::chrono::steady_clock::now();
+              partial_route = real_prefetch_take_partial_route(
+                  layer, id_ptr, count, &all_partial);
+              const long pending_wait_us = static_cast<long>(
+                  std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - pending_t0).count());
+              g_async_pending_wait_us.fetch_add(
+                  pending_wait_us, std::memory_order_relaxed);
+              if (layer >= 0 && layer < 64)
+                g_async_layer_pending_wait_us[layer].fetch_add(
+                    pending_wait_us, std::memory_order_relaxed);
+            } else if (any_miss && wait_for_pending) {
               auto pending_t0 = std::chrono::steady_clock::now();
               if (use_side) {
                 if (wait_for_refinement)
@@ -1157,14 +1490,23 @@ class AsyncDemandPrimitive : public mx::Primitive {
                   sideregion_wait_refinement(forward_id, layer);
                 real_prefetch_wait_pending(layer, id_ptr, count);
               }
-              g_async_pending_wait_us.fetch_add(
-                  static_cast<long>(std::chrono::duration_cast<
+              const long pending_wait_us = static_cast<long>(
+                  std::chrono::duration_cast<
                       std::chrono::microseconds>(
-                      std::chrono::steady_clock::now() - pending_t0).count()),
+                      std::chrono::steady_clock::now() - pending_t0).count());
+              g_async_pending_wait_us.fetch_add(
+                  pending_wait_us,
                   std::memory_order_relaxed);
+              if (layer >= 0 && layer < 64)
+                g_async_layer_pending_wait_us[layer].fetch_add(
+                    pending_wait_us, std::memory_order_relaxed);
             }
             if (!any_miss) {
               stats[0] = static_cast<long>(count);
+              if (partial_projection) {
+                std::memcpy(prefix_ptr, entry_ptr, count * sizeof(int32_t));
+                state->event->setSignaledValue(state->prefix_value);
+              }
               std::memcpy(final_ptr, entry_ptr, count * sizeof(int32_t));
               if (use_side)
                 sideregion_note_demand_values(
@@ -1196,7 +1538,11 @@ class AsyncDemandPrimitive : public mx::Primitive {
               for (size_t index = 0; index < count; ++index) {
                 const int expert = static_cast<int>(id_ptr[index]);
                 const int entry_row = static_cast<int>(entry_ptr[index]);
-                const int side_row = static_cast<int>(side_local[index]);
+                const auto partial = partial_route.find(expert);
+                const int partial_row = partial == partial_route.end()
+                    ? -1 : partial->second;
+                const int side_row = partial_row >= 0
+                    ? partial_row : static_cast<int>(side_local[index]);
                 if (side_row >= 0) route_side[expert] = side_row;
                 // Real rows are stable until this handler takes the real lock.
                 // A side row must be revalidated because a prefetch callback
@@ -1237,7 +1583,67 @@ class AsyncDemandPrimitive : public mx::Primitive {
               throw std::runtime_error(
                   "async demand route set exceeds real pool capacity");
 
-            if (!placements.empty()) {
+            long fallback_wait_us = 0;
+            const bool partial_down_first = partial_projection && [] {
+              const char* value = std::getenv("PREFETCH_PARTIAL_ORDER");
+              return value && std::strcmp(value, "down_first") == 0;
+            }();
+            std::vector<std::pair<int, int>> fallback_placements;
+            std::vector<std::pair<int, int>> staged_placements;
+            fallback_placements.reserve(placements.size());
+            for (const auto& placement : placements) {
+              if (staged_rows.count(placement.first))
+                staged_placements.push_back(placement);
+              else
+                fallback_placements.push_back(placement);
+            }
+            // Only now, after the real route has allocated and protected every
+            // row it will consume, admit completed false positives as bounded
+            // speculative cache entries for a later MTP branch/traversal.
+            if (!staged_rows.empty() && staging_spec_limit > 0) {
+              std::unordered_set<int> protect;
+              for (size_t index = 0; index < count; ++index)
+                protect.insert(static_cast<int>(id_ptr[index]));
+              std::lock_guard<std::mutex> lock(g_real_mutex);
+              RealLayer& real = g_real[layer];
+              real_ensure_locked(real, cap);
+              for (const auto& staged : staged_rows) {
+                if (protect.count(staged.first) || real.e2r.count(staged.first))
+                  continue;
+                const int slot = alloc_speculative_locked(
+                    real, staged.first, staging_spec_limit, protect);
+                if (slot >= 0)
+                  staged_placements.emplace_back(staged.first, slot);
+              }
+            }
+            if (!staged_placements.empty()) {
+              std::vector<size_t> offsets(seg_nbytes.size(), 0);
+              for (size_t index = 1; index < seg_nbytes.size(); ++index)
+                offsets[index] = offsets[index - 1]
+                    + static_cast<size_t>(seg_nbytes[index - 1]);
+              for (const auto& placement : staged_placements) {
+                const auto staged = staged_rows.find(placement.first);
+                const uint8_t* source = staging_buffers[staged->second.bank]
+                    .data<uint8_t>()
+                    + static_cast<size_t>(staged->second.row)
+                        * static_cast<size_t>(stride);
+                for (size_t segment = 0; segment < seg_nbytes.size(); ++segment)
+                  std::memcpy(
+                      pool_ptrs[segment]
+                          + static_cast<size_t>(placement.second)
+                              * static_cast<size_t>(seg_nbytes[segment]),
+                      source + offsets[segment],
+                      static_cast<size_t>(seg_nbytes[segment]));
+              }
+            }
+            stats[2] = static_cast<long>(fallback_placements.size());
+            // The handler no longer dereferences staging buffers beyond this
+            // point.  Publish recycle permission only now; publishing it in
+            // take_for_demand allowed Python to reuse a finished bank while
+            // these memcpy operations were still running.
+            for (long generation : staging_generations)
+              prefetch_staging_mark_consumed(layer, generation);
+            if (!fallback_placements.empty()) {
               auto fallback_t0 = std::chrono::steady_clock::now();
               std::vector<long> seg_off(seg_nbytes.size());
               std::vector<long> seg_nb(seg_nbytes.size());
@@ -1247,15 +1653,82 @@ class AsyncDemandPrimitive : public mx::Primitive {
                 seg_nb[index] = seg_nbytes[index];
                 offset += seg_nbytes[index];
               }
-              auto tickets = submit_demand_reads(
-                  pools, seg_off, seg_nb, placements, path,
-                  static_cast<long>(stride));
-              for (long ticket : tickets) bg_reader_wait(ticket);
-              g_async_fallback_wait_us.fetch_add(
-                  static_cast<long>(std::chrono::duration_cast<
+              if (partial_projection && !partial_down_first) {
+                std::vector<mx::array> prefix_pools(pools.begin(), pools.begin() + 6);
+                std::vector<long> prefix_off(seg_off.begin(), seg_off.begin() + 6);
+                std::vector<long> prefix_nb(seg_nb.begin(), seg_nb.begin() + 6);
+                auto tickets = submit_demand_reads(
+                    prefix_pools, prefix_off, prefix_nb,
+                    fallback_placements, path,
+                    static_cast<long>(stride));
+                bg_reader_wait_all(tickets);
+              } else {
+                auto tickets = submit_demand_reads(
+                    pools, seg_off, seg_nb, fallback_placements, path,
+                    static_cast<long>(stride));
+                bg_reader_wait_all(tickets);
+              }
+              fallback_wait_us = static_cast<long>(std::chrono::duration_cast<
                       std::chrono::microseconds>(
-                      std::chrono::steady_clock::now() - fallback_t0).count()),
-                  std::memory_order_relaxed);
+                      std::chrono::steady_clock::now() - fallback_t0).count());
+              g_async_fallback_wait_us.fetch_add(
+                  fallback_wait_us, std::memory_order_relaxed);
+            }
+            if (partial_down_first && !all_partial.empty()) {
+              auto fallback_t0 = std::chrono::steady_clock::now();
+              std::vector<long> prefix_off(seg_nbytes.size());
+              std::vector<long> prefix_nb(seg_nbytes.size());
+              long offset = 0;
+              for (size_t index = 0; index < seg_nbytes.size(); ++index) {
+                prefix_off[index] = offset;
+                prefix_nb[index] = seg_nbytes[index];
+                offset += seg_nbytes[index];
+              }
+              std::vector<mx::array> prefix_pools(
+                  pools.begin(), pools.begin() + 6);
+              auto tickets = submit_demand_reads(
+                  prefix_pools,
+                  std::vector<long>(prefix_off.begin(), prefix_off.begin() + 6),
+                  std::vector<long>(prefix_nb.begin(), prefix_nb.begin() + 6),
+                  all_partial, path, static_cast<long>(stride));
+              bg_reader_wait_all(tickets);
+              const long wait_us = static_cast<long>(std::chrono::duration_cast<
+                      std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - fallback_t0).count());
+              fallback_wait_us += wait_us;
+              g_async_fallback_wait_us.fetch_add(
+                  wait_us, std::memory_order_relaxed);
+            }
+            if (partial_projection && any_miss) {
+              std::memcpy(prefix_ptr, local.data(), count * sizeof(int32_t));
+              // Release gate/up immediately; the GPU may now consume only the
+              // six completed prefix arrays while this handler reads down.
+              state->event->setSignaledValue(state->prefix_value);
+              std::vector<std::pair<int, int>> tails;
+              if (!partial_down_first) {
+                tails = fallback_placements;
+                tails.insert(
+                    tails.end(), all_partial.begin(), all_partial.end());
+              }
+              if (!tails.empty()) {
+                std::vector<long> offsets(seg_nbytes.size());
+                std::vector<long> lengths(seg_nbytes.size());
+                long offset = 0;
+                for (size_t i = 0; i < seg_nbytes.size(); ++i) {
+                  offsets[i] = offset;
+                  lengths[i] = seg_nbytes[i];
+                  offset += seg_nbytes[i];
+                }
+                std::vector<mx::array> tail_pools(pools.begin() + 6, pools.end());
+                std::vector<long> tail_off(offsets.begin() + 6, offsets.end());
+                std::vector<long> tail_nb(lengths.begin() + 6, lengths.end());
+                auto tickets = submit_demand_reads(
+                    tail_pools, tail_off, tail_nb, tails, path,
+                    static_cast<long>(stride));
+                bg_reader_wait_all(tickets);
+              }
+              for (const auto& item : all_partial)
+                real_prefetch_publish(layer, item.first, item.second, cap);
             }
             // Current-layer true misses are deadline-critical. Starting the
             // next layer's broad speculative batch before them can occupy a
@@ -1273,6 +1746,8 @@ class AsyncDemandPrimitive : public mx::Primitive {
             }
             if (any_miss)
               std::memcpy(final_ptr, local.data(), count * sizeof(int32_t));
+            if (!staging_generations.empty())
+              prefetch_staging_finish_demand(forward_id, layer);
             if (use_side)
               sideregion_acquire_row_leases(
                   layer, final_ptr, count, cap);
@@ -1285,6 +1760,34 @@ class AsyncDemandPrimitive : public mx::Primitive {
                 entry_hit_positions, std::memory_order_relaxed);
             g_async_positions.fetch_add(
                 static_cast<long>(count), std::memory_order_relaxed);
+            const size_t entry_misses = count - static_cast<size_t>(
+                entry_hit_positions);
+            if (layer >= 0 && layer < 64) {
+              g_async_layer_calls[layer].fetch_add(1, std::memory_order_relaxed);
+              g_async_layer_loads[layer].fetch_add(
+                  stats[2], std::memory_order_relaxed);
+              g_async_layer_entry_misses[layer].fetch_add(
+                  static_cast<long>(entry_misses), std::memory_order_relaxed);
+              long observed = g_async_layer_max_entry_misses[layer].load(
+                  std::memory_order_relaxed);
+              while (
+                  observed < static_cast<long>(entry_misses)
+                  && !g_async_layer_max_entry_misses[layer].compare_exchange_weak(
+                      observed, static_cast<long>(entry_misses),
+                      std::memory_order_relaxed)) {}
+              g_async_layer_wait_us[layer].fetch_add(
+                  fallback_wait_us, std::memory_order_relaxed);
+              if (stats[2] > 0)
+                g_async_layer_fallback[layer].fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            g_async_miss_hist[std::min<size_t>(entry_misses, 128)].fetch_add(
+                1, std::memory_order_relaxed);
+            if (sequence_length >= 1 && sequence_length <= 3) {
+              g_async_seq_miss_hist[static_cast<size_t>(sequence_length)]
+                  [std::min<size_t>(entry_misses, 30)].fetch_add(
+                      1, std::memory_order_relaxed);
+            }
             const long rescued = std::max<long>(
                 0, stats[0] - entry_hit_positions);
             g_async_pending_rescued.fetch_add(
@@ -1300,6 +1803,12 @@ class AsyncDemandPrimitive : public mx::Primitive {
             else
               g_async_fallback.fetch_add(1, std::memory_order_relaxed);
           } catch (const std::exception& error) {
+            for (long generation : staging_generations)
+              prefetch_staging_mark_consumed(layer, generation);
+            if (partial_projection) {
+              std::fill(prefix_ptr, prefix_ptr + count, 0);
+              state->event->setSignaledValue(state->prefix_value);
+            }
             std::fill(final_ptr, final_ptr + count, 0);
             std::lock_guard<std::mutex> lock(g_async_error_mutex);
             if (g_async_error.empty()) g_async_error = error.what();
@@ -1313,6 +1822,31 @@ class AsyncDemandPrimitive : public mx::Primitive {
           }
           g_async_active_cv.notify_all();
         });
+    // Attach the handler before dispatch: dispatch_threads() is allowed to
+    // auto-commit when an MLX command buffer reaches its operation limit.
+    encoder.set_input_array(ids, 0);
+    encoder.set_input_array(real_table, 1);
+    encoder.set_input_array(side_table, 2);
+    encoder.set_input_array(row_leases, 3);
+    encoder.set_output_array(outputs[0], 4);
+    const char* lease_env = std::getenv("SIDEREGION_ROW_LEASES");
+    struct LeaseParams {
+      int side_enabled; int real_cap; int real_enabled; int side_lease_enabled;
+    };
+    const LeaseParams lease_params = {
+        use_side ? 1 : 0,
+        cap,
+        use_side ? 0 : 1,
+        use_side && lease_env && lease_env[0] == '1' ? 1 : 0,
+    };
+    encoder.set_bytes(lease_params, 5);
+    encoder.dispatch_threads(
+        MTL::Size(count, 1, 1),
+        MTL::Size(std::min<size_t>(count, 256), 1, 1));
+    // Ask the evaluator to submit this producer buffer before it encodes the
+    // event-gated consumer.  The handler is already attached, so crossing the
+    // operation limit here cannot accidentally attach it to the next buffer.
+    force_async_commit(device, encoder, outputs[0], evaluator_submit_);
   }
 
  private:
@@ -1329,6 +1863,7 @@ class AsyncDemandPrimitive : public mx::Primitive {
   bool wait_for_pending_;
   bool wait_for_refinement_;
   bool evaluator_submit_;
+  bool partial_projection_;
   std::vector<int> prefetch_seg_nbytes_;
   int prefetch_layer_;
   std::string prefetch_path_;
@@ -1336,13 +1871,16 @@ class AsyncDemandPrimitive : public mx::Primitive {
   int prefetch_cap_;
   int prefetch_spec_limit_;
   std::vector<int> prefetch_resident_;
+  std::vector<long> staging_generations_;
+  int staging_spec_limit_;
 };
 
 class AsyncDemandWaitPrimitive : public mx::Primitive {
  public:
   AsyncDemandWaitPrimitive(
-      mx::Stream stream, std::shared_ptr<AsyncDemandState> state)
-      : Primitive(stream), state_(std::move(state)) {}
+      mx::Stream stream, std::shared_ptr<AsyncDemandState> state,
+      bool prefix = false)
+      : Primitive(stream), state_(std::move(state)), prefix_(prefix) {}
   const char* name() const override { return "AsyncDemandWaitPrimitive"; }
   void eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) override {
     throw std::runtime_error("AsyncDemandWaitPrimitive requires Metal");
@@ -1355,7 +1893,7 @@ class AsyncDemandWaitPrimitive : public mx::Primitive {
     auto& encoder = mx::metal::get_command_encoder(stream());
     encoder.end_encoding();
     encoder.get_command_buffer()->encodeWait(
-        state_->event.get(), state_->demand_value);
+        state_->event.get(), prefix_ ? state_->prefix_value : state_->demand_value);
     auto library = device.get_library(
         "streaming_async_demand", [] { return async_demand_metal_source(); });
     auto copy = device.get_kernel("demand_async_copy", library);
@@ -1369,6 +1907,7 @@ class AsyncDemandWaitPrimitive : public mx::Primitive {
 
  private:
   std::shared_ptr<AsyncDemandState> state_;
+  bool prefix_;
 };
 
 class GpuOnlyDemandPrimitive : public mx::Primitive {
@@ -1471,6 +2010,87 @@ std::pair<mx::array, mx::array> demand_dual_split_async(
   return {raw[0], gated_final};
 }
 
+std::pair<mx::array, mx::array> demand_staged_split_async(
+    const mx::array& inds, const std::vector<mx::array>& pool_list,
+    const std::vector<int>& seg_nbytes, int layer, const std::string& path,
+    int stride, int cap, bool lfu, int decay_interval, int64_t forward_id,
+    int sequence_length, bool evaluator_submit, int spec_limit,
+    const std::vector<mx::array>& staging_buffers,
+    const std::vector<long>& staging_generations,
+    mx::StreamOrDevice s = {}) {
+  if (seg_nbytes.size() != pool_list.size() ||
+      staging_buffers.size() != staging_generations.size())
+    throw std::invalid_argument("staged async demand input mismatch");
+  mx::Stream stream = mx::to_stream(s);
+  mx::array ids = mx::contiguous(inds, false, stream);
+  auto state = std::make_shared<AsyncDemandState>();
+  mx::array real_table = real_slot_table(layer, cap);
+  mx::array empty_side = sideregion_slot_table(-1, -1);
+  mx::array leases = real_lease_table(layer, cap);
+  std::vector<mx::array> inputs;
+  inputs.reserve(pool_list.size() + staging_buffers.size() + 4);
+  inputs.push_back(ids);
+  inputs.insert(inputs.end(), pool_list.begin(), pool_list.end());
+  inputs.push_back(real_table);
+  inputs.push_back(empty_side);
+  inputs.push_back(leases);
+  inputs.insert(inputs.end(), staging_buffers.begin(), staging_buffers.end());
+  auto primitive = std::make_shared<AsyncDemandPrimitive>(
+      stream, state, seg_nbytes, layer, 0, path, stride, cap,
+      lfu, decay_interval, forward_id, sequence_length,
+      false, false, false, evaluator_submit, false,
+      std::vector<int>{}, -1, std::string{}, 0, 0, 0,
+      std::vector<int>{}, staging_generations, spec_limit);
+  auto raw = mx::array::make_arrays(
+      {ids.shape(), ids.shape()}, {mx::int32, mx::int32}, primitive, inputs);
+  mx::array gated_final(
+      raw[1].shape(), mx::int32,
+      std::make_shared<AsyncDemandWaitPrimitive>(stream, state), {raw[1]});
+  return {raw[0], gated_final};
+}
+
+std::tuple<mx::array, mx::array, mx::array>
+demand_dual_projection_split_async(
+    const mx::array& inds, const std::vector<mx::array>& pool_list,
+    const std::vector<int>& seg_nbytes, int layer, int side_gen,
+    const std::string& path, int stride, int cap, bool lfu,
+    int decay_interval, int64_t forward_id, int sequence_length,
+    bool use_side, bool wait_for_pending, bool wait_for_refinement,
+    bool evaluator_submit, mx::StreamOrDevice s = {}) {
+  if (use_side || seg_nbytes.size() != 9 || pool_list.size() != 9)
+    throw std::invalid_argument(
+        "projection split requires unified pool with nine Qwen segments");
+  mx::Stream stream = mx::to_stream(s);
+  mx::array ids = mx::contiguous(inds, false, stream);
+  auto state = std::make_shared<AsyncDemandState>();
+  mx::array real_table = real_slot_table(layer, cap);
+  mx::array side_table = sideregion_slot_table(-1, -1);
+  mx::array leases = real_lease_table(layer, cap);
+  std::vector<mx::array> inputs;
+  inputs.reserve(pool_list.size() + 4);
+  inputs.push_back(ids);
+  inputs.insert(inputs.end(), pool_list.begin(), pool_list.end());
+  inputs.push_back(real_table);
+  inputs.push_back(side_table);
+  inputs.push_back(leases);
+  auto primitive = std::make_shared<AsyncDemandPrimitive>(
+      stream, state, seg_nbytes, layer, side_gen, path, stride, cap,
+      lfu, decay_interval, forward_id, sequence_length, false,
+      wait_for_pending, wait_for_refinement, evaluator_submit, true);
+  auto raw = mx::array::make_arrays(
+      {ids.shape(), ids.shape(), ids.shape()},
+      {mx::int32, mx::int32, mx::int32}, primitive, inputs);
+  mx::array gated_prefix(
+      raw[1].shape(), mx::int32,
+      std::make_shared<AsyncDemandWaitPrimitive>(stream, state, true),
+      {raw[1]});
+  mx::array gated_final(
+      raw[2].shape(), mx::int32,
+      std::make_shared<AsyncDemandWaitPrimitive>(stream, state, false),
+      {raw[2]});
+  return {raw[0], gated_prefix, gated_final};
+}
+
 mx::array demand_dual_async(
     const mx::array& inds, const std::vector<mx::array>& pool_list,
     const std::vector<int>& seg_nbytes, int layer, int side_gen,
@@ -1483,6 +2103,59 @@ mx::array demand_dual_async(
       inds, pool_list, seg_nbytes, layer, side_gen, path, stride, cap,
       lfu, decay_interval, forward_id, sequence_length, use_side,
       wait_for_pending, wait_for_refinement, evaluator_submit, s).second;
+}
+
+mx::array demand_dual_async_prefetch(
+    const mx::array& inds, const std::vector<mx::array>& pool_list,
+    const std::vector<int>& seg_nbytes, int layer, int side_gen,
+    const std::string& path, int stride, int cap, bool lfu,
+    int decay_interval, int64_t forward_id, int sequence_length,
+    bool use_side, bool wait_for_pending, bool wait_for_refinement,
+    bool evaluator_submit,
+    const mx::array& prefetch_ids,
+    const std::vector<mx::array>& prefetch_pool_list,
+    const std::vector<int>& prefetch_seg_nbytes, int prefetch_layer,
+    const std::string& prefetch_path, int prefetch_stride,
+    int prefetch_cap, int prefetch_spec_limit,
+    const std::vector<int>& prefetch_resident,
+    mx::StreamOrDevice s) {
+  if (seg_nbytes.size() != pool_list.size() ||
+      prefetch_seg_nbytes.size() != prefetch_pool_list.size())
+    throw std::invalid_argument(
+        "demand_dual_async_prefetch segment mismatch");
+  mx::Stream stream = mx::to_stream(s);
+  mx::array ids = mx::contiguous(inds, false, stream);
+  mx::array predicted = mx::contiguous(prefetch_ids, false, stream);
+  auto state = std::make_shared<AsyncDemandState>();
+  mx::array real_table = real_slot_table(layer, cap);
+  mx::array side_table = use_side
+      ? sideregion_slot_table(layer, side_gen)
+      : sideregion_slot_table(-1, -1);
+  mx::array side_leases = use_side
+      ? sideregion_lease_table(layer, side_gen)
+      : real_lease_table(layer, cap);
+  std::vector<mx::array> inputs;
+  inputs.reserve(pool_list.size() + prefetch_pool_list.size() + 5);
+  inputs.push_back(ids);
+  inputs.insert(inputs.end(), pool_list.begin(), pool_list.end());
+  inputs.push_back(real_table);
+  inputs.push_back(side_table);
+  inputs.push_back(side_leases);
+  inputs.push_back(predicted);
+  inputs.insert(
+      inputs.end(), prefetch_pool_list.begin(), prefetch_pool_list.end());
+  auto primitive = std::make_shared<AsyncDemandPrimitive>(
+      stream, state, seg_nbytes, layer, side_gen, path, stride, cap,
+      lfu, decay_interval, forward_id, sequence_length, use_side,
+      wait_for_pending, wait_for_refinement, evaluator_submit, false,
+      prefetch_seg_nbytes, prefetch_layer, prefetch_path,
+      prefetch_stride, prefetch_cap, prefetch_spec_limit,
+      prefetch_resident);
+  auto raw = mx::array::make_arrays(
+      {ids.shape(), ids.shape()}, {mx::int32, mx::int32}, primitive, inputs);
+  return mx::array(
+      raw[1].shape(), mx::int32,
+      std::make_shared<AsyncDemandWaitPrimitive>(stream, state), {raw[1]});
 }
 
 std::vector<long> demand_async_stats() {
@@ -1500,6 +2173,46 @@ std::vector<long> demand_async_stats() {
   };
 }
 
+std::vector<long> demand_async_miss_histogram() {
+  std::vector<long> output;
+  output.reserve(g_async_miss_hist.size());
+  for (auto& value : g_async_miss_hist)
+    output.push_back(value.load(std::memory_order_relaxed));
+  return output;
+}
+
+std::vector<long> demand_async_seq_miss_histogram() {
+  std::vector<long> values;
+  values.reserve(4 * 31);
+  for (const auto& by_miss : g_async_seq_miss_hist)
+    for (const auto& value : by_miss)
+      values.push_back(value.load(std::memory_order_relaxed));
+  return values;
+}
+
+std::vector<long> demand_async_layer_stats() {
+  std::vector<long> output;
+  output.reserve(64 * 7);
+  for (int layer = 0; layer < 64; ++layer) {
+    output.push_back(g_async_layer_calls[layer].load(std::memory_order_relaxed));
+    output.push_back(g_async_layer_fallback[layer].load(std::memory_order_relaxed));
+    output.push_back(g_async_layer_loads[layer].load(std::memory_order_relaxed));
+    output.push_back(g_async_layer_entry_misses[layer].load(std::memory_order_relaxed));
+    output.push_back(g_async_layer_max_entry_misses[layer].load(std::memory_order_relaxed));
+    output.push_back(g_async_layer_wait_us[layer].load(std::memory_order_relaxed));
+    output.push_back(g_async_layer_pending_wait_us[layer].load(std::memory_order_relaxed));
+  }
+  return output;
+}
+
+std::vector<long> unified_prefetch_reads_by_layer() {
+  std::vector<long> output(64, 0);
+  for (int layer = 0; layer < 64; ++layer)
+    output[layer] = g_unified_prefetch_reads[layer].load(
+        std::memory_order_relaxed);
+  return output;
+}
+
 void demand_async_stats_reset() {
   {
     std::unique_lock<std::mutex> lock(g_async_active_mutex);
@@ -1515,6 +2228,22 @@ void demand_async_stats_reset() {
   g_async_pending_rescued.store(0, std::memory_order_relaxed);
   g_async_pending_wait_us.store(0, std::memory_order_relaxed);
   g_async_fallback_wait_us.store(0, std::memory_order_relaxed);
+  for (auto& value : g_async_miss_hist)
+    value.store(0, std::memory_order_relaxed);
+  for (auto& by_miss : g_async_seq_miss_hist)
+    for (auto& value : by_miss)
+      value.store(0, std::memory_order_relaxed);
+  for (auto& value : g_unified_prefetch_reads)
+    value.store(0, std::memory_order_relaxed);
+  for (int layer = 0; layer < 64; ++layer) {
+    g_async_layer_calls[layer].store(0, std::memory_order_relaxed);
+    g_async_layer_fallback[layer].store(0, std::memory_order_relaxed);
+    g_async_layer_loads[layer].store(0, std::memory_order_relaxed);
+    g_async_layer_entry_misses[layer].store(0, std::memory_order_relaxed);
+    g_async_layer_max_entry_misses[layer].store(0, std::memory_order_relaxed);
+    g_async_layer_wait_us[layer].store(0, std::memory_order_relaxed);
+    g_async_layer_pending_wait_us[layer].store(0, std::memory_order_relaxed);
+  }
   std::lock_guard<std::mutex> lock(g_async_error_mutex);
   g_async_error.clear();
 }
@@ -1692,7 +2421,13 @@ mx::array demand_staged_multi(
               path, static_cast<long>(stride), ticket, 1, false);
           tickets.push_back(ticket);
         }
-        for (long ticket : tickets) bg_reader_wait(ticket);
+        bg_reader_wait_all(tickets);
+        // Match demand_dual / AsyncDemandPrimitive: a true fallback means
+        // this layer's cache is missing useful working-set rows, so rearm the
+        // bounded adaptive predictor for subsequent decoder traversals.
+        // Without this, compatibility multi-bank staging stops submitting as
+        // soon as the warm-up consumes its initial cooldown budget.
+        mark_predict_cooldown_locked(layer);
       }
     }
   }

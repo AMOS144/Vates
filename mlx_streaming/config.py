@@ -8,6 +8,14 @@ monkeypatch env 仍生效，热路径每 token 读 env 的成本与原先相同�
 native 预取=1），accessor 暴露 `default` 参数，由调用方传入，绝不擅自统一。
 """
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+
+_prefetch_exact_no_io_override = ContextVar(
+    "prefetch_exact_no_io_override", default=None,
+)
+_demand_async_override = ContextVar("demand_async_override", default=None)
 
 
 def _b(name: str, default: str = "0") -> bool:
@@ -86,6 +94,16 @@ def custom_fused_moe_bits() -> int: return _i("CUSTOM_FUSED_MOE_BITS", 6)
 def custom_fused_moe_lanes() -> int: return _i("CUSTOM_FUSED_MOE_LANES", 8)
 def custom_fused_moe_block() -> int: return _i("CUSTOM_FUSED_MOE_BLOCK", 256)
 def custom_fused_moe_max_seq() -> int: return _i("CUSTOM_FUSED_MOE_MAX_SEQ", 4)
+# Single-token decode can consume the async demand primitive's event-ordered
+# final remap directly and run one standard MoE pass.  MTP batches retain the
+# split hit/miss overlap path, where waiting before all useful compute is less
+# attractive.
+def demand_async_single_pass() -> bool: return _b("DEMAND_ASYNC_SINGLE_PASS", "0")
+def demand_async_single_pass_for(layer: int) -> bool:
+    selected = parse_layers_env("DEMAND_ASYNC_SINGLE_PASS_LAYERS")
+    return demand_async_single_pass() and (
+        selected is None or int(layer) in selected
+    )
 
 
 # ============================ native MoE 后端 ============================
@@ -131,16 +149,123 @@ def global_staging_slots() -> int: return max(1, _i("GLOBAL_STAGING_SLOTS", 24))
 # segment is complete; there is no per-layer side ownership/table.
 # Global staging remains available with PREFETCH_DIRECT_SLOTS=0.
 def prefetch_direct_slots() -> bool: return _b("PREFETCH_DIRECT_SLOTS", "1")
+def prefetch_partial_projections() -> bool:
+    return _b("PREFETCH_PARTIAL_PROJECTIONS", "0")
+def prefetch_partial_demand_tail() -> bool:
+    """Keep false-positive prefixes partial; complete only demanded routes."""
+    return _b("PREFETCH_PARTIAL_DEMAND_TAIL", "0")
 # L0 has no preceding decoder layer that can hide an expert prefetch.  Allow a
 # small per-model exception without multiplying every layer's pool footprint.
 def layer0_slots(default: int = 256) -> int:
     return min(512, max(1, _i("LAYER0_SLOTS", default)))
 # Event-gated demand keeps route materialization and expert->slot remap off the
 # Python/main thread. It is meaningful only with the directly addressable pool.
-def demand_async() -> bool: return _b("DEMAND_ASYNC", "1")
-# Submit the GPU entry-remap output with ``mx.async_eval`` before constructing
-# the event-gated final mapping. This avoids native max-op no-op padding.
-def demand_async_python_submit() -> bool: return _b("DEMAND_ASYNC_PY_SUBMIT", "1")
+def demand_async() -> bool:
+    override = _demand_async_override.get()
+    return _b("DEMAND_ASYNC", "0") if override is None else bool(override)
+
+
+@contextmanager
+def override_demand_async(enabled: bool):
+    token = _demand_async_override.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _demand_async_override.reset(token)
+# ``mx.async_eval(entry_local)`` does not guarantee that the entry remap ends
+# its Metal command buffer before the event-gated final mapping is assembled.
+# On a long-lived decode graph that can let later work cross the CPU completion
+# callback which publishes demand-loaded pool rows, corrupting the target
+# model's cache.  The native submission boundary is exact; keep the evaluator
+# path available only as an explicit diagnostic opt-in.
+def demand_async_python_submit() -> bool: return _b("DEMAND_ASYNC_PY_SUBMIT", "0")
+def demand_async_eval_boundary() -> bool:
+    return _b("DEMAND_ASYNC_EVAL_BOUNDARY", "0")
+# Evaluate the source predictor as an extra input of the source layer's native
+# demand primitive.  Its completion handler submits the target reads after
+# resolving source demand, removing a separate Metal completion callback
+# without moving prediction later than source-MoE compute.
+def prefetch_fuse_with_demand() -> bool:
+    return _b("PREFETCH_FUSE_WITH_DEMAND", "0")
+# Standard-MLX sparse correction budget for event-gated demand.  Zero keeps
+# the mature one-pass path. Positive values compute resident hits immediately
+# and recompute only this many missing route positions after SSD completion;
+# overflow is detected lazily and causes an exact whole-verify replay.
+def demand_sparse_miss_budget() -> int:
+    return max(0, _i("DEMAND_SPARSE_MISS_BUDGET", 0))
+def demand_sparse_miss_budget_overrides() -> "dict[int, int]":
+    """Parse ``layer[-layer]:budget`` sparse-correction overrides."""
+    spec = _s("DEMAND_SPARSE_MISS_BUDGET_OVERRIDES", "").strip()
+    if not spec:
+        return {}
+    output: "dict[int, int]" = {}
+    try:
+        for item in spec.split(","):
+            layer_spec, budget_spec = item.strip().split(":", 1)
+            budget = int(budget_spec)
+            if budget < 0:
+                raise ValueError
+            if "-" in layer_spec:
+                start, end = (int(value) for value in layer_spec.split("-", 1))
+                layers = range(start, end + 1)
+            else:
+                layers = (int(layer_spec),)
+            for layer in layers:
+                if layer < 0:
+                    raise ValueError
+                output[layer] = budget
+    except ValueError as error:
+        raise ValueError(
+            "DEMAND_SPARSE_MISS_BUDGET_OVERRIDES 必须是 layer[-layer]:budget 列表",
+        ) from error
+    return output
+def demand_sparse_miss_budget_by_sequence() -> "dict[int, int]":
+    """Parse ``sequence_length:budget`` fixed-tail overrides."""
+    spec = _s("DEMAND_SPARSE_MISS_BUDGET_BY_SEQ", "").strip()
+    if not spec:
+        return {}
+    output: "dict[int, int]" = {}
+    try:
+        for item in spec.split(","):
+            sequence_spec, budget_spec = item.strip().split(":", 1)
+            sequence = int(sequence_spec)
+            budget = int(budget_spec)
+            if sequence <= 0 or budget < 0:
+                raise ValueError
+            output[sequence] = budget
+    except ValueError as error:
+        raise ValueError(
+            "DEMAND_SPARSE_MISS_BUDGET_BY_SEQ 必须是 sequence:budget 列表",
+        ) from error
+    return output
+def demand_sparse_miss_budget_for(
+    layer: int, sequence_length: "int | None" = None,
+) -> int:
+    layer_overrides = demand_sparse_miss_budget_overrides()
+    layer_budget = layer_overrides.get(int(layer), demand_sparse_miss_budget())
+    if sequence_length is None:
+        return layer_budget
+    sequence_budget = demand_sparse_miss_budget_by_sequence().get(
+        int(sequence_length), layer_budget,
+    )
+    if _b("DEMAND_SPARSE_SEQ_LAYER_MAX", "0") and int(layer) in layer_overrides:
+        return max(sequence_budget, layer_budget)
+    return sequence_budget
+def demand_sparse_enabled() -> bool:
+    return demand_sparse_miss_budget() > 0 or any(
+        budget > 0 for budget in demand_sparse_miss_budget_overrides().values()
+    ) or any(budget > 0 for budget in demand_sparse_miss_budget_by_sequence().values())
+def demand_sparse_partition() -> bool:
+    return _b("DEMAND_SPARSE_PARTITION", "0")
+def demand_sparse_local_correction() -> bool:
+    """Repair rare fixed-tail overflows in-layer instead of replaying verify."""
+    return _b("DEMAND_SPARSE_LOCAL_CORRECTION", "0")
+def demand_sparse_suffix_replay() -> bool:
+    """Replay only from the first overflowed decoder layer."""
+    return _b("DEMAND_SPARSE_SUFFIX_REPLAY", "0")
+def demand_sparse_hit_aux_stream() -> bool:
+    """Submit the entry-ready half on an independent Metal stream."""
+    return _b("DEMAND_SPARSE_HIT_AUX_STREAM", "0")
 # Run the always-resident shared expert on a separate device stream after the
 # prefetch graph is attached but before routed-expert demand can wait on SSD.
 def shared_expert_overlap() -> bool: return _b("SHARED_EXPERT_OVERLAP", "1")
@@ -150,6 +275,14 @@ def global_staging_banks() -> int:
     # back to per-layer buffers.
     default = 8 if prefetch_progressive() else 2
     return max(2, _i("GLOBAL_STAGING_BANKS", default))
+def prefetch_staging_late_promote() -> bool:
+    """Keep a prefetch that completed only after its target demand.
+
+    Disabled by default: demand has already loaded the routed experts at that
+    point, so admitting an unverified late candidate can only duplicate work
+    or evict a useful resident row.
+    """
+    return _b("PREFETCH_STAGING_LATE_PROMOTE", "0")
 def staging_pread_parallel() -> bool:
     # Multi-step early/refinement must leave the Metal completion thread and
     # use the priority-aware background queue. Legacy single-stage staging
@@ -195,6 +328,11 @@ def cross_layer_ahead_profile() -> "dict[int, int]":
                 )
             out[target] = ahead
     return out
+
+
+def prefetch_target_layers() -> "set[int] | None":
+    """Optional ordinary-prefetch target allowlist; unset keeps every layer."""
+    return parse_layers_env("PREFETCH_TARGET_LAYERS")
 def predict_use_x() -> bool: return _b("PREDICT_USE_X", "1")  # 默认用本层 MoE 输入 x（更新鲜，+3.6pp recall）；=0 回退旧 norm 路径
 def predict_agg() -> str: return _s("PREDICT_AGG", "max")  # K+1 token 聚合：max|mean|union
 def predict_union_k() -> int: return _i("PREDICT_UNION_K", 8)  # union 时每 token 取的 top-k（控候选数）
@@ -209,9 +347,48 @@ def prefetch_rerank_candidate_width() -> int: return max(1, _i("PREFETCH_RERANK_
 # LFU churn.  Callers provide the mode-specific production default (15 for a
 # single token, 26 for K=3); the env remains available for controlled sweeps.
 def prefetch_rerank_max_width(default: int) -> int: return max(1, _i("PREFETCH_RERANK_MAX_WIDTH", default))
+def prefetch_rerank_max_width_overrides() -> "dict[int, int]":
+    """Parse per-target logical width caps (``layer[-layer]:width``)."""
+    spec = _s("PREFETCH_RERANK_MAX_WIDTH_OVERRIDES", "").strip()
+    if not spec:
+        return {}
+    output: "dict[int, int]" = {}
+    try:
+        for item in spec.split(","):
+            layer_spec, width_spec = item.strip().split(":", 1)
+            width = int(width_spec)
+            if width < 1:
+                raise ValueError
+            if "-" in layer_spec:
+                start, end = (int(value) for value in layer_spec.split("-", 1))
+                layers = range(start, end + 1)
+            else:
+                layers = (int(layer_spec),)
+            for layer in layers:
+                if layer < 1:
+                    raise ValueError
+                output[layer] = width
+    except ValueError as error:
+        raise ValueError(
+            "PREFETCH_RERANK_MAX_WIDTH_OVERRIDES 必须是 layer[-layer]:width 列表",
+        ) from error
+    return output
+def prefetch_rerank_max_width_for(target_layer: int, default: int) -> int:
+    return prefetch_rerank_max_width_overrides().get(
+        int(target_layer), prefetch_rerank_max_width(default),
+    )
 # K=3 实测 0.97 在 width、命中与吞吐间最均衡；0.99 过宽并回退吞吐。
 def prefetch_rerank_mass() -> float: return max(0.0, min(1.0, _f("PREFETCH_RERANK_MASS", 0.97)))
 def prefetch_rerank_min_width(default: int) -> int: return max(1, _i("PREFETCH_RERANK_MIN_WIDTH", default))
+def prefetch_rerank_backfill_extra() -> int:
+    """Additional nonresident candidates after resident filtering."""
+    return max(0, _i("PREFETCH_RERANK_BACKFILL_EXTRA", 0))
+def prefetch_rerank_backfill_extra_for(target_layer: int) -> int:
+    extra = prefetch_rerank_backfill_extra()
+    layers = parse_layers_env("PREFETCH_RERANK_BACKFILL_LAYERS")
+    if layers is not None and int(target_layer) not in layers:
+        return 0
+    return extra
 def prefetch_rerank_width_policy() -> str: return _s("PREFETCH_RERANK_WIDTH_POLICY", "mass").strip().lower()
 def prefetch_rerank_ranking_policy() -> str: return _s("PREFETCH_RERANK_RANKING_POLICY", "noisy_or").strip().lower()
 def prefetch_rerank_ranking_policy_overrides() -> "dict[int, str]":
@@ -296,6 +473,29 @@ def prefetch_rerank_history_beta_overrides() -> "dict[int, float]":
                 raise ValueError(f"invalid rerank target layer {target}")
             output[target] = beta
     return output
+def prefetch_rerank_residual_scale_overrides() -> "dict[int, float]":
+    """Parse per-target previous ``actual - proxy`` correction scales."""
+    spec = _s("PREFETCH_RERANK_RESIDUAL_SCALE_OVERRIDES", "").strip()
+    if not spec:
+        return {}
+    output: "dict[int, float]" = {}
+    for item in spec.split(","):
+        layer_spec, scale_spec = item.strip().split(":", 1)
+        scale = float(scale_spec)
+        if scale < 0:
+            raise ValueError("rerank residual scale 不能为负")
+        if "-" in layer_spec:
+            start, end = (int(value) for value in layer_spec.split("-", 1))
+            targets = range(start, end + 1)
+        else:
+            targets = (int(layer_spec),)
+        for target in targets:
+            if target < 1:
+                raise ValueError(f"invalid rerank target layer {target}")
+            output[target] = scale
+    return output
+def prefetch_rerank_residual_decay() -> float:
+    return max(0.0, min(0.999, _f("PREFETCH_RERANK_RESIDUAL_DECAY", 0.0)))
 # The real router remains at the model's configured precision.  This controls
 # only the extra cross-layer predictor copy, so lowering it cannot change model
 # logits; it trades predictor ranking fidelity for substantially less gate
@@ -306,15 +506,59 @@ def prefetch_predict_gate_bits() -> int: return max(2, min(8, _i("PREFETCH_PREDI
 # layer need not serialize its own expert compute behind this speculative work.
 def prefetch_async_predict() -> bool:
     return _b("PREFETCH_ASYNC_PREDICT", "0")
+# Submit an adjacent target prediction from the completed source decoder
+# output. Its gate runs beside the target attention/GDN, retaining an I/O
+# window while using a fresher hidden state than the source MoE-entry proxy.
+def prefetch_post_moe() -> bool: return _b("PREFETCH_POST_MOE", "0")
+# Experimental two-stage mode: retain the ordinary early callback and use the
+# fresher post-MoE prediction only as a bounded second fill.  The default keeps
+# the historical replacement semantics.
+def prefetch_post_moe_refinement() -> bool:
+    return _b("PREFETCH_POST_MOE_REFINEMENT", "0")
+def prefetch_post_moe_refine_width() -> int:
+    return max(1, _i("PREFETCH_POST_MOE_REFINE_WIDTH", 1))
+def prefetch_post_moe_refinement_layers() -> "set[int] | None":
+    """Optional targets for the costly late refinement submission."""
+    return parse_layers_env("PREFETCH_POST_MOE_REFINEMENT_LAYERS")
+def prefetch_post_moe_replacement_layers() -> "set[int] | None":
+    """Optional targets whose single early prediction moves post-MoE.
+
+    Unlike refinement, replacement does not add a second predictor.  Targets
+    outside this set retain their ordinary MoE-entry submission.  An unset
+    value preserves the historical all-target post-MoE behaviour.
+    """
+    return parse_layers_env("PREFETCH_POST_MOE_REPLACEMENT_LAYERS")
+def prefetch_multistage_early() -> bool:
+    """Add one T-3 prediction before the ordinary T-2 submission."""
+    return _b("PREFETCH_MULTISTAGE_EARLY", "0")
+def prefetch_multistage_early_ahead() -> int:
+    return max(2, _i("PREFETCH_MULTISTAGE_EARLY_AHEAD", 3))
+def prefetch_multistage_early_layers() -> "set[int] | None":
+    return parse_layers_env("PREFETCH_MULTISTAGE_EARLY_LAYERS")
+def prefetch_multistage_history() -> bool:
+    """Use the previous exact target route for T-3 instead of another gate."""
+    return _b("PREFETCH_MULTISTAGE_HISTORY", "0")
+def prefetch_multistage_history_width() -> int:
+    return max(1, _i("PREFETCH_MULTISTAGE_HISTORY_WIDTH", 10))
+# Cheap late correction: the ordinary early full gate retains the SSD window,
+# then the completed source output scores only its frozen top-64 candidates.
+def prefetch_late_candidate_rerank() -> bool:
+    return _b("PREFETCH_LATE_CANDIDATE_RERANK", "0")
+def prefetch_late_candidate_width() -> int:
+    return max(1, _i("PREFETCH_LATE_CANDIDATE_WIDTH", 2))
+def prefetch_late_candidate_layers() -> "set[int] | None":
+    return parse_layers_env("PREFETCH_LATE_CANDIDATE_LAYERS")
 # Stop rebuilding a target predictor once that layer's unified pool has a
 # stable working set.  A true demand load rearms prediction for a few forwards.
 def prefetch_adaptive() -> bool: return _b("PREFETCH_ADAPTIVE", "0")
 def prefetch_adaptive_fill() -> float: return max(0.0, min(1.0, _f("PREFETCH_ADAPTIVE_FILL", 0.85)))
-def prefetch_adaptive_cooldown() -> int: return max(1, _i("PREFETCH_ADAPTIVE_COOLDOWN", 8))
+def prefetch_adaptive_cooldown() -> int: return max(1, _i("PREFETCH_ADAPTIVE_COOLDOWN", 32))
 # 两阶段预取：原 main source callback 先锁定小 core；到目标 T-1 后把下一层
 # 的真实 attention/GDN+gate 提前执行，并由正式 decoder 调用直接复用，只补剩余槽。
 # 它不移动第一次 callback，也不允许不能被正式调用复用的 shadow gate/replay。
 def prefetch_progressive() -> bool: return _b("PREFETCH_PROGRESSIVE", "0")
+def prefetch_progressive_exact_only() -> bool:
+    return _b("PREFETCH_PROGRESSIVE_EXACT_ONLY", "0")
 def prefetch_progressive_mode() -> str: return _s("PREFETCH_PROGRESSIVE_MODE", "k1").strip().lower()
 def prefetch_progressive_target_layers() -> "set[int] | None":
     """Targets using early-core + refinement; empty config means all."""
@@ -380,6 +624,46 @@ def prefetch_progressive_callback_wait() -> bool:
 # target-boundary CPU completion handler. Opt-in until long-run validation.
 def prefetch_exact_gpu_demand() -> bool:
     return _b("PREFETCH_EXACT_GPU_DEMAND", "0")
+# Diagnostic: keep the exact route's device dependency but skip its native
+# CPU callback/read submission.  Valid only when the working set is already
+# resident; used to isolate empty callback/event overhead.
+def prefetch_exact_no_io(layer: "int | None" = None) -> bool:
+    override = _prefetch_exact_no_io_override.get()
+    if override is not None:
+        if isinstance(override, (set, frozenset)):
+            return layer is not None and int(layer) in override
+        return bool(override)
+    return _b("PREFETCH_EXACT_NO_IO", "0")
+
+
+@contextmanager
+def override_prefetch_exact_no_io(enabled):
+    """Temporarily select the handler-free exact-demand implementation.
+
+    The override is context-local so speculative verify can use it without
+    making prefill, baseline decode, or a concurrent request optimistic.
+    """
+    value = frozenset(int(layer) for layer in enabled) \
+        if isinstance(enabled, (set, frozenset, tuple, list)) else bool(enabled)
+    token = _prefetch_exact_no_io_override.set(value)
+    try:
+        yield
+    finally:
+        _prefetch_exact_no_io_override.reset(token)
+
+
+def prefetch_optimistic_verify() -> bool:
+    # Run MTP batch verify without per-layer completion callbacks. Any missing
+    # GPU table row is detected after the forward and causes an exact safe
+    # replay through the ordinary native I/O path.
+    return _b("PREFETCH_OPTIMISTIC_VERIFY", "0")
+
+
+def prefetch_optimistic_reprobe() -> bool:
+    # Diagnostic: keep probing layers after a miss so a short exact run can
+    # reveal the per-layer miss distribution. Production keeps failed layers
+    # on the safe callback path for the rest of the request.
+    return _b("PREFETCH_OPTIMISTIC_REPROBE", "0")
 # Diagnostic/certified-working-set mode.  The caller must provide a pin profile
 # covering every route that can occur; demand then becomes a pure GPU table
 # lookup with no callback.  This gives a numerically correct resident-speed
@@ -410,6 +694,11 @@ def prefetch_progressive_signal_for(target_layer: int) -> str:
     )
 def prefetch_progressive_refine_ahead() -> int:
     return max(1, _i("PREFETCH_PROGRESSIVE_REFINE_AHEAD", 2))
+def prefetch_progressive_refine_aux_stream() -> bool:
+    # The adjacent target gate depends on the source MoE output and is already
+    # next on the decoder's critical path.  Keep the historical auxiliary
+    # placement available, but allow avoiding its cross-stream fence.
+    return _b("PREFETCH_PROGRESSIVE_REFINE_AUX_STREAM", "1")
 def prefetch_progressive_late_layers() -> "set[int]":
     configured = parse_layers_env("PREFETCH_PROGRESSIVE_LATE_LAYERS")
     if configured is not None:
@@ -460,8 +749,23 @@ def prefetch_deadline_prof() -> bool: return _b("PREFETCH_DEADLINE_PROF", "0")
 # 严格验收探针：用逻辑 forward id 把 source-time rerank 提交与目标 demand
 # 一一配对，统计逐次 width、recall、1.5x 违规和真实 I/O 时间线。
 def prefetch_audit_prof() -> bool: return _b("PREFETCH_AUDIT_PROF", "0")
+# Lightweight logical-set acceptance only; unlike PREFETCH_AUDIT_PROF this
+# does not collect native callback/I/O timelines for every layer.
+def prefetch_acceptance_prof() -> bool: return _b("PREFETCH_ACCEPTANCE_PROF", "0")
+# Optional decode-only training trace. Each row stores the exact raw proxy
+# gate logits used to form top64 plus the target layer's true routed experts.
+def prefetch_rerank_data_out() -> str:
+    return _s("PREFETCH_RERANK_DATA_OUT", "").strip()
+def prefetch_rerank_data_active() -> bool:
+    return bool(prefetch_rerank_data_out()) and _b(
+        "PREFETCH_RERANK_DATA_ACTIVE", "0",
+    )
 def prefetch_pin_profile() -> str: return _s("PREFETCH_PIN_PROFILE", "").strip()
 def prefetch_transition_profile() -> str: return _s("PREFETCH_TRANSITION_PROFILE", "").strip()
+def prefetch_transition_only_profile() -> str: return _s("PREFETCH_TRANSITION_ONLY_PROFILE", "").strip()
+def prefetch_online_transition() -> bool: return _b("PREFETCH_ONLINE_TRANSITION", "0")
+def prefetch_online_host_submit() -> bool: return _b("PREFETCH_ONLINE_HOST_SUBMIT", "0")
+def prefetch_host_ready_submit() -> bool: return _b("PREFETCH_HOST_READY_SUBMIT", "0")
 def transition_trace() -> bool: return _b("TRANSITION_TRACE", "0")
 def transition_trace_width() -> int: return max(1, _i("TRANSITION_TRACE_WIDTH", 64))
 def residual_hidden_trace() -> bool: return _b("RESIDUAL_HIDDEN_TRACE", "0")
@@ -528,6 +832,33 @@ def sideregion_row_leases() -> bool: return _b("SIDEREGION_ROW_LEASES", "0")
 def native_no_submit() -> bool: return _b("NATIVE_NO_SUBMIT", "0")
 def native_no_promote() -> bool: return _b("NATIVE_NO_PROMOTE", "0")
 def native_materialize() -> bool: return _b("NATIVE_MATERIALIZE", "0")
+def prefetch_physical_read_budget() -> int: return _i("PREFETCH_PHYSICAL_READ_BUDGET", 0)
+def prefetch_physical_read_budget_profile() -> str:
+    return _s("PREFETCH_PHYSICAL_READ_BUDGET_PROFILE", "").strip()
+def prefetch_k1_physical_rank_limit() -> int:
+    """Only read a K=1 miss when it appears this high in proxy order.
+
+    Zero keeps the full logical rerank output.  The logical top64/top15 audit
+    remains unchanged; this is solely an SSD precision gate.
+    """
+    return max(0, _i("PREFETCH_K1_PHYSICAL_RANK_LIMIT", 0))
+def prefetch_k3_physical_rank_limit() -> int:
+    """K=2/3 counterpart, ranked by max proxy logit across verify tokens."""
+    return max(0, _i("PREFETCH_K3_PHYSICAL_RANK_LIMIT", 0))
+def prefetch_host_ready_protect_logical() -> bool:
+    """Keep resident logical candidates in the native eviction protect set."""
+    return _b("PREFETCH_HOST_READY_PROTECT_LOGICAL", "0")
+def prefetch_protect_logical() -> bool:
+    """Keep resident winners in the async logical prefix (no miss backfill)."""
+    return _b("PREFETCH_PROTECT_LOGICAL", "0")
+def prefetch_isolated_side() -> bool:
+    """Reserve the allocation tail for non-competing prediction rows."""
+    return _b("PREFETCH_ISOLATED_SIDE", "0")
+def prefetch_isolated_side_for(layer: int) -> bool:
+    selected = prefetch_target_layers()
+    return prefetch_isolated_side() and (
+        selected is None or int(layer) in selected
+    )
 def file_prefetch_global_budget() -> int: return _i("FILE_PREFETCH_GLOBAL_BUDGET", 64)
 def stage_prefetch_global_budget() -> int: return _i("STAGE_PREFETCH_GLOBAL_BUDGET", 64)
 def stage_prefetch_min_score() -> float: return _f("STAGE_PREFETCH_MIN_SCORE", 0)

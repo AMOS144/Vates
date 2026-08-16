@@ -537,6 +537,8 @@ class FileExpertStore:
         self._resident.gpu_fallback = 0
         self._resident.prefetch_hits = 0
         self._resident.prefetch_loads = 0
+        if hasattr(self._resident, "_demand_layer_stats"):
+            self._resident._demand_layer_stats.clear()
         self.prefetch_buffer_hits = 0
         self.prefetch_submitted = 0
         self.prefetch_dropped = 0

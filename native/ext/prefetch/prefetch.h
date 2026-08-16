@@ -15,8 +15,19 @@ mx::array prefetch_into_staging(
     const std::string& path, int stride, const std::vector<int>& resident, int cap,
     bool parallel, int source_layer, int64_t forward_id, int priority,
     mx::StreamOrDevice s);
+// expert IDs are already host-visible: start the staging read immediately,
+// without inserting another Metal completed-handler boundary.
+void prefetch_staging_ready(
+    const mx::array& staging, const std::vector<int>& expert_ids, int layer,
+    long gen, const std::string& path, int stride,
+    const std::vector<int>& resident, int cap, bool parallel,
+    int source_layer, int64_t forward_id, int priority);
 // 取走某层就绪记录：[gen, e0,r0,e1,r1,...]；空表示无就绪。
 std::vector<long> prefetch_staging_take(int layer, long generation = -1);
+std::vector<long> prefetch_staging_take_for_demand(
+    int layer, long generation);
+void prefetch_staging_mark_consumed(int layer, long generation);
+bool prefetch_staging_consumed(int layer, long generation);
 bool prefetch_staging_finished(int layer, long generation);
 void prefetch_staging_forget(int layer, long generation);
 void prefetch_staging_wait_experts(

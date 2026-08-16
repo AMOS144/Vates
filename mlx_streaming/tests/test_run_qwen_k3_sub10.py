@@ -14,8 +14,24 @@ def test_final_profile_defaults(monkeypatch):
     assert FINAL_DEFAULTS["MTP_BITS"] == "4"
     assert FINAL_DEFAULTS["MTP_EXPERT_DIR"].endswith("_4bit_g64")
     assert FINAL_DEFAULTS["NATIVE_NO_SUBMIT"] == "0"
+    assert FINAL_DEFAULTS["PREFETCH_PHYSICAL_READ_BUDGET"] == "3"
+    assert FINAL_DEFAULTS["MTP_CONF_TAU"] == "0.3"
+    assert FINAL_DEFAULTS["PREFETCH_ISOLATED_SIDE"] == "1"
+    assert FINAL_DEFAULTS["SIDEREGION_ROW_LEASES"] == "1"
+    assert FINAL_DEFAULTS["PREFETCH_TARGET_LAYERS"] == (
+        "1-7,10-16,18-21,23,25-26,28-36,38-41,43-47"
+    )
+    assert FINAL_DEFAULTS["MTP_EXPERT_SLOTS"] == "256"
+    assert FINAL_DEFAULTS["PREFETCH_ADAPTIVE"] == "0"
+    assert FINAL_DEFAULTS["EXPERT_POOL_PROFILE"].endswith(
+        "qwen_k3_prefetch_wait_rebalanced_same10g.json"
+    )
+    assert FINAL_DEFAULTS["DEMAND_ASYNC"] == "0"
+    assert FINAL_DEFAULTS["SPEC_SPLIT_DEMAND_AFTER_PREFILL"] == "1"
+    assert FINAL_DEFAULTS["DEMAND_ASYNC_PY_SUBMIT"] == "0"
     assert FINAL_DEFAULTS["PREFETCH_ASYNC_PREDICT"] == "1"
     assert FINAL_DEFAULTS["PREFETCH_PROGRESSIVE"] == "0"
+    assert FINAL_DEFAULTS["PREFETCH_ADAPTIVE_COOLDOWN"] == "32"
     assert FINAL_DEFAULTS["PREFETCH_RERANK_RANKING_POLICY"] == "topk_union_fast"
 
 

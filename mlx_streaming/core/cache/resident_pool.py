@@ -116,7 +116,10 @@ class ResidentExpertPool:
             # 复刻基线 8-worker 并行读：demand miss 的 pread 派给 BgReader 并行执行（高优队列）。
             import mlx_streaming.native_moe_ext as _N
             try:
-                _N.bg_reader_start(int(os.environ.get("DEMAND_WORKERS", "8")), 0)
+                _N.bg_reader_start(
+                    int(os.environ.get("DEMAND_WORKERS", "8")),
+                    int(os.environ.get("PREFETCH_LOW_WORKERS", "0")),
+                )
             except Exception:
                 pass
         if self._native_demand and os.environ.get("DEMAND_TIMING") == "1":
@@ -132,8 +135,11 @@ class ResidentExpertPool:
         return min(self.layer_caps.get(layer, self.capacity), self.capacity)
 
     def native_real_cap_for(self, layer: int) -> int:
-        """C++ demand 与预取共享的单一主池行数。"""
-        return self.cap_for(layer)
+        """Return the demand-owned prefix of the physical allocation."""
+        cap = self.cap_for(layer)
+        if config.prefetch_isolated_side_for(layer) and int(layer) > 0:
+            return max(1, cap - self.spec_gens * self.spec_slots)
+        return cap
 
     def _ensure_layer(self, layer: int):
         if layer not in self._slot_of:

@@ -122,6 +122,54 @@ def test_mlx_backend_load_warms_up(monkeypatch):
     assert any("预热" in s for s in seen)          # 有预热状态提示
 
 
+def test_mlx_backend_splits_sync_prefill_and_async_decode(monkeypatch):
+    """Throughput profile must enable async demand at the decode boundary."""
+    import os
+    import types
+
+    import mlx_streaming.cli as cli_mod
+    import mlx_streaming.mtp.generate as gen_mod
+    from mlx_streaming.tui.backend import MLXBackend
+
+    class _Tok:
+        eos_token_ids = None
+        eos_token_id = -1
+        chat_template = None
+
+        def decode(self, ids):
+            return ",".join(str(i) for i in ids)
+
+    monkeypatch.setattr(cli_mod, "_encode_chat", lambda tok, msgs: [1, 2, 3])
+    monkeypatch.setenv("SPEC_SPLIT_DEMAND_AFTER_PREFILL", "1")
+    monkeypatch.setenv("DEMAND_ASYNC", "0")
+    seen = []
+
+    def fake_mtp_generate(
+        model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
+        profile=False, on_tokens=None, main_cache=None, cached_len=0,
+        on_prefill_complete=None,
+    ):
+        seen.append(("prefill", os.environ["DEMAND_ASYNC"]))
+        assert on_prefill_complete is not None
+        on_prefill_complete()
+        seen.append(("decode", os.environ["DEMAND_ASYNC"]))
+        if on_tokens is not None:
+            on_tokens([10])
+        return [10], {"resident_tokens": prompt.shape[1]}
+
+    monkeypatch.setattr(gen_mod, "mtp_generate", fake_mtp_generate)
+    args = types.SimpleNamespace(model="m", k=3, max_tokens=8, system=None)
+    backend = MLXBackend(args)
+    backend._tok = _Tok()
+    backend._model = types.SimpleNamespace(make_cache=lambda: object())
+    backend._drafter = object()
+
+    backend.generate([{"role": "user", "content": "hi"}], lambda full, n: False)
+
+    assert seen == [("prefill", "0"), ("decode", "1")]
+    assert os.environ["DEMAND_ASYNC"] == "0"
+
+
 def test_common_prefix_len():
     assert _common_prefix_len([], [1, 2]) == 0
     assert _common_prefix_len([1, 2, 3], [1, 2, 9]) == 2

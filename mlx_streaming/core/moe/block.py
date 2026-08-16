@@ -20,6 +20,7 @@ from mlx_streaming.core.profiling import (
 # decode/verify 热路径判据:seq 短(单 token decode=1、MTP verify=K≤几)，与 prefill 长 seq 区分。
 _DECODE_SEQ_MAX = 8
 _SHARED_EXPERT_STREAM = None
+_SPARSE_HIT_STREAM = None
 
 
 def _shared_expert_stream():
@@ -27,6 +28,13 @@ def _shared_expert_stream():
     if _SHARED_EXPERT_STREAM is None:
         _SHARED_EXPERT_STREAM = mx.new_stream(mx.default_device())
     return _SHARED_EXPERT_STREAM
+
+
+def _sparse_hit_stream():
+    global _SPARSE_HIT_STREAM
+    if _SPARSE_HIT_STREAM is None:
+        _SPARSE_HIT_STREAM = mx.new_stream(mx.default_device())
+    return _SPARSE_HIT_STREAM
 
 
 from mlx_streaming.core.moe.gate import _effective_top_k
@@ -109,21 +117,78 @@ class FileStreamingMoeBlock:
             raw_gates = self.gate(x)
         else:
             object.__setattr__(self, "_prefetch_reuse_raw_gates", None)
+        post_moe_dummy = getattr(self, "_prefetch_post_moe_dummy", None)
+        if post_moe_dummy is not None:
+            object.__setattr__(self, "_prefetch_post_moe_dummy", None)
+            # The target attention/GDN has already run independently.  Join
+            # the post-MoE predictor only at the real gate boundary so native
+            # reservation/row writes cannot race target demand, without a CPU
+            # synchronization or shortening the attention overlap window.
+            raw_gates = raw_gates + (
+                post_moe_dummy.reshape(()).astype(raw_gates.dtype) * 0
+            )
         gate_history = getattr(self, "_prefetch_gate_history", None)
         if gate_history is not None:
             # A long layer-0 call starts a new request/prefill.  Clear prior
             # request history before any source callback can consume it.
             if self.layer_idx == 0 and int(raw_gates.shape[1]) > _DECODE_SEQ_MAX:
                 gate_history.clear()
+                proxy_history = getattr(self, "_prefetch_proxy_history", None)
+                if proxy_history is not None:
+                    proxy_history.clear()
+                residual_history = getattr(
+                    self, "_prefetch_residual_history", None,
+                )
+                if residual_history is not None:
+                    residual_history.clear()
+                route_history = getattr(self, "_prefetch_route_history", None)
+                if route_history is not None:
+                    route_history.clear()
+            current_proxy = getattr(
+                self, "_prefetch_proxy_history", {},
+            ).get(self.layer_idx)
+            residual_history = getattr(
+                self, "_prefetch_residual_history", None,
+            )
+            if (
+                residual_history is not None
+                and current_proxy is not None
+                and int(raw_gates.shape[1]) <= _DECODE_SEQ_MAX
+            ):
+                experts = int(raw_gates.shape[-1])
+                residual = (
+                    mx.mean(raw_gates.reshape(-1, experts), axis=0)
+                    - mx.mean(current_proxy.reshape(-1, experts), axis=0)
+                )
+                previous = residual_history.get(self.layer_idx)
+                decay = config.prefetch_rerank_residual_decay()
+                residual_history[self.layer_idx] = (
+                    residual
+                    if previous is None or decay <= 0
+                    else previous * decay + residual * (1.0 - decay)
+                )
             gate_history[self.layer_idx] = (
                 raw_gates
                 if int(raw_gates.shape[1]) <= _DECODE_SEQ_MAX
                 else raw_gates[:, -1:, :]
             )
+        oracle_replay = getattr(self, "_prefetch_oracle_replay", None)
+        if (
+            oracle_replay is not None
+            and self.layer_idx == 0
+            and int(raw_gates.shape[1]) > _DECODE_SEQ_MAX
+        ):
+            # A long layer-0 prefill is an unambiguous request boundary.  The
+            # captured route sequence is replayed from its first decode call
+            # for every warmup/repeat request.
+            oracle_replay.reset()
         gates = mx.softmax(raw_gates, axis=-1, precise=True)
         k = _effective_top_k(self.top_k)
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
         scores = mx.take_along_axis(gates, inds, axis=-1)
+        route_history = getattr(self, "_prefetch_route_history", None)
+        if route_history is not None and int(raw_gates.shape[1]) <= _DECODE_SEQ_MAX:
+            route_history[self.layer_idx] = inds
         if self.norm_topk_prob:
             scores = scores / mx.sum(scores, axis=-1, keepdims=True)
         if config.transition_trace():
@@ -212,6 +277,16 @@ class FileStreamingMoeBlock:
         # 每块开头推进逻辑 forward id，供 progressive 状态与审计精确配对。
         if config.zerocopy_dual_source() and getattr(self, "_vpool", None) is not None:
             self._vpool.begin_forward(self.layer_idx)
+        _online_host_targets = ()
+        _deferred_ready_predictions = []
+        _fused_demand_prediction = (
+            self._vpool.take_fused_prefetch(self.layer_idx)
+            if (
+                getattr(self, "_vpool", None) is not None
+                and config.prefetch_fuse_with_demand()
+            ) else None
+        )
+        _fused_scheduled_targets = set()
         if (getattr(self.store, "_staging", None) is not None
                 and not config.native_no_submit()):
             _vpool = getattr(self, "_vpool", None)
@@ -220,7 +295,118 @@ class FileStreamingMoeBlock:
                 if _vpool is not None and hasattr(_vpool, "targets_for")
                 else (None,)
             )
-            for _target in _targets:
+            _multistage_target = None
+            if config.prefetch_multistage_early() and _vpool is not None:
+                _candidate_target = (
+                    int(self.layer_idx)
+                    + config.prefetch_multistage_early_ahead()
+                )
+                _allowed_targets = config.prefetch_target_layers()
+                _selected_targets = config.prefetch_multistage_early_layers()
+                if (
+                    _candidate_target < len(getattr(
+                        getattr(self, "_prefetch_model_ref", None),
+                        "layers", (),
+                    ))
+                    and (
+                        _allowed_targets is None
+                        or _candidate_target in _allowed_targets
+                    )
+                    and (
+                        _selected_targets is None
+                        or _candidate_target in _selected_targets
+                    )
+                    and _candidate_target not in _targets
+                ):
+                    _multistage_target = _candidate_target
+                    if not config.prefetch_multistage_history():
+                        _targets = (*_targets, _candidate_target)
+            if (
+                config.prefetch_post_moe()
+                and not config.prefetch_post_moe_refinement()
+            ):
+                # Selected targets are submitted once from the completed
+                # decoder output by cross_layer.patched_call.  Suppress only
+                # their older MoE-entry submissions, keeping one predictor per
+                # target and preserving the early window everywhere else.
+                _replacement_layers = (
+                    config.prefetch_post_moe_replacement_layers()
+                )
+                if _replacement_layers is None:
+                    _targets = ()
+                else:
+                    _targets = tuple(
+                        target for target in _targets
+                        if target not in _replacement_layers
+                    )
+            if (
+                config.prefetch_host_ready_submit()
+                and int(x.shape[1]) <= _DECODE_SEQ_MAX
+                and not config.demand_async()
+            ):
+                for _target in _targets:
+                    if config.prefetch_async_predict() and _vpool is not None:
+                        with mx.stream(_vpool.progressive_stream()):
+                            _pred_ids = self._native_fused_prefetch(
+                                x, source_routes=inds, source_scores=scores,
+                                source_logits=raw_gates,
+                                target_layer=_target, ids_only=True,
+                            )
+                            if _pred_ids is not None:
+                                mx.async_eval(_pred_ids)
+                    else:
+                        _pred_ids = self._native_fused_prefetch(
+                            x, source_routes=inds, source_scores=scores,
+                            source_logits=raw_gates,
+                            target_layer=_target, ids_only=True,
+                        )
+                    if _pred_ids is not None:
+                        _deferred_ready_predictions.append((_target, _pred_ids))
+            elif (
+                config.prefetch_online_host_submit()
+                and getattr(self, "_prefetch_online_transition", None) is not None
+                and int(x.shape[1]) == 1
+                and not config.demand_async()
+            ):
+                _online_host_targets = _targets
+            elif (
+                config.prefetch_fuse_with_demand()
+                and config.demand_async()
+                and len(_targets) == 1
+                and not config.prefetch_progressive_for(_targets[0])
+                and _targets[0] in self.store._resident._pools
+                and not config.prefetch_isolated_side_for(_targets[0])
+                and int(_targets[0]) - int(self.layer_idx) >= 2
+            ):
+                _target = _targets[0]
+                if config.prefetch_async_predict() and _vpool is not None:
+                    with mx.stream(_vpool.progressive_stream()):
+                        _pred_ids = self._native_fused_prefetch(
+                            x, source_routes=inds, source_scores=scores,
+                            source_logits=raw_gates,
+                            target_layer=_target, ids_only=True,
+                        )
+                else:
+                    _pred_ids = self._native_fused_prefetch(
+                        x, source_routes=inds, source_scores=scores,
+                        source_logits=raw_gates,
+                        target_layer=_target, ids_only=True,
+                    )
+                if _pred_ids is not None:
+                    mx.async_eval(_pred_ids)
+                    _vpool.record_fused_prefetch(
+                        int(self.layer_idx) + 1,
+                        int(_target), _pred_ids,
+                        self.store.resident_experts(int(_target)),
+                    )
+                    _fused_scheduled_targets.add(int(_target))
+            for _target in (
+                () if _online_host_targets or _deferred_ready_predictions
+                else tuple(
+                    target for target in _targets
+                    if int(target) not in _fused_scheduled_targets
+                )
+            ):
                 if config.prefetch_async_predict() and _vpool is not None:
                     # The target predictor is speculative and independent of
                     # this layer's expert output.  Launch it on the auxiliary
@@ -232,6 +418,9 @@ class FileStreamingMoeBlock:
                             x, source_routes=inds, source_scores=scores,
                             source_logits=raw_gates,
                             target_layer=_target,
+                            prefetch_priority=(
+                                -1 if _target == _multistage_target else 0
+                            ),
                         )
                         if _dummy is not None:
                             mx.async_eval(_dummy)
@@ -240,11 +429,28 @@ class FileStreamingMoeBlock:
                         x, source_routes=inds, source_scores=scores,
                         source_logits=raw_gates,
                         target_layer=_target,
+                        prefetch_priority=(
+                            -1 if _target == _multistage_target else 0
+                        ),
                     )
                     if _dummy is not None:
                         # 多个 dummy 都折进当前层真实路由图；同一次 demand eval 会触发全部
                         # target callback，不增加 host 同步，也不把任一提交挪到 source MoE 后。
                         inds = inds + (_dummy.reshape(()).astype(inds.dtype) * 0)
+            if (
+                _multistage_target is not None
+                and config.prefetch_multistage_history()
+            ):
+                _history_dummy = self._history_route_prefetch(
+                    _multistage_target, priority=-1,
+                )
+                if _history_dummy is not None:
+                    # The logits came from the preceding decode/verify and are
+                    # already materialized by exact demand.  Only the tiny
+                    # 512-way rank and native callback join this source graph.
+                    inds = inds + (
+                        _history_dummy.reshape(()).astype(inds.dtype) * 0
+                    )
         # route-delta 会物化路由与 raw logits，必须在当前块预取提交构造完成后执行。
         if route_forward_id is not None:
             route_delta_trace.record_target(
@@ -313,20 +519,261 @@ class FileStreamingMoeBlock:
                         self.layer_idx,
                         [int(i) for i in inds.reshape(-1).tolist()],
                     )
+                if config.prefetch_rerank_data_active():
+                    self._vpool.attach_rerank_actual_logits(
+                        self.layer_idx, raw_gates,
+                    )
                 pool_arrays, local, n_experts = self._vpool.acquire(
                     self.layer_idx, inds, gates.shape[-1],
-                    seq_len=x.shape[1], layer_cap=layer_cap)
+                    seq_len=x.shape[1], layer_cap=layer_cap,
+                    fused_prefetch=_fused_demand_prediction,
+                )
+                online_transition = getattr(
+                    self, "_prefetch_online_transition", None,
+                )
+                if (
+                    online_transition is not None
+                    and not config.demand_async()
+                ):
+                    from mlx_streaming.core.prefetch.online_transition import (
+                        prefill_active,
+                    )
+                    if prefill_active():
+                        # Synchronous native demand has already evaluated inds;
+                        # this records every prefill chunk without another fence.
+                        online_transition.observe(
+                            self.layer_idx,
+                            [int(value) for value in inds.reshape(-1).tolist()],
+                            tuple(int(value) for value in inds.shape),
+                        )
+                if _online_host_targets:
+                    # Synchronous native demand has already materialized
+                    # ``inds``. Reusing those host-visible IDs adds no new GPU
+                    # barrier and starts target reads before source MoE compute.
+                    source_ids = [int(value) for value in inds.reshape(-1).tolist()]
+                    source_route_scores = [
+                        float(value) for value in scores.reshape(-1).tolist()
+                    ]
+                    online_transition = self._prefetch_online_transition
+                    for target in _online_host_targets:
+                        target_resident = self.store.resident_experts(int(target))
+                        predicted = online_transition.predict_ids_host(
+                            int(target), source_ids, source_route_scores,
+                            target_resident,
+                        )
+                        self._vpool.prefetch_ready_ids(
+                            int(target), predicted,
+                            source_layer=self.layer_idx,
+                        )
+                for target, predicted in _deferred_ready_predictions:
+                    self._vpool.prefetch_ready_ids(
+                        int(target),
+                        [int(value) for value in predicted.reshape(-1).tolist()],
+                        source_layer=self.layer_idx,
+                    )
                 if isinstance(local, tuple):
+                    if len(local) == 3:
+                        _, prefix_local, final_local = local
+                        hidden = self._sub.forward_gate_up(
+                            pool_arrays, n_experts, x, prefix_local,
+                        )
+                        # Submit prefix-wait -> gate/up before constructing
+                        # the final-wait -> down consumer. A boundary is
+                        # required because Metal's
+                        # command-buffer event wait otherwise gates earlier
+                        # encoders too. This path stays experimental/default
+                        # off because that boundary currently costs more than
+                        # the hidden tail I/O.
+                        mx.async_eval(hidden)
+                        y = self._sub.forward_down(
+                            pool_arrays, n_experts, hidden, final_local,
+                        )
+                        y = (y * scores[..., None]).sum(axis=-2)
+                        if self.shared_expert is not None:
+                            y = y + self._shared_forward(x)
+                        return y
                     entry_local, final_local = local
                     entry_hit = entry_local >= 0
                     hit_local = mx.maximum(entry_local, 0)
+                    if (
+                        config.demand_async_single_pass_for(self.layer_idx)
+                        and int(x.shape[1]) == 1
+                    ):
+                        # The final remap is ordered after the native demand
+                        # SharedEvent.  Cross-layer prefetch hits therefore
+                        # flow straight through, while a real miss waits only
+                        # for its bytes and still executes the optimized MLX
+                        # expert kernel exactly once.  This is preferable to
+                        # two full hit/miss passes for single-token baseline
+                        # decode; MTP batches keep the compute/I/O split below.
+                        y = self._sub.forward(
+                            pool_arrays, n_experts, x, final_local,
+                        )
                     # The remap command buffer is committed before either
                     # branch.  Hit compute is encoded before the final-local
                     # SharedEvent wait, allowing useful MoE work to overlap
                     # the CPU/SSD fallback callback.  The second pass is
                     # selected only at entry misses; this generic MLX version
                     # intentionally precedes a masked fused-kernel variant.
-                    if config.custom_fused_moe():
+                    elif (sparse_budget := min(
+                        config.demand_sparse_miss_budget_for(
+                            self.layer_idx, int(x.shape[1]),
+                        ),
+                        int(entry_local.size),
+                    )) > 0:
+                        flat_hit = entry_hit.reshape(-1)
+                        hidden = int(x.shape[-1])
+                        pair_x = mx.broadcast_to(
+                            mx.expand_dims(x, -2),
+                            entry_local.shape + (hidden,),
+                        ).reshape(-1, hidden)
+                        if config.demand_sparse_partition():
+                            # Partition the fixed route-position axis into a
+                            # guaranteed-hit prefix and an event-gated tail.
+                            # When misses<=budget the two sets are disjoint and
+                            # together perform exactly one expert evaluation
+                            # per route position (unlike the legacy full+tail
+                            # correction below).
+                            total = int(entry_local.size)
+                            early_count = total - sparse_budget
+                            order = mx.argsort(
+                                -flat_hit.astype(mx.int32),
+                            )
+                            early_pos = order[:early_count]
+                            late_pos = order[early_count:]
+                            if early_count:
+                                early_x = pair_x[early_pos].reshape(
+                                    1, early_count, hidden,
+                                )
+                                early_local = hit_local.reshape(-1)[
+                                    early_pos
+                                ].reshape(1, early_count, 1)
+                                if config.demand_sparse_hit_aux_stream():
+                                    # The final remap waits on a CPU/SSD
+                                    # SharedEvent.  Encoding entry-ready work
+                                    # on the same stream lets that wait gate
+                                    # the whole command buffer.  A dedicated
+                                    # stream commits the ordinary, numerically
+                                    # identical MLX expert kernel immediately;
+                                    # the final merge supplies the dependency.
+                                    with mx.stream(_sparse_hit_stream()):
+                                        early_y = self._sub.forward(
+                                            pool_arrays, n_experts,
+                                            early_x, early_local,
+                                        ).reshape(early_count, hidden)
+                                        mx.async_eval(early_y)
+                                else:
+                                    early_y = self._sub.forward(
+                                        pool_arrays, n_experts,
+                                        early_x, early_local,
+                                    ).reshape(early_count, hidden)
+                                    mx.async_eval(early_y)
+                            else:
+                                early_y = mx.zeros(
+                                    (0, hidden), dtype=x.dtype,
+                                )
+                            late_x = pair_x[late_pos].reshape(
+                                1, sparse_budget, hidden,
+                            )
+                            late_local = final_local.reshape(-1)[
+                                late_pos
+                            ].reshape(1, sparse_budget, 1)
+                            late_y = self._sub.forward(
+                                pool_arrays, n_experts,
+                                late_x, late_local,
+                            ).reshape(sparse_budget, hidden)
+                            if (
+                                early_count
+                                and config.demand_sparse_local_correction()
+                            ):
+                                # The fixed tail covers the common entry misses.
+                                # A rare overflow leaves one or more missing
+                                # positions in ``early_pos``; their early row-0
+                                # result is throwaway.  Once final_local is ready,
+                                # run only those positions through the masked
+                                # fused kernel and repair them in this layer. This
+                                # closes correctness locally and avoids a full
+                                # speculative-cache snapshot/replay every step.
+                                early_miss = (~flat_hit[early_pos])
+                                corrected_early_local = final_local.reshape(-1)[
+                                    early_pos
+                                ].reshape(1, early_count, 1)
+                                corrected_early = self._sub._custom_fused_forward(
+                                    early_x,
+                                    corrected_early_local,
+                                    active_mask=early_miss,
+                                ).reshape(early_count, hidden)
+                                early_y = mx.where(
+                                    early_miss[:, None],
+                                    corrected_early,
+                                    early_y,
+                                )
+                            output = mx.zeros(
+                                (total, hidden), dtype=late_y.dtype,
+                            )
+                            if early_count:
+                                output = output.at[early_pos].add(early_y)
+                            late_full = mx.zeros_like(output).at[
+                                late_pos
+                            ].add(late_y)
+                            late_mask = mx.zeros(
+                                (total,), dtype=mx.uint8,
+                            ).at[late_pos].add(
+                                mx.ones((sparse_budget,), dtype=mx.uint8),
+                            ) > 0
+                            y = mx.where(
+                                late_mask[:, None], late_full, output,
+                            ).reshape(entry_local.shape + (hidden,))
+                            if not config.demand_sparse_local_correction():
+                                self._vpool.record_lazy_replay_flag(
+                                    self.layer_idx,
+                                    mx.sum((~flat_hit).astype(mx.int32))
+                                    > sparse_budget,
+                                )
+                        else:
+                            # First pass uses the normal optimized MLX
+                            # SwitchGLU for all positions; the legacy path is
+                            # retained for controlled A/B comparison.
+                            hit_y = self._sub.forward(
+                                pool_arrays, n_experts, x, hit_local,
+                            )
+                            mx.async_eval(hit_y)
+                            miss_pos = mx.argsort(
+                                flat_hit.astype(mx.uint8),
+                            )[:sparse_budget]
+                            correction_x = pair_x[miss_pos].reshape(
+                                1, sparse_budget, hidden,
+                            )
+                            correction_local = final_local.reshape(-1)[
+                                miss_pos
+                            ].reshape(1, sparse_budget, 1)
+                            corrected = self._sub.forward(
+                                pool_arrays, n_experts,
+                                correction_x, correction_local,
+                            ).reshape(sparse_budget, hidden)
+                            hit_flat = hit_y.reshape(-1, hidden)
+                            is_miss = (~flat_hit[miss_pos])[:, None]
+                            replacement = mx.where(
+                                is_miss, corrected, mx.zeros_like(corrected),
+                            )
+                            replacement_full = mx.zeros_like(hit_flat).at[
+                                miss_pos
+                            ].add(replacement)
+                            replace_mask = mx.zeros(
+                                (int(hit_flat.shape[0]),), dtype=mx.uint8,
+                            ).at[miss_pos].add(
+                                is_miss.reshape(-1).astype(mx.uint8),
+                            ) > 0
+                            y = mx.where(
+                                replace_mask[:, None], replacement_full,
+                                hit_flat,
+                            ).reshape(hit_y.shape)
+                            self._vpool.record_lazy_replay_flag(
+                                self.layer_idx,
+                                mx.sum((~flat_hit).astype(mx.int32))
+                                > sparse_budget,
+                            )
+                    elif config.custom_fused_moe():
                         hit_y = self._sub.forward_masked(
                             pool_arrays, n_experts, x, hit_local, entry_hit,
                         )
@@ -362,6 +809,13 @@ class FileStreamingMoeBlock:
             # prefill/大批量(seq>1)或显式关闭 GPU_REMAP:走 host 路径。
             # 只在此处对 inds 做一次 .tolist() 同步，uniq/local 全在 Python 里算。
             flat = [int(i) for i in inds.reshape(-1).tolist()]
+            online_transition = getattr(self, "_prefetch_online_transition", None)
+            if online_transition is not None:
+                from mlx_streaming.core.prefetch.online_transition import prefill_active
+            if online_transition is not None and prefill_active():
+                online_transition.observe(
+                    self.layer_idx, flat, tuple(int(value) for value in inds.shape),
+                )
             uniq_set = set(flat)
             if UNION_ON:
                 note_union(x.shape[1], len(uniq_set), self.layer_idx)  # 本层路由专家并集(零额外同步,uniq_set 已算)
@@ -404,6 +858,67 @@ class FileStreamingMoeBlock:
             )
         return y
 
+    def _history_route_prefetch(self, target_layer: int, *, priority: int = -1):
+        """Prefetch from the preceding forward's exact target router output.
+
+        This is intentionally a separate first stage: it adds no forecast
+        gate and therefore can be submitted at T-3 without stealing compute
+        from the ordinary, fresher T-2 predictor.  Native filtering walks the
+        short exact-route ranking until it finds the first nonresident row.
+        """
+        target_layer = int(target_layer)
+        previous = getattr(self, "_prefetch_route_history", {}).get(target_layer)
+        previous_logits = getattr(
+            self, "_prefetch_gate_history", {},
+        ).get(target_layer)
+        model = getattr(self, "_prefetch_model_ref", None)
+        vp = getattr(self, "_vpool", None)
+        stg = getattr(self.store, "_staging", None)
+        if previous is None or model is None or vp is None or stg is None:
+            return None
+        layers = getattr(model, "layers", ())
+        if not (self.layer_idx < target_layer < len(layers)):
+            return None
+        tmlp = getattr(layers[target_layer], "mlp", None)
+        if not isinstance(tmlp, FileStreamingMoeBlock):
+            return None
+        rp = self.store._resident
+        if target_layer not in rp._pools:
+            return None
+
+        rank_width = min(
+            int(previous.size), config.prefetch_multistage_history_width(),
+        )
+        if previous_logits is not None:
+            # ``inds`` comes from argpartition and has no score-order
+            # guarantee.  Taking its first element made a one-row T-3 stage
+            # effectively random inside the previous top-k.  Rank the exact
+            # previous route union by its strongest per-token target-gate
+            # logit while keeping membership restricted to experts that were
+            # actually routed.
+            experts = int(previous_logits.shape[-1])
+            route_ids = previous.reshape(-1).astype(mx.int32)
+            route_mask = mx.zeros((experts,), dtype=mx.int32).at[
+                route_ids
+            ].add(mx.ones(route_ids.shape, dtype=mx.int32)) > 0
+            route_scores = mx.max(
+                previous_logits.reshape(-1, experts), axis=0,
+            )
+            route_scores = mx.where(route_mask, route_scores, -1e30)
+            ranked = mx.argsort(-route_scores)[:rank_width].astype(mx.uint32)
+        else:
+            ranked = previous.reshape(-1)[:rank_width].astype(mx.uint32)
+        resident = self.store.resident_experts(target_layer)
+        segs = stg.src._segs
+        pool_list = [
+            rp._pools[target_layer][f"{projection}.{tensor}"]
+            for projection, tensor, *_ in segs
+        ]
+        return vp.prefetch(
+            target_layer, ranked, resident, pool_list,
+            source_layer=self.layer_idx, priority=int(priority),
+        )
+
     def _native_fused_prefetch(
         self,
         x: mx.array,
@@ -411,6 +926,10 @@ class FileStreamingMoeBlock:
         source_scores: mx.array | None = None,
         source_logits: mx.array | None = None,
         target_layer: int | None = None,
+        ids_only: bool = False,
+        predictor_input_override: "mx.array | None" = None,
+        physical_rank_limit_override: int = 0,
+        prefetch_priority: int = 0,
     ):
         """搭车式预取：用下 AHEAD 层 gate 对 x 算预测 inds(lazy)，挂 GPU 完成回调，
         在 C++ 里(GPU 算完后)读 id + pread 预热下层专家字节。返回 dummy 张量(需被 eval 才触发)。
@@ -442,7 +961,11 @@ class FileStreamingMoeBlock:
             from mlx_streaming import native_moe_ext as _N
         except Exception:
             return None
-        if config.prefetch_adaptive():
+        exact_only_progressive = (
+            config.prefetch_progressive_for(tgt)
+            and config.prefetch_progressive_exact_only()
+        )
+        if config.prefetch_adaptive() and not exact_only_progressive:
             target_cap = int(self.store.cap_for(tgt))
             minimum = max(1, int(target_cap * config.prefetch_adaptive_fill()))
             if not _N.real_should_predict(
@@ -458,15 +981,43 @@ class FileStreamingMoeBlock:
         # PREDICT_USE_X=0 回退旧路径：目标层 post_attention_layernorm 作用在本层未归一化输入上。
         h = getattr(self, "_unnormed_input", None)
         predictor_gate = getattr(tmlp, "_prefetch_predict_gate", tmlp.gate)
-        if config.predict_use_x():
+        if predictor_input_override is not None:
+            predictor_input = predictor_input_override
+        elif config.predict_use_x():
             predictor_input = x
         elif h is None:
             h = x  # 退化：无未归一化输入时用 x（norm 偏差，覆盖会差）
             predictor_input = h
         else:
             predictor_input = layers[tgt].post_attention_layernorm(h)
-        proxy_g = predictor_gate(predictor_input)
-        rerank_gate = getattr(tmlp, "_prefetch_rerank_gate", None)
+        online_transition = getattr(self, "_prefetch_online_transition", None)
+        online_pred = (
+            online_transition.predict_ids(tgt, source_routes, source_scores)
+            if online_transition is not None
+            and source_routes is not None and source_scores is not None
+            else None
+        )
+        online_g = None
+        transition_only = getattr(
+            self, "_prefetch_transition_only_profile", {},
+        ).get(tgt)
+        if online_pred is not None:
+            proxy_g = mx.zeros(source_routes.shape[:-1] + (512,), dtype=mx.float32)
+        elif transition_only is not None:
+            if source_routes is None or source_scores is None:
+                return None
+            from mlx_streaming.core.prefetch.transition_only_runtime import (
+                apply_transition_only,
+            )
+            proxy_g = apply_transition_only(
+                source_routes, source_scores, transition_only,
+            )
+        else:
+            proxy_g = predictor_gate(predictor_input)
+        rerank_gate = (
+            None if transition_only is not None or online_pred is not None
+            else getattr(tmlp, "_prefetch_rerank_gate", None)
+        )
         source_correction = getattr(
             self, "_prefetch_source_correction_profile", {},
         ).get(tgt)
@@ -531,13 +1082,55 @@ class FileStreamingMoeBlock:
             g = proxy_g * (1.0 - alpha) + cache_logits * alpha
         else:
             g = forecast_g
+        residual_scale = config.prefetch_rerank_residual_scale_overrides().get(
+            int(tgt), 0.0,
+        )
+        proxy_history = getattr(self, "_prefetch_proxy_history", None)
+        previous_proxy_logits = (
+            proxy_history.get(tgt) if proxy_history is not None else None
+        )
+        previous_actual_logits = getattr(
+            self, "_prefetch_gate_history", {},
+        ).get(tgt)
+        accumulated_residual = getattr(
+            self, "_prefetch_residual_history", {},
+        ).get(tgt)
+        if (
+            residual_scale > 0
+            and previous_proxy_logits is not None
+            and (
+                accumulated_residual is not None
+                or previous_actual_logits is not None
+            )
+            and int(g.shape[1]) <= _DECODE_SEQ_MAX
+        ):
+            experts = int(g.shape[-1])
+            residual = (
+                accumulated_residual
+                if accumulated_residual is not None
+                else (
+                    mx.mean(
+                        previous_actual_logits.reshape(-1, experts), axis=0,
+                    )
+                    - mx.mean(
+                        previous_proxy_logits.reshape(-1, experts), axis=0,
+                    )
+                )
+            )
+            g = g + float(residual_scale) * residual
+        if proxy_history is not None and int(proxy_g.shape[1]) <= _DECODE_SEQ_MAX:
+            proxy_history[tgt] = proxy_g
         history_beta = config.prefetch_rerank_history_beta_overrides().get(
             int(tgt), 0.0,
         )
         previous_target_logits = getattr(
             self, "_prefetch_gate_history", {},
         ).get(tgt)
-        if history_beta > 0 and previous_target_logits is not None:
+        if (
+            history_beta > 0
+            and previous_target_logits is not None
+            and int(g.shape[1]) <= _DECODE_SEQ_MAX
+        ):
             from mlx_streaming.core.prefetch.history_rerank import (
                 blend_previous_target_logits,
             )
@@ -552,6 +1145,7 @@ class FileStreamingMoeBlock:
             and tgt in transition_profile
             and source_routes is not None
             and source_scores is not None
+            and int(g.shape[1]) <= _DECODE_SEQ_MAX
         ):
             from mlx_streaming.core.prefetch.source_transition_runtime import (
                 apply_source_transition,
@@ -630,7 +1224,19 @@ class FileStreamingMoeBlock:
             )
         )
         progressive = config.prefetch_progressive_for(tgt)
-        if progressive:
+        oracle_pred = (
+            getattr(self, "_prefetch_oracle_replay", None).next(tgt, token_count)
+            if (
+                getattr(self, "_prefetch_oracle_replay", None) is not None
+                and os.environ.get("PREFETCH_ORACLE_DISABLE") != "1"
+            )
+            else None
+        )
+        if oracle_pred is not None:
+            pred = oracle_pred
+        elif online_pred is not None:
+            pred = online_pred
+        elif progressive:
             # Keep main's first source callback unchanged.  Only a conservative
             # core is irreversible here; the same-forward T-1 decoder boundary
             # later fills the remaining legal slots from a moved exact gate.
@@ -653,14 +1259,17 @@ class FileStreamingMoeBlock:
             # turn a K=3 rerank into W32 (or K=1 into W24/32): that increases
             # SSD traffic and evicts useful rows without improving the target
             # route budget.  The raw candidate membership remains top64.
-            logical_width = config.prefetch_rerank_max_width(
+            logical_width = config.prefetch_rerank_max_width_for(
+                tgt,
                 default=15 if token_count == 1 else 26,
             )
             output_width = min(rerank_candidate_width, logical_width)
-            if prefetch_budget > 0:
-                output_width = min(output_width, prefetch_budget)
             _audit_rerank = (
-                config.prefetch_audit_prof()
+                (
+                    config.prefetch_audit_prof()
+                    or config.prefetch_acceptance_prof()
+                    or config.prefetch_rerank_data_active()
+                )
                 and vp is not None
                 and config.zerocopy_dual_source()
             )
@@ -671,7 +1280,19 @@ class FileStreamingMoeBlock:
                 retained_mass=config.prefetch_rerank_mass(),
                 min_width=config.prefetch_rerank_min_width(
                     default=_effective_top_k(tmlp.top_k)),
-                resident=resident or (),
+                # Host-ready unified submission uses one list for both native
+                # eviction protection and physical read ordering.  Retaining
+                # already-resident logical winners lets native skip their I/O
+                # while protecting them from the slot replacement needed for
+                # the first missing winner.  The runtime acceptance audit
+                # still receives ``resident`` below and subtracts these rows
+                # from physical selected width.
+                resident=(
+                    () if ids_only
+                    and config.prefetch_host_ready_protect_logical()
+                    or config.prefetch_protect_logical()
+                    else resident or ()
+                ),
                 width_policy=rerank_width_policy,
                 ranking_policy=rerank_ranking_policy,
                 union_margin=rerank_union_margin,
@@ -680,6 +1301,10 @@ class FileStreamingMoeBlock:
                 candidate_logits=raw_proxy_logits,
                 candidate_ranking_policy="max",
                 candidate_width=rerank_candidate_width,
+                backfill_extra=(
+                    config.prefetch_rerank_backfill_extra_for(int(tgt))
+                    if token_count <= _DECODE_SEQ_MAX else 0
+                ),
                 return_candidate_ids=_audit_rerank,
             )
             pred, _rerank_scores, _rerank_keep = _rerank_result[:3]
@@ -687,9 +1312,19 @@ class FileStreamingMoeBlock:
                 vp.record_rerank_acceptance(
                     tgt,
                     candidate_ids=_rerank_result[3],
-                    selected_ids=pred,
-                    online_width=mx.sum(_rerank_keep.astype(mx.int32)),
+                    selected_ids=_rerank_result[4],
+                    online_width=mx.sum(
+                        _rerank_result[5].astype(mx.int32)
+                    ),
                     resident=resident,
+                    proxy_logits=(
+                        raw_proxy_logits
+                        if config.prefetch_rerank_data_active() else None
+                    ),
+                    predictor_hidden=(
+                        predictor_input
+                        if config.prefetch_rerank_data_active() else None
+                    ),
                 )
             if config.prefetch_rerank_prof():
                 note_rerank(_rerank_scores, _rerank_keep, len(resident or ()))
@@ -710,11 +1345,67 @@ class FileStreamingMoeBlock:
                 # 取 top-kk（argpartition，O(E) 不全排序）。实测：加宽 kk 不提升命中——staging 更多 = 后台
                 # pread 更多、到位更晚 + 抢带宽 → 反而更低；故 width=16 即最优，cap 截断极少触发、无需排序。
                 pred = mx.argpartition(g, kth=-kk, axis=-1)[..., -kk:].reshape(-1).astype(mx.uint32)
+        # Keep the audited logical top15 intact, but allow the host-ready K=1
+        # path to submit only a high-confidence prefix to SSD.  Resident rows
+        # deliberately remain in this prefix: native reservation filters them
+        # without backfilling a lower-confidence miss.
+        _physical_rank_limit = (
+            config.prefetch_k1_physical_rank_limit()
+            if token_count == 1
+            else config.prefetch_k3_physical_rank_limit()
+            if token_count <= _DECODE_SEQ_MAX
+            else 0
+        )
+        if ids_only and _physical_rank_limit > 0:
+            _rank_logits = mx.max(
+                g.reshape(-1, int(g.shape[-1])), axis=0,
+            )
+            _rank_width = min(int(g.shape[-1]), _physical_rank_limit)
+            _rank_ids = mx.argpartition(
+                _rank_logits, kth=-_rank_width,
+            )[-_rank_width:]
+            _rank_order = mx.argsort(_rank_logits[_rank_ids])[::-1]
+            pred = _rank_ids[_rank_order].astype(mx.uint32)
+        elif _physical_rank_limit > 0:
+            # Async unified prediction previously ignored the public rank
+            # limit and always let native scan the full nonresident-packed
+            # W26 until it found three misses. With logical protection active,
+            # this fixed prefix retains resident winners and deliberately does
+            # not backfill a low-ranked stranger merely to fill the I/O cap.
+            pred = pred[:min(int(pred.size), _physical_rank_limit)]
+        if physical_rank_limit_override > 0:
+            pred = pred[:min(int(pred.size), int(physical_rank_limit_override))]
+        if (
+            config.prefetch_late_candidate_rerank()
+            and predictor_input_override is None
+            and token_count <= _DECODE_SEQ_MAX
+        ):
+            # Freeze membership from the authoritative early raw top-64, but
+            # keep it lazy on device.  cross_layer scores only these rows from
+            # the completed source output, avoiding a second 512-way gate.
+            _candidate_scores = mx.max(
+                raw_proxy_logits.reshape(-1, int(raw_proxy_logits.shape[-1])),
+                axis=0,
+            )
+            _candidate_width = min(
+                int(raw_proxy_logits.shape[-1]),
+                int(rerank_candidate_width),
+            )
+            _candidate_ids = mx.argpartition(
+                _candidate_scores, kth=-_candidate_width,
+            )[-_candidate_width:].astype(mx.uint32)
+            _late_state = getattr(self, "_prefetch_late_candidates", None)
+            if _late_state is None:
+                _late_state = {}
+                object.__setattr__(self, "_prefetch_late_candidates", _late_state)
+            _late_state[int(tgt)] = _candidate_ids
         if config.predict_recall_prof() or config.miss_attrib():
             try:
                 tmlp._predicted_set = {int(e) for e in pred.tolist()}
             except Exception:
                 pass
+        if ids_only:
+            return pred
         if TPROF_ON:
             note_tprof("predict_s", time.perf_counter() - _tp0, count_key="predict_n")
         if stg is not None:
@@ -735,9 +1426,26 @@ class FileStreamingMoeBlock:
                               f"ptr={hex(_N.array_data_ptr(rp._pools[tgt][_fk]))}", flush=True)
                     except Exception as _e:
                         print(f"[POOL_PTR] err {_e}", flush=True)
+                if progressive:
+                    if config.prefetch_progressive_exact_only():
+                        self._vpool.record_progressive(
+                            tgt,
+                            candidate_logits=raw_proxy_logits,
+                            early_ids=pred,
+                            resident=resident,
+                            pool_list=pool_list,
+                            top_k=_effective_top_k(tmlp.top_k),
+                            candidate_width=config.prefetch_rerank_candidate_width(),
+                            early_dummy=None,
+                            exact_only=True,
+                        )
+                        # Preserve the caller's lazy dependency shape without
+                        # issuing the inaccurate early SSD callback.
+                        return mx.zeros((), dtype=mx.uint32)
                 result = self._vpool.prefetch(
                     tgt, pred, resident, pool_list,
                     source_layer=self.layer_idx,
+                    priority=int(prefetch_priority),
                 )
                 if progressive:
                     self._vpool.record_progressive(
@@ -749,6 +1457,7 @@ class FileStreamingMoeBlock:
                         top_k=_effective_top_k(tmlp.top_k),
                         candidate_width=config.prefetch_rerank_candidate_width(),
                         early_dummy=result,
+                        exact_only=False,
                     )
                 if route_forward_id is not None:
                     route_delta_trace.record_prediction(

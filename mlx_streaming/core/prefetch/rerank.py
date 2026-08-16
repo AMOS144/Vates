@@ -105,6 +105,7 @@ def rerank_prefetch_candidates(
     candidate_logits: "mx.array | None" = None,
     candidate_ranking_policy: str = "max",
     candidate_width: int = 64,
+    backfill_extra: int = 0,
     return_candidate_ids: bool = False,
 ) -> "tuple[mx.array, ...]":
     """按专家至少被一个 token 选中的近似概率排序，并压紧无效尾部。
@@ -185,9 +186,21 @@ def rerank_prefetch_candidates(
         available = mx.ones((num_experts,), dtype=mx.bool_)
     selectable = candidate_mask
     eligible_candidate_scores = mx.where(selectable, scores, -1e30)
+    # Normally logical W includes resident winners, so filtering them does not
+    # pull lower-ranked SSD rows into the request.  The opt-in backfill mode
+    # instead searches far enough down the same frozen raw-top64 candidate set
+    # to produce up to W nonresident rows.  This targets the approximately two
+    # true cache gaps per layer without changing candidate membership.
+    extra = max(0, int(backfill_extra))
+    selection_width = width
+    if extra and width_policy == "predicted_route_union":
+        # Only inspect ``extra`` positions beyond the old logical prefix.  A
+        # full resident backfill can double SSD traffic; the useful regime is
+        # the measured one-or-two true cache gaps per layer.
+        selection_width = min(num_experts, width + extra)
     candidate_ids = mx.argpartition(
-        eligible_candidate_scores, kth=-width,
-    )[-width:]
+        eligible_candidate_scores, kth=-selection_width,
+    )[-selection_width:]
     rerank_candidate_scores = scores[candidate_ids]
     candidate_valid = selectable[candidate_ids]
 
@@ -199,7 +212,7 @@ def rerank_prefetch_candidates(
         ordered_valid, noisy_or_scores[ordered_ids], 0.0,
     )
 
-    positions = mx.arange(width)
+    positions = mx.arange(selection_width)
     if width_policy == "mass":
         cumulative = mx.cumsum(ordered_mass_scores)
         threshold = mx.sum(ordered_mass_scores) * mass
@@ -221,7 +234,27 @@ def rerank_prefetch_candidates(
             int(top_k), predicted_union - max(0, int(union_margin)),
         )
         online_width = mx.minimum(width, (reference * 3) // 2)
-        keep = ordered_valid & ordered_nonresident & (positions < online_width)
+        if extra:
+            nonresident_position = (
+                mx.cumsum(ordered_nonresident.astype(mx.int32)) - 1
+            )
+            original_nonresident = mx.sum(
+                (
+                    ordered_valid
+                    & ordered_nonresident
+                    & (positions < online_width)
+                ).astype(mx.int32)
+            )
+            target_nonresident = mx.minimum(
+                online_width, original_nonresident + extra,
+            )
+            keep = (
+                ordered_valid
+                & ordered_nonresident
+                & (nonresident_position < target_nonresident)
+            )
+        else:
+            keep = ordered_valid & ordered_nonresident & (positions < online_width)
     else:
         raise ValueError(f"未知 rerank width policy: {width_policy}")
 
@@ -229,12 +262,13 @@ def rerank_prefetch_candidates(
     # Fixed-shape tail rows repeat the first packed ID, so native de-dup sees
     # exactly the logical set.  With zero submitted rows the first resident ID
     # is repeated, which reserve() filters without issuing a read.
-    pack_key = mx.where(keep, positions, positions + width)
+    pack_key = mx.where(keep, positions, positions + selection_width)
     pack_order = mx.argsort(pack_key)
-    packed_ids = ordered_ids[pack_order]
-    packed_scores = ordered_mass_scores[pack_order]
+    packed_ids = ordered_ids[pack_order][:width]
+    packed_scores = ordered_mass_scores[pack_order][:width]
     kept_count = mx.sum(keep.astype(mx.int32))
-    compact_keep = positions < kept_count
+    output_positions = mx.arange(width)
+    compact_keep = output_positions < mx.minimum(kept_count, width)
     first_id = mx.broadcast_to(packed_ids[:1], packed_ids.shape)
     compact_ids = mx.where(compact_keep, packed_ids, first_id)
     result = (compact_ids, packed_scores, compact_keep)
@@ -242,5 +276,19 @@ def rerank_prefetch_candidates(
         # Audit must use the exact device-side raw top-N membership computed by
         # production. Re-running argpartition after generation can disagree at
         # a bfloat16 boundary tie and would make the retention gate ambiguous.
-        return (*result, token_candidate_ids)
+        # Quality auditing must see the logical rerank set before resident
+        # filtering/backfill.  A Python resident snapshot is taken while MLX
+        # is still building the lazy graph and can lag the native callback by
+        # an entire evaluation; folding it into recall made cache state look
+        # like predictor quality.  Production still consumes ``compact_ids``
+        # above, while these two arrays provide the pure occurrence-local set.
+        logical_ids = ordered_ids[:width]
+        logical_positions = mx.arange(width)
+        logical_keep = (
+            ordered_valid[:width]
+            & (logical_positions < online_width)
+        )
+        return (
+            *result, token_candidate_ids, logical_ids, logical_keep,
+        )
     return result

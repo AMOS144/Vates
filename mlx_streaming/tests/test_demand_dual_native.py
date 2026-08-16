@@ -158,6 +158,78 @@ def test_unified_prediction_hits_fill_free_history_then_stop_promoting():
     os.unlink(path)
 
 
+def test_staged_demand_miss_rearms_adaptive_predictor():
+    """Compatibility staging must rearm just like direct demand."""
+    N.real_reset(); N.sideregion_reset()
+    path = tempfile.NamedTemporaryFile(suffix=".blob", delete=False).name
+    _blob(path)
+    pool = _pool()
+    layer = 23
+    N.real_init(layer, CAP)
+    # Production checks prediction eligibility before this target's demand;
+    # that call also registers the configured cooldown budget.
+    assert N.real_should_predict(layer, CAP, 2) is True
+
+    local = N.demand_staged_multi(
+        mx.array([[9]], dtype=mx.uint32), pool, SEG, layer, path,
+        STRIDE, CAP, True, 0, SPEC, [], [], sequence_length=1,
+    )
+    mx.eval(local)
+    assert N.real_should_predict(layer, CAP, 2) is True
+    assert N.real_should_predict(layer, CAP, 2) is True
+    assert N.real_should_predict(layer, CAP, 2) is False
+    os.unlink(path)
+
+
+def test_unified_physical_read_budget_caps_missing_rows_not_logical_ids(monkeypatch):
+    """The rerank set stays wide while one callback pulls at most N misses."""
+    monkeypatch.setenv("PREFETCH_PHYSICAL_READ_BUDGET", "1")
+    N.real_reset(); N.sideregion_reset(); N.prefetch_audit_stats_reset()
+    path = tempfile.NamedTemporaryFile(suffix=".blob", delete=False).name
+    _blob(path)
+    pool = _pool()
+    layer = 24
+    N.real_init(layer, CAP)
+
+    ready = N.prefetch_pool_sideregion(
+        pool, SEG, mx.array([1, 2, 3], dtype=mx.uint32), layer, path,
+        STRIDE, [], 3, -CAP, gen=0, source_layer=23, forward_id=99,
+    )
+    mx.eval(ready); N.sideregion_drain()
+
+    assert N.real_region_count(layer) == 1
+    audit = list(N.prefetch_audit_stats())
+    assert audit[10] == 3                 # logical candidate width unchanged
+    assert audit[21:23] == [1, 1]        # requested/completed physical reads
+    os.unlink(path)
+
+
+def test_unified_physical_read_budget_profile_overrides_selected_layer(monkeypatch):
+    monkeypatch.setenv("PREFETCH_PHYSICAL_READ_BUDGET", "1")
+    monkeypatch.setenv("PREFETCH_PHYSICAL_READ_BUDGET_PROFILE", "24:2,30-31:3")
+    N.real_reset(); N.sideregion_reset()
+    path = tempfile.NamedTemporaryFile(suffix=".blob", delete=False).name
+    _blob(path)
+    pool24 = _pool()
+    pool25 = _pool()
+    N.real_init(24, CAP)
+    N.real_init(25, CAP)
+
+    ready24 = N.prefetch_pool_sideregion(
+        pool24, SEG, mx.array([1, 2, 3], dtype=mx.uint32), 24, path,
+        STRIDE, [], 3, -CAP, gen=0, source_layer=23, forward_id=99,
+    )
+    ready25 = N.prefetch_pool_sideregion(
+        pool25, SEG, mx.array([1, 2, 3], dtype=mx.uint32), 25, path,
+        STRIDE, [], 3, -CAP, gen=0, source_layer=24, forward_id=99,
+    )
+    mx.eval(ready24, ready25); N.sideregion_drain()
+
+    assert N.real_region_count(24) == 2
+    assert N.real_region_count(25) == 1
+    os.unlink(path)
+
+
 def test_demand_overcap_requests_temporary_fallback_without_mutating_real():
     N.real_reset(); N.sideregion_reset(); N.demand_deadline_stats_reset()
     path = tempfile.NamedTemporaryFile(suffix=".blob", delete=False).name
@@ -447,9 +519,11 @@ def test_async_demand_maps_and_loads_only_after_graph_evaluation():
     )
     # Construction is lazy: neither route ids nor misses reached the CPU.
     assert list(N.demand_async_stats()) == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    assert not any(N.demand_async_miss_histogram())
     mx.eval(local)
     N.demand_async_check()
     assert list(N.demand_async_stats())[:8] == [1, 0, 1, 2, 0, 2, 1, 0]
+    assert list(N.demand_async_miss_histogram())[2] == 1
     mapping = dict(zip(
         N.real_region_contents(15)[::2],
         N.real_region_contents(15)[1::2],
@@ -463,6 +537,8 @@ def test_async_demand_maps_and_loads_only_after_graph_evaluation():
     mx.eval(again)
     N.demand_async_check()
     assert list(N.demand_async_stats())[:8] == [2, 1, 1, 2, 2, 4, 1, 0]
+    hist = list(N.demand_async_miss_histogram())
+    assert hist[0] == 1 and hist[2] == 1 and sum(hist) == 2
     assert again.tolist() == local.tolist()
     os.unlink(path)
 

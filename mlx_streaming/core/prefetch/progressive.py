@@ -20,8 +20,8 @@ def initial_core_ids(
 ) -> mx.array:
     """Select a fixed nonresident early core from the raw per-token top64."""
     core = int(core_width)
-    if not 1 <= core <= 15:
-        raise ValueError("progressive early core must be in [1, 15]")
+    if not 1 <= core <= 26:
+        raise ValueError("progressive early core must be in [1, 26]")
     ids, _scores, _keep = rerank_prefetch_candidates(
         proxy_logits,
         top_k=int(top_k),
@@ -62,7 +62,7 @@ def refined_ids(
     if capacity <= 0:
         raise ValueError("side capacity must be positive")
     core_width = int(early_ids.size)
-    if not 1 <= core_width <= min(15, capacity):
+    if not 1 <= core_width <= min(26, capacity):
         raise ValueError("invalid progressive early core width")
 
     num_experts = int(exact_logits.shape[-1])
@@ -164,11 +164,18 @@ def exact_route_union_ids(
     side_capacity: int,
     resident=(),
 ) -> "tuple[mx.array, mx.array]":
-    """Pack the exact adjacent target route union into fixed device storage.
+    """Pack the complete adjacent target route union into device storage.
 
     The adjacent target attention/gate is the real computation moved to T-1
-    and reused by the decoder, so this is not an oracle label.  K=3 routes at
-    most ``3 * top_k == 30`` experts and therefore fit the 32 direct rows.
+    and reused by the decoder, so this is not an oracle label.  Existing
+    resident routes must remain in the packed set: the native reservation uses
+    the full submitted set as its eviction-protection set.  Filtering resident
+    routes here could let a missing route evict an expert that this same MoE
+    invocation is about to consume.
+
+    GPU-only demand cannot recover from a truncated union.  Require enough
+    fixed storage for the worst-case union rather than silently returning a
+    partial mapping containing ``-1`` rows.
     """
     capacity = int(side_capacity)
     num_experts = int(exact_logits.shape[-1])
@@ -180,20 +187,21 @@ def exact_route_union_ids(
     route_ids = mx.argpartition(
         exact, kth=-int(top_k), axis=-1,
     )[:, -int(top_k):]
+    max_route_width = int(route_ids.shape[0]) * int(top_k)
+    if capacity < max_route_width:
+        raise ValueError(
+            "exact GPU route storage is too small: "
+            f"capacity={capacity}, required={max_route_width}",
+        )
     expert_axis = mx.arange(num_experts)
     route_present = mx.any(
         route_ids[..., None] == expert_axis,
         axis=(0, 1),
     )
-    resident_set = {
-        int(expert) for expert in resident
-        if 0 <= int(expert) < num_experts
-    }
-    available = mx.array(
-        [expert not in resident_set for expert in range(num_experts)],
-        dtype=mx.bool_,
-    )
-    needed = route_present & available
+    # ``resident`` is intentionally not subtracted.  Native reservation skips
+    # its I/O but uses every submitted ID to protect current-route rows.
+    del resident
+    needed = route_present
     scores, _ = _ranking_scores(
         exact, top_k=int(top_k), policy="topk_union",
     )
@@ -208,3 +216,49 @@ def exact_route_union_ids(
     keep = mx.arange(capacity) < width
     first = mx.broadcast_to(selected[:1], selected.shape)
     return mx.where(keep, selected, first), width
+
+
+def exact_candidate_route_ids(
+    exact_logits: mx.array,
+    candidate_logits: mx.array,
+    *,
+    top_k: int,
+    side_capacity: int,
+    resident=(),
+    candidate_width: int = 64,
+) -> "tuple[mx.array, mx.array]":
+    """Select only exact target routes that belong to the frozen raw top64.
+
+    This is the single-callback variant of progressive refinement: it gives up
+    the inaccurate early core and spends the adjacent half-layer window only
+    on route-critical rows. The resulting set is a strict raw-top64 subset and
+    is never wider than the true route union.
+    """
+    capacity = int(side_capacity)
+    num_experts = int(exact_logits.shape[-1])
+    exact = exact_logits.reshape(-1, num_experts)
+    candidate = candidate_logits.reshape(-1, num_experts)
+    route_ids = mx.argpartition(exact, kth=-int(top_k), axis=-1)[:, -int(top_k):]
+    raw_width = min(num_experts, int(candidate_width))
+    candidate_ids = mx.argpartition(
+        candidate, kth=-raw_width, axis=-1,
+    )[:, -raw_width:]
+    expert_axis = mx.arange(num_experts)
+    route_mask = mx.any(route_ids[..., None] == expert_axis, axis=(0, 1))
+    candidate_mask = mx.any(
+        candidate_ids[..., None] == expert_axis, axis=(0, 1),
+    )
+    resident_set = {int(value) for value in resident}
+    available = mx.array(
+        [expert not in resident_set for expert in range(num_experts)],
+        dtype=mx.bool_,
+    )
+    needed = route_mask & candidate_mask & available
+    scores, _ = _ranking_scores(exact, top_k=int(top_k), policy="topk_union")
+    ranked = mx.where(needed, scores, -1e30)
+    ids = mx.argpartition(ranked, kth=-capacity)[-capacity:]
+    ids = ids[mx.argsort(ranked[ids])[::-1]].astype(mx.uint32)
+    width = mx.minimum(capacity, mx.sum(needed.astype(mx.int32)))
+    keep = mx.arange(capacity) < width
+    first = mx.broadcast_to(ids[:1], ids.shape)
+    return mx.where(keep, ids, first), width

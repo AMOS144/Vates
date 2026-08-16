@@ -112,6 +112,7 @@ class MLXBackend:
         _warmup(self._model, self._tok, self._drafter, self.args)
 
     def generate(self, messages, on_text) -> GenResult:
+        import os
         import time
 
         import mlx.core as mx
@@ -145,20 +146,47 @@ class MLXBackend:
                 return True
             return False
 
+        # The throughput profile keeps wide prompt ingestion synchronous, then
+        # enables overlapped demand exactly at the prefill/decode boundary.
+        # Keep the TUI on the same path as the plain CLI and benchmark runner;
+        # otherwise DEMAND_ASYNC remains 0 for the whole decode and throughput
+        # falls back to the synchronous ~24 tok/s path.
+        split_demand = os.environ.get(
+            "SPEC_SPLIT_DEMAND_AFTER_PREFILL",
+        ) == "1"
+        saved_demand_async = os.environ.get("DEMAND_ASYNC")
+        if split_demand:
+            os.environ["DEMAND_ASYNC"] = "0"
+
+        def on_prefill_complete():
+            if split_demand:
+                os.environ["DEMAND_ASYNC"] = "1"
+
         t0 = time.perf_counter()
-        produced, stats = mtp_generate(
-            self._model,
-            self._drafter,
-            tok,
-            mx.array([ids]),
-            self.args.max_tokens,
-            K=self.args.k,
-            ids_mode=True,
-            profile=False,
-            on_tokens=on_tokens,
-            main_cache=main_cache,
-            cached_len=cached_len,
-        )
+        try:
+            generate_kwargs = {}
+            if split_demand:
+                generate_kwargs["on_prefill_complete"] = on_prefill_complete
+            produced, stats = mtp_generate(
+                self._model,
+                self._drafter,
+                tok,
+                mx.array([ids]),
+                self.args.max_tokens,
+                K=self.args.k,
+                ids_mode=True,
+                profile=False,
+                on_tokens=on_tokens,
+                main_cache=main_cache,
+                cached_len=cached_len,
+                **generate_kwargs,
+            )
+        finally:
+            if split_demand:
+                if saved_demand_async is None:
+                    os.environ.pop("DEMAND_ASYNC", None)
+                else:
+                    os.environ["DEMAND_ASYNC"] = saved_demand_async
         dt = time.perf_counter() - t0
 
         # 持久化本轮 cache 供下轮复用。正常情况下 main_cache 恰好持有 `ids + produced[:-1]`

@@ -169,3 +169,53 @@ def test_early_rerank_acceptance_is_deferred_until_target_truth(monkeypatch):
     assert captured[0][0] == 2
     assert captured[0][1]["actual_ids"] is actual
     assert captured[0][1]["resident"] == (7,)
+
+
+def test_ordinary_optimistic_prefetch_uses_gpu_only_remap(monkeypatch):
+    """T-ahead rerank needs no progressive dummy to enter the replay-safe path."""
+    import mlx_streaming.native_moe_ext as native
+
+    class _RP:
+        spec_gens = 1
+        spec_slots = 32
+        _native_demand = True
+        eviction_policy = "lfu"
+        lfu_decay_interval = 1
+
+        def __init__(self):
+            self._pools = {3: "POOL"}
+
+        def _bootstrap_dual_pool(self, _layer):
+            return None
+
+        def native_real_cap_for(self, _layer):
+            return 64
+
+        def allocated_slots(self, _layer):
+            return 64
+
+    monkeypatch.setenv("PREFETCH_DIRECT_SLOTS", "1")
+    monkeypatch.setenv("PREFETCH_EXACT_GPU_DEMAND", "1")
+    monkeypatch.setenv("PREFETCH_OPTIMISTIC_VERIFY", "1")
+    monkeypatch.setenv("PREFETCH_EXACT_NO_IO", "1")
+    monkeypatch.setenv("DEMAND_ASYNC", "0")
+    calls = []
+    monkeypatch.setattr(
+        native,
+        "demand_gpu_remap_only",
+        lambda inds, layer, generation, cap, use_side: (
+            calls.append((inds, layer, generation, cap, use_side))
+            or mx.array([[-1, 7]], dtype=mx.int32)
+        ),
+    )
+
+    vp = VirtualPool(_RP(), staging=object(), spec_slots=32)
+    vp._native_meta = lambda _layer: ([], [], "unused", 0)
+    inds = mx.array([[11, 12]], dtype=mx.uint32)
+    pool, local, n_exp = vp._acquire_direct(3, inds, 0, 64, seq_len=1)
+
+    assert pool == "POOL"
+    assert local.tolist() == [[0, 7]]
+    assert n_exp == 64
+    assert len(calls) == 1
+    assert bool(vp.take_optimistic_miss_flag().item())

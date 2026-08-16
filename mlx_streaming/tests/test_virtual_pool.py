@@ -43,6 +43,18 @@ def test_targets_for_covers_every_target_once_without_shortening():
     )
 
 
+def test_targets_for_respects_ordinary_prefetch_allowlist(monkeypatch):
+    monkeypatch.setenv("PREFETCH_TARGET_LAYERS", "2,4,7")
+    vp = VirtualPool(num_layers=8, cutoff=2, ahead_lo=1, ahead_hi=3)
+    assert vp.targets_for(1) == (2, 4)
+    assert vp.targets_for(4) == (7,)
+    assert all(
+        target in {2, 4, 7}
+        for source in range(8)
+        for target in vp.targets_for(source)
+    )
+
+
 # ---- 双源双缓冲协调器（dual-source coordinator）----
 
 class _FakeRP:
@@ -122,3 +134,30 @@ def test_double_gen_still_alternates():
     vp = VirtualPool(_RP2(), _Stg(), spec_slots=16)
     vp.begin_forward(0)
     assert vp.read_gen() != vp.fill_gen()                 # 双代:读填不同
+
+
+def test_progressive_direct_base_matches_isolated_demand_capacity(monkeypatch):
+    monkeypatch.setenv("PREFETCH_DIRECT_SLOTS", "1")
+    monkeypatch.setenv("PREFETCH_ISOLATED_SIDE", "1")
+    monkeypatch.setenv("PREFETCH_TARGET_LAYERS", "4")
+
+    class _IsolatedRP:
+        spec_gens = 1
+        spec_slots = 32
+        _native_demand = True
+
+        @staticmethod
+        def cap_for(layer):
+            return 82
+
+        @staticmethod
+        def native_real_cap_for(layer):
+            return 50
+
+    vp = VirtualPool(_IsolatedRP(), _FakeStg(), spec_slots=32)
+    # Early and progressive refinement both use this helper.  They must start
+    # at the end of the same 50-row real region, never reinitialize it as 82.
+    assert vp._direct_prefetch_base(4, 0) == 50
+    # Layer zero has no predecessor/isolated admission tail.
+    assert vp._direct_prefetch_base(0, 0) == -82
+

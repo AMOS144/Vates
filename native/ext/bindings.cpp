@@ -57,6 +57,38 @@ NB_MODULE(native_moe_ext, m) {
       "stride"_a,
       nb::kw_only(),
       "stream"_a = nb::none());
+  m.def(
+      "blob_mmap",
+      &blob_mmap,
+      "path"_a,
+      "stride"_a,
+      "num_experts"_a);
+  m.def(
+      "blob_mmap_gather",
+      &blob_mmap_gather,
+      "path"_a,
+      "expert_ids"_a,
+      "stride"_a,
+      "num_experts"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none());
+  m.def(
+      "blob_mmap_prefetch",
+      &blob_mmap_prefetch,
+      "path"_a,
+      "expert_ids"_a,
+      "stride"_a,
+      "num_experts"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none());
+  m.def(
+      "blob_mmap_prefault_host",
+      &blob_mmap_prefault_host,
+      "path"_a,
+      "expert_ids"_a,
+      "stride"_a,
+      "num_experts"_a,
+      nb::call_guard<nb::gil_scoped_release>());
   // ---- [2] 轻量预取(无 staging，仅预热 page cache) ----
   m.def(
       "prefetch_on_complete",
@@ -85,8 +117,14 @@ NB_MODULE(native_moe_ext, m) {
       "priority"_a = 0,
       nb::kw_only(),
       "stream"_a = nb::none());
+  m.def("prefetch_staging_ready_ids", &prefetch_staging_ready,
+        "staging"_a, "expert_ids"_a, "layer"_a, "gen"_a, "path"_a,
+        "stride"_a, "resident"_a, "cap"_a, "parallel"_a,
+        "source_layer"_a = -1, "forward_id"_a = -1, "priority"_a = 0);
   m.def("prefetch_staging_take", &prefetch_staging_take,
         "layer"_a, "generation"_a = -1);
+  m.def("prefetch_staging_consumed", &prefetch_staging_consumed,
+        "layer"_a, "generation"_a);
   m.def("prefetch_staging_drain", &prefetch_staging_drain,
         nb::call_guard<nb::gil_scoped_release>());
   m.def("prefetch_staging_finished", &prefetch_staging_finished,
@@ -113,10 +151,27 @@ NB_MODULE(native_moe_ext, m) {
         "source_layer"_a = -1, "forward_id"_a = -1, "priority"_a = 0,
         nb::kw_only(),
         "stream"_a = nb::none());
+  m.def("prefetch_unified_ready_ids",
+        [](const std::vector<mx::array>& pool_list,
+           const std::vector<int>& seg_nbytes,
+           const std::vector<int>& expert_ids, int layer,
+           const std::string& path, int stride,
+           const std::vector<int>& resident, int speculative_limit,
+           int real_cap, int source_layer, int64_t forward_id) {
+          std::vector<uint32_t> ids(expert_ids.begin(), expert_ids.end());
+          prefetch_unified_ready(
+              pool_list, seg_nbytes, ids.data(), ids.size(), layer, path,
+              stride, resident, speculative_limit, real_cap, source_layer,
+              forward_id);
+        },
+        "pool_list"_a, "seg_nbytes"_a, "expert_ids"_a, "layer"_a,
+        "path"_a, "stride"_a, "resident"_a, "speculative_limit"_a,
+        "real_cap"_a, "source_layer"_a, "forward_id"_a);
   m.def("sideregion_contents", &sideregion_contents, "layer"_a, "gen"_a = 0);
   m.def("sideregion_kv", &sideregion_kv, "layer"_a, "gen"_a = 0);
   m.def("sideregion_reset", &sideregion_reset);
   m.def("sideregion_prefetch_stats", &sideregion_prefetch_stats);
+  m.def("sideregion_prefetch_reads_by_layer", &sideregion_prefetch_reads_by_layer);
   m.def("sideregion_prefetch_stats_reset", &sideregion_prefetch_stats_reset);
   m.def("prefetch_audit_stats", &prefetch_audit_stats);
   m.def("prefetch_audit_stats_reset", &prefetch_audit_stats_reset);
@@ -162,6 +217,16 @@ NB_MODULE(native_moe_ext, m) {
         "wait_for_refinement"_a = false,
         "evaluator_submit"_a = false,
         nb::kw_only(), "stream"_a = nb::none());
+  m.def("demand_dual_async_prefetch", &demand_dual_async_prefetch,
+        "inds"_a, "pool_list"_a, "seg_nbytes"_a, "layer"_a,
+        "side_gen"_a, "path"_a, "stride"_a, "cap"_a, "lfu"_a,
+        "decay_interval"_a, "forward_id"_a, "sequence_length"_a,
+        "use_side"_a, "wait_for_pending"_a, "wait_for_refinement"_a,
+        "evaluator_submit"_a, "prefetch_ids"_a,
+        "prefetch_pool_list"_a, "prefetch_seg_nbytes"_a,
+        "prefetch_layer"_a, "prefetch_path"_a, "prefetch_stride"_a,
+        "prefetch_cap"_a, "prefetch_spec_limit"_a,
+        "prefetch_resident"_a, nb::kw_only(), "stream"_a = nb::none());
   m.def("demand_gpu_remap_only", &demand_gpu_remap_only,
         "inds"_a, "layer"_a, "side_gen"_a, "cap"_a,
         "use_side"_a = true, nb::kw_only(), "stream"_a = nb::none());
@@ -174,7 +239,29 @@ NB_MODULE(native_moe_ext, m) {
         "wait_for_refinement"_a = false,
         "evaluator_submit"_a = false,
         nb::kw_only(), "stream"_a = nb::none());
+  m.def("demand_staged_split_async", &demand_staged_split_async,
+        "inds"_a, "pool_list"_a, "seg_nbytes"_a, "layer"_a,
+        "path"_a, "stride"_a, "cap"_a, "lfu"_a,
+        "decay_interval"_a, "forward_id"_a,
+        "sequence_length"_a, "evaluator_submit"_a, "spec_limit"_a,
+        "staging_buffers"_a, "staging_generations"_a,
+        nb::kw_only(), "stream"_a = nb::none());
+  m.def("demand_dual_projection_split_async",
+        &demand_dual_projection_split_async,
+        "inds"_a, "pool_list"_a, "seg_nbytes"_a, "layer"_a,
+        "side_gen"_a, "path"_a, "stride"_a, "cap"_a, "lfu"_a,
+        "decay_interval"_a, "forward_id"_a = -1,
+        "sequence_length"_a = -1, "use_side"_a = false,
+        "wait_for_pending"_a = false,
+        "wait_for_refinement"_a = false,
+        "evaluator_submit"_a = false,
+        nb::kw_only(), "stream"_a = nb::none());
   m.def("demand_async_stats", &demand_async_stats);
+  m.def("demand_async_layer_stats", &demand_async_layer_stats);
+  m.def("unified_prefetch_reads_by_layer", &unified_prefetch_reads_by_layer);
+  m.def("demand_async_miss_histogram", &demand_async_miss_histogram);
+  m.def("demand_async_seq_miss_histogram",
+        &demand_async_seq_miss_histogram);
   m.def("demand_async_stats_reset", &demand_async_stats_reset);
   m.def("demand_async_check", &demand_async_check);
   m.def("demand_last_stats", &demand_last_stats);

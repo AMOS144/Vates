@@ -8,6 +8,8 @@
 #include "../io/bg_reader.h"
 
 #include <chrono>
+#include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +38,25 @@ struct SideLayer {
 static std::mutex g_side_mutex;
 static std::map<std::pair<int, int>, SideLayer> g_side;   // 键 (layer, gen)：双缓冲两代独立
 static std::map<std::pair<int, int>, uint32_t> g_side_row_leases;
+static std::array<std::atomic<int64_t>, 64> g_target_consumed_forward{};
+
+void sideregion_mark_target_consumed(int64_t forward_id, int layer) {
+  if (forward_id < 0 || layer < 0 || layer >= 64) return;
+  auto& value = g_target_consumed_forward[static_cast<size_t>(layer)];
+  const int64_t encoded = forward_id + 1;
+  int64_t observed = value.load(std::memory_order_relaxed);
+  while (observed < encoded && !value.compare_exchange_weak(
+      observed, encoded, std::memory_order_release,
+      std::memory_order_relaxed)) {}
+}
+
+static bool target_already_consumed(int64_t forward_id, int layer) {
+  const char* enabled = std::getenv("PREFETCH_CANCEL_STALE_QUEUED");
+  return enabled && enabled[0] == '1' &&
+      forward_id >= 0 && layer >= 0 && layer < 64 &&
+      g_target_consumed_forward[static_cast<size_t>(layer)].load(
+          std::memory_order_acquire) >= forward_id + 1;
+}
 
 static bool side_row_leased_locked(int layer, int row) {
   auto found = g_side_row_leases.find({layer, row});
@@ -111,7 +132,26 @@ static void side_table_set_locked(SideLayer& side, int expert, int row) {
   ensure_side_table_locked(side);
   if (expert >= 0 && expert < 512)
     __atomic_store_n(
-        side.slot_table->data<int32_t>() + expert, row, __ATOMIC_RELEASE);
+      side.slot_table->data<int32_t>() + expert, row, __ATOMIC_RELEASE);
+}
+
+// Atomically close the GPU-remap/victim-selection race.  Merely checking the
+// lease before clearing expert->row has a TOCTOU window: a remap can read the
+// old row just after the check, acquire its lease, and then consume bytes that
+// prefetch is already overwriting.  Invalidate first, then recheck.  A remap
+// that observed the old value either publishes its lease before this check or
+// fails its own table revalidation; in the former case restore ownership and
+// leave the row untouched.  A transient GPU miss is safe (normal demand falls
+// back), while a stale-row hit is a numerical correctness violation.
+static bool side_try_unmap_unleased_locked(
+    SideLayer& side, int layer, int expert, int row) {
+  if (side_row_leased_locked(layer, row)) return false;
+  side_table_set_locked(side, expert, -1);
+  if (side_row_leased_locked(layer, row)) {
+    side_table_set_locked(side, expert, row);
+    return false;
+  }
+  return true;
 }
 // 预取诊断累计值：全部使用原子计数，默认路径只增加极小开销。
 static std::atomic<long> g_stat_input_ids{0};
@@ -122,6 +162,7 @@ static std::atomic<long> g_stat_evictions{0};
 static std::atomic<long> g_stat_pread_ok{0};
 static std::atomic<long> g_stat_pread_fail{0};
 static std::atomic<bool> g_stats_enabled{false};
+static std::atomic<long> g_stat_layer_reads[64]{};
 static std::mutex g_stat_unique_mutex;
 static std::unordered_set<uint64_t> g_stat_unique_reads;
 static inline void side_stat_add(std::atomic<long>& counter, long value) {
@@ -131,6 +172,9 @@ static inline void side_stat_add(std::atomic<long>& counter, long value) {
 static inline void side_stat_note_reads(
     int layer, const std::vector<std::pair<int, int>>& reads) {
   if (!g_stats_enabled.load(std::memory_order_relaxed) || reads.empty()) return;
+  if (layer >= 0 && layer < 64)
+    g_stat_layer_reads[layer].fetch_add(
+        static_cast<long>(reads.size()), std::memory_order_relaxed);
   std::lock_guard<std::mutex> lk(g_stat_unique_mutex);
   for (const auto& item : reads)
     g_stat_unique_reads.insert(
@@ -466,6 +510,11 @@ static void side_wait_pending_empty(int layer, int gen) {
   });
 }
 
+static bool refinement_wait_all_enabled() {
+  const char* value = std::getenv("PREFETCH_REFINEMENT_WAIT_ALL");
+  return value && value[0] == '1';
+}
+
 class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
  public:
   PrefetchPoolSideRegionPrimitive(mx::Stream s, std::vector<int> seg_nbytes, int layer, int gen,
@@ -533,18 +582,28 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
           // 阶段1（回调线程、持锁极短）：读惰性 id（此刻已算完）、预留侧区行。
           // 必须在回调里——id 只有 command buffer 完成后才有效。
           prefetch_audit_note_callback(forward_id, layer, idp, n, resident);
-          // An exact adjacent route (priority 2) must own every required row
-          // before its ready event is signaled. Early broad reads may have all
-          // 32 rows reserved but not yet publishable/evictable; let them finish
-          // first, then reserve the <=30 exact K3 union against stable rows.
-          if (priority >= 2) {
+          // Progressive refinement resubmits the complete legal union, which
+          // contains the immutable early core.  With core<=15 and final
+          // width<=26/32, early+tail jointly fit the admission share, so
+          // waiting for *all* early reads only serializes route-critical I/O
+          // behind false positives and destroys the T-1 window.  Reservation
+          // is concurrency-safe: an already-pending expert is deduplicated and
+          // each new tail expert receives a distinct row. Keep the old full
+          // drain only as a diagnostic compatibility switch.
+          if (priority >= 2 && refinement_wait_all_enabled()) {
             if (unified) real_prefetch_wait_all(layer);
             else side_wait_pending_empty(layer, gen);
           }
           auto to_read = unified
               ? real_prefetch_reserve(
-                    idp, n, layer, real_cap, spec, resident)
-              : reserve(idp, n, layer, gen, resident, spec, base);
+                    idp, n, layer, real_cap, spec, resident, priority)
+              : reserve(
+                    idp, n, layer, gen, resident, spec, base, priority);
+          // Unified direct-slot prefetch bypasses reserve(), where the legacy
+          // side-cache counters are normally updated. Count its actual SSD
+          // reservations here so per-layer profiling reflects the production
+          // path instead of reporting an empty map beside nonzero pool loads.
+          if (unified) side_stat_note_reads(layer, to_read);
           if (priority > 0) side_refinement_ready(forward_id, layer);
           if (to_read.empty()) {
             prefetch_audit_note_pread(forward_id, layer, 0);
@@ -565,6 +624,79 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
                 priority > 0, unified, real_cap);
             side_inflight_done(forward_id, layer);
             side_ready_signal(ready_state);
+            return;
+          }
+          static const bool kFirstRowHighPriority = []() {
+            const char* value = std::getenv(
+                "PREFETCH_FIRST_ROW_HIGH_PRIORITY");
+            return value && value[0] == '1';
+          }();
+          if (priority == 0 && kFirstRowHighPriority && !to_read.empty()) {
+            // The first physical row has much higher precision than the tail
+            // (about 87% on held-out Qwen traces).  Give only that row demand-
+            // class queueing latency while preserving early/F_NOCACHE I/O
+            // semantics; the lower-confidence tail remains low priority.
+            const size_t task_count = to_read.size() > 1 ? 2 : 1;
+            auto remaining = std::make_shared<std::atomic<size_t>>(task_count);
+            auto finish = [forward_id, layer, ready_state, remaining]() {
+              if (remaining->fetch_sub(1) == 1) {
+                side_inflight_done(forward_id, layer);
+                side_ready_signal(ready_state);
+              }
+            };
+            const auto first = to_read.front();
+            bg_submit_task(
+                [in, ptrs, seg, first, path, stride, layer, gen,
+                 forward_id, ready_state, unified, real_cap, finish]() {
+                  read_publish(
+                      ptrs, seg, {first}, path, stride, layer, gen,
+                      forward_id, /*cached=*/false, unified, real_cap);
+                  finish();
+                },
+                /*priority=*/1);
+            if (to_read.size() > 1) {
+              std::vector<std::pair<int, int>> tail(
+                  to_read.begin() + 1, to_read.end());
+              bg_submit_task(
+                  [in, ptrs, seg, tail, path, stride, layer, gen,
+                   forward_id, ready_state, unified, real_cap, finish]() {
+                    read_publish(
+                        ptrs, seg, tail, path, stride, layer, gen,
+                        forward_id, /*cached=*/false, unified, real_cap);
+                    finish();
+                  },
+                  /*priority=*/0);
+            }
+            return;
+          }
+          static const bool kSplitEarlyExperts = []() {
+            const char* value = std::getenv("PREFETCH_SPLIT_EARLY_EXPERTS");
+            return value && value[0] == '1';
+          }();
+          if ((priority >= 2 || kSplitEarlyExperts) && to_read.size() > 1) {
+            // Route-critical exact tail: one batch task would serialize up to
+            // ~18 random expert records on a single worker. Split by expert so
+            // the reserved high-priority workers can issue independent preadv
+            // calls and publish each completed row immediately. The logical
+            // submission remains one inflight item/event and is released only
+            // after the final expert finishes.
+            auto remaining = std::make_shared<std::atomic<size_t>>(
+                to_read.size());
+            for (auto placement : to_read) {
+              bg_submit_task(
+                  [in, ptrs, seg, placement, path, stride, layer, gen,
+                   forward_id, priority, ready_state, unified, real_cap,
+                   remaining]() {
+                    read_publish(
+                        ptrs, seg, {placement}, path, stride, layer, gen,
+                        forward_id, priority > 0, unified, real_cap);
+                    if (remaining->fetch_sub(1) == 1) {
+                      side_inflight_done(forward_id, layer);
+                      side_ready_signal(ready_state);
+                    }
+                  },
+                  priority);
+            }
             return;
           }
           // 阶段2+3 派给自由后台线程：pread + 逐行发布脱离 Metal 回调线程，
@@ -621,15 +753,17 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
         forward_id_, layer_, ids.data<uint32_t>(), ids.size(), resident_);
     const bool unified = base_ < 0;
     const int real_cap = unified ? -base_ : 0;
-    if (priority_ >= 2) {
+    if (priority_ >= 2 && refinement_wait_all_enabled()) {
       if (unified) real_prefetch_wait_all(layer_);
       else side_wait_pending_empty(layer_, gen_);
     }
     auto to_read = unified
         ? real_prefetch_reserve(
-              ids.data<uint32_t>(), ids.size(), layer_, real_cap, spec_, resident_)
+              ids.data<uint32_t>(), ids.size(), layer_, real_cap, spec_, resident_,
+              priority_)
         : reserve(
-              ids.data<uint32_t>(), ids.size(), layer_, gen_, resident_, spec_, base_);
+              ids.data<uint32_t>(), ids.size(), layer_, gen_, resident_, spec_,
+              base_, priority_);
     read_publish(
         ptrs, seg_, to_read, path_, stride_, layer_, gen_, forward_id_,
         priority_ > 0, unified, real_cap);
@@ -639,7 +773,7 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
   // 避免消费者在字节写好前看到 e2r 命中而 gather 到脏字节）。返回 (expert, 预留行)。
   static std::vector<std::pair<int, int>> reserve(
       const uint32_t* idp, size_t n, int layer, int gen, const std::vector<int>& resident,
-      int spec, int base) {
+      int spec, int base, int priority) {
     side_stat_add(g_stat_input_ids, static_cast<long>(n));
     const char* lfu_env = std::getenv("SIDEREGION_LFU");   // 每次读,便于测试切换
     // 默认开:持久 LFU 单缓冲=生产路径(cli 默认)。仅显式 SIDEREGION_LFU=0 回退旧 legacy 双缓冲。
@@ -655,6 +789,17 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
     }
     side_stat_add(g_stat_candidates, static_cast<long>(P.size()));
     std::vector<std::pair<int, int>> to_read;
+    // Early rerank and exact T-1 refinement have different precision.  Keep
+    // speculative early I/O narrow, but let a route-critical refinement fill
+    // every still-missing real route in one callback.  A non-positive
+    // refinement budget means unlimited, matching the historical convention.
+    const char* read_budget_env = std::getenv(
+        priority >= 2
+            ? "PREFETCH_REFINEMENT_READ_BUDGET"
+            : "PREFETCH_PHYSICAL_READ_BUDGET");
+    const int read_budget = (
+        read_budget_env && read_budget_env[0]
+        ? std::max(0, std::atoi(read_budget_env)) : 0);
     std::lock_guard<std::mutex> lk(g_side_mutex);
     SideLayer& c = g_side[{layer, gen}];
     ensure_side_table_locked(c);
@@ -679,9 +824,9 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
       for (int expert : res) {
         auto duplicate = c.e2r.find(expert);
         if (duplicate == c.e2r.end()) continue;
-        if (side_row_leased_locked(layer, duplicate->second)) continue;
+        if (!side_try_unmap_unleased_locked(
+                c, layer, expert, duplicate->second)) continue;
         c.free_rows.push_back(duplicate->second);
-        side_table_set_locked(c, expert, -1);
         c.e2r.erase(duplicate);
         c.freq.erase(expert);
       }
@@ -690,15 +835,17 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
       // 旧行为:∉P 全弃(一次性预取批)。
       for (auto it = c.e2r.begin(); it != c.e2r.end();) {
         if (!Pset.count(it->first)
-            && !side_row_leased_locked(layer, it->second)) {
+            && side_try_unmap_unleased_locked(
+                c, layer, it->first, it->second)) {
           c.free_rows.push_back(it->second);
-          side_table_set_locked(c, it->first, -1);
           it = c.e2r.erase(it);
         } else {
           ++it;
         }
       }
       for (int e : P) {
+        if (read_budget > 0 &&
+            static_cast<int>(to_read.size()) >= read_budget) break;
         if (c.e2r.count(e)) {
           side_stat_add(g_stat_side_hits, 1);
           continue;
@@ -726,6 +873,8 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
       }
     }
     for (int e : P) {
+      if (read_budget > 0 &&
+          static_cast<int>(to_read.size()) >= read_budget) break;
       if (c.e2r.count(e) || c.pending_e2r.count(e))
         continue;                                 // 已驻或在途,跳过(不重读)
       int row;
@@ -750,7 +899,8 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
         }
         if (victim < 0) continue;                 // 全是 P 热,无可淘 → 本步不读
         row = c.e2r[victim];
-        side_table_set_locked(c, victim, -1);
+        if (!side_try_unmap_unleased_locked(
+                c, layer, victim, row)) continue;
         c.e2r.erase(victim);
         c.freq.erase(victim);
         side_stat_add(g_stat_evictions, 1);
@@ -818,7 +968,48 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
                            const std::string& path, size_t stride, int layer, int gen,
                            int64_t forward_id, bool cached, bool unified,
                            int real_cap) {
+    // Reservation happens in the Metal completion callback, before this low
+    // priority task enters its worker queue. If target demand has arrived in
+    // the meantime, release the untouched rows so demand can issue the same
+    // experts immediately on its high-priority reader pool.
+    if (target_already_consumed(forward_id, layer)) {
+      if (unified) {
+        for (const auto& item : to_read)
+          real_prefetch_abort(layer, item.first, item.second, real_cap);
+      } else {
+        std::lock_guard<std::mutex> lock(g_side_mutex);
+        SideLayer& side = g_side[{layer, gen}];
+        for (const auto& item : to_read) {
+          auto pending = side.pending_e2r.find(item.first);
+          if (pending == side.pending_e2r.end() ||
+              pending->second != item.second) continue;
+          side.pending_e2r.erase(pending);
+          side.free_rows.push_back(item.second);
+        }
+      }
+      side_progress_notify();
+      prefetch_audit_note_pread(forward_id, layer, 0);
+      prefetch_audit_note_publish(forward_id, layer, 0);
+      return;
+    }
     prefetch_audit_note_pread(forward_id, layer, to_read.size());
+    const bool partial_projection = unified && !cached && seg.size() == 9 && [] {
+      const char* value = std::getenv("PREFETCH_PARTIAL_PROJECTIONS");
+      const char* demand_async = std::getenv("DEMAND_ASYNC");
+      // run_mtp_spec deliberately switches async demand off during prompt
+      // ingestion. Keep full-row publication there; synchronous demand has no
+      // two-stage consumer and must never wait on a prefix-only reservation.
+      return value && value[0] == '1' &&
+          demand_async && demand_async[0] == '1';
+    }();
+    const bool partial_down_first = partial_projection && [] {
+      const char* value = std::getenv("PREFETCH_PARTIAL_ORDER");
+      return value && std::strcmp(value, "down_first") == 0;
+    }();
+    const int partial_full_rows = partial_projection ? [] {
+      const char* value = std::getenv("PREFETCH_PARTIAL_FULL_ROWS");
+      return value && value[0] ? std::max(0, std::atoi(value)) : 0;
+    }() : 0;
     // 段在 blob 记录内的偏移（段顺序 = seg 顺序 = ptrs/池 key 顺序）。
     std::vector<size_t> seg_off(seg.size(), 0);
     size_t acc = 0;
@@ -826,9 +1017,25 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
     // Late route-critical rows are small (~1.7 MiB each) and may be demanded
     // immediately. Normal cached pread avoids the large non-cached random-I/O
     // latency and lets a subsequent exact fallback reuse the page. Early
-    // broad speculation stays F_NOCACHE so it cannot inflate long-lived RSS.
-    int fd = cached ? ::open(path.c_str(), O_RDONLY) : open_blob_nocache(path.c_str());
-    if (fd < 0) {                                             // 失败则把预留行还回 free
+    // broad speculation stays F_NOCACHE by default.  On machines with enough
+    // spare unified memory an opt-in page-cache experiment can retain the
+    // repeatedly-read hot expert records without enlarging the MLX pool.
+    static const int kEarlyPageCacheRows = []() {
+      const char* rows = std::getenv("PREFETCH_EARLY_PAGE_CACHE_ROWS");
+      if (rows && rows[0]) return std::max(0, std::atoi(rows));
+      const char* value = std::getenv("PREFETCH_EARLY_PAGE_CACHE");
+      return value && value[0] == '1' ? INT_MAX : 0;
+    }();
+    const int cached_rows = cached
+        ? static_cast<int>(to_read.size())
+        : std::min(kEarlyPageCacheRows, static_cast<int>(to_read.size()));
+    int cached_fd = cached_rows > 0 ? ::open(path.c_str(), O_RDONLY) : -1;
+    int nocache_fd = cached_rows < static_cast<int>(to_read.size())
+        ? open_blob_nocache(path.c_str()) : -1;
+    if ((cached_rows > 0 && cached_fd < 0) ||
+        (cached_rows < static_cast<int>(to_read.size()) && nocache_fd < 0)) {
+      if (cached_fd >= 0) ::close(cached_fd);
+      if (nocache_fd >= 0) ::close(nocache_fd);
       side_stat_add(g_stat_pread_fail, static_cast<long>(to_read.size()));
       if (unified) {
         for (auto& pr : to_read)
@@ -857,25 +1064,71 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
     static thread_local std::vector<uint8_t> rec;
     if (!kPreadv && rec.size() < stride) rec.resize(stride);
     size_t completed = 0;
-    for (auto& pr : to_read) {
+    for (size_t read_index = 0; read_index < to_read.size(); ++read_index) {
+      // A low-priority batch is score ordered, but one worker processes its
+      // rows serially.  Once target demand has entered, continuing through the
+      // low-ranked tail only delays the high-priority exact reads.  Release
+      // untouched reservations so the demand waiter can immediately allocate
+      // and fetch the true route itself.  The existing stale-cancel switch
+      // gates this behavior and remains off by default.
+      if (read_index > 0 && target_already_consumed(forward_id, layer)) {
+        if (unified) {
+          for (size_t pending = read_index; pending < to_read.size(); ++pending)
+            real_prefetch_abort(
+                layer, to_read[pending].first, to_read[pending].second,
+                real_cap);
+        } else {
+          std::lock_guard<std::mutex> lock(g_side_mutex);
+          SideLayer& side = g_side[{layer, gen}];
+          for (size_t pending_index = read_index;
+               pending_index < to_read.size(); ++pending_index) {
+            const auto& item = to_read[pending_index];
+            auto pending = side.pending_e2r.find(item.first);
+            if (pending == side.pending_e2r.end() ||
+                pending->second != item.second) continue;
+            side.pending_e2r.erase(pending);
+            side.free_rows.push_back(item.second);
+          }
+          side_progress_notify();
+        }
+        break;
+      }
+      auto& pr = to_read[read_index];
+      const bool row_partial = partial_projection &&
+          static_cast<int>(read_index) >= partial_full_rows;
+      const size_t first_segment = row_partial && partial_down_first ? 6 : 0;
+      const size_t io_segments = row_partial
+          ? (partial_down_first ? seg.size() - first_segment : 6)
+          : seg.size();
+      int fd = static_cast<int>(read_index) < cached_rows
+          ? cached_fd : nocache_fd;
       int e = pr.first, row = pr.second;
       ssize_t bytes_read = -1;
       if (kPreadv) {
-        std::vector<iovec> vectors(seg.size());
-        for (size_t i = 0; i < seg.size(); ++i) {
-          vectors[i].iov_base = ptrs[i] + static_cast<size_t>(row) *
+        std::vector<iovec> vectors(io_segments);
+        size_t expected = 0;
+        for (size_t local = 0; local < io_segments; ++local) {
+          const size_t i = first_segment + local;
+          vectors[local].iov_base = ptrs[i] + static_cast<size_t>(row) *
               static_cast<size_t>(seg[i]);
-          vectors[i].iov_len = static_cast<size_t>(seg[i]);
+          vectors[local].iov_len = static_cast<size_t>(seg[i]);
+          expected += static_cast<size_t>(seg[i]);
         }
         bytes_read = ::preadv(
             fd, vectors.data(), static_cast<int>(vectors.size()),
-            static_cast<off_t>(static_cast<size_t>(e) * stride));
+            static_cast<off_t>(
+                static_cast<size_t>(e) * stride + seg_off[first_segment]));
       } else {
         bytes_read = ::pread(
             fd, rec.data(), stride,
             static_cast<off_t>(static_cast<size_t>(e) * stride));
       }
-      if (bytes_read != static_cast<ssize_t>(stride)) {
+      const size_t expected_bytes = (kPreadv && row_partial)
+          ? std::accumulate(
+                seg.begin() + first_segment,
+                seg.begin() + first_segment + io_segments, size_t{0})
+          : stride;
+      if (bytes_read != static_cast<ssize_t>(expected_bytes)) {
         side_stat_add(g_stat_pread_fail, 1);
         if (unified) {
           real_prefetch_abort(layer, e, row, real_cap);
@@ -905,7 +1158,10 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
       // deadline 不可见。逐专家发布保留相同的“半写行永不暴露”不变量，同时
       // 让 rerank 顺序真正成为 SSD deadline 的优先级顺序。
       if (unified) {
-        real_prefetch_publish(layer, e, row, real_cap);
+        if (row_partial)
+          real_prefetch_publish_partial(layer, e, row, real_cap);
+        else
+          real_prefetch_publish(layer, e, row, real_cap);
       } else {
         std::lock_guard<std::mutex> lk(g_side_mutex);
         SideLayer& c = g_side[{layer, gen}];
@@ -926,8 +1182,15 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
       }
       side_progress_notify();
       ++completed;
+      static const bool kPreemptForDemand = []() {
+        const char* value = std::getenv("PREFETCH_PREEMPT_FOR_DEMAND");
+        return value && value[0] == '1';
+      }();
+      if (!cached && kPreemptForDemand)
+        bg_reader_wait_high_idle();
     }
-    ::close(fd);
+    if (cached_fd >= 0) ::close(cached_fd);
+    if (nocache_fd >= 0) ::close(nocache_fd);
     if (!unified && std::getenv("SIDE_AUDIT")) {
       std::lock_guard<std::mutex> lk(g_side_mutex);
       SideLayer& c = g_side[{layer, gen}];
@@ -935,6 +1198,7 @@ class PrefetchPoolSideRegionPrimitive : public mx::Primitive {
     }
     prefetch_audit_note_publish(forward_id, layer, completed);
   }
+
   std::vector<int> seg_;
   int layer_;
   int gen_;
@@ -963,7 +1227,8 @@ void prefetch_unified_ready(
   side_inflight_start(forward_id, target_layer);
   auto reads = real_prefetch_reserve(
       expert_ids, count, target_layer, real_cap,
-      speculative_limit, resident);
+      speculative_limit, resident, /*priority=*/0);
+  side_stat_note_reads(target_layer, reads);
   if (reads.empty()) {
     prefetch_audit_note_pread(forward_id, target_layer, 0);
     prefetch_audit_note_publish(forward_id, target_layer, 0);
@@ -973,6 +1238,31 @@ void prefetch_unified_ready(
   std::vector<uint8_t*> pointers;
   pointers.reserve(pool_list.size());
   for (auto pool : pool_list) pointers.push_back(pool.data<uint8_t>());
+  const char* parallel_rows_env = std::getenv("PREFETCH_PARALLEL_ROWS");
+  const bool parallel_rows = parallel_rows_env && parallel_rows_env[0] == '1';
+  if (parallel_rows && reads.size() > 1) {
+    // A batch is otherwise one low-priority job, so one worker reads all
+    // predicted experts serially even when PREFETCH_LOW_WORKERS=2.  Split the
+    // tiny physical prefix into independent jobs: the reader's low-priority
+    // concurrency cap still protects high-priority demand I/O, while the
+    // first two ranked experts can reach the deadline in parallel.
+    auto remaining = std::make_shared<std::atomic<size_t>>(reads.size());
+    for (const auto& read : reads) {
+      std::vector<std::pair<int, int>> one{read};
+      bg_submit_task(
+          [pool_list, pointers, seg_nbytes, one, path, stride, target_layer,
+           forward_id, real_cap, remaining]() {
+            PrefetchPoolSideRegionPrimitive::read_publish(
+                pointers, seg_nbytes, one, path,
+                static_cast<size_t>(stride), target_layer, /*gen=*/0,
+                forward_id, /*cached=*/false, /*unified=*/true, real_cap);
+            if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1)
+              side_inflight_done(forward_id, target_layer);
+          },
+          /*priority=*/0);
+    }
+    return;
+  }
   // Keep every C++-owned MLX buffer alive until the background worker has
   // finished writing and publishing all reserved rows.
   bg_submit_task(
@@ -1146,6 +1436,13 @@ std::vector<long> sideregion_prefetch_stats() {
   };
 }
 
+std::vector<long> sideregion_prefetch_reads_by_layer() {
+  std::vector<long> out(64, 0);
+  for (int layer = 0; layer < 64; ++layer)
+    out[layer] = g_stat_layer_reads[layer].load(std::memory_order_relaxed);
+  return out;
+}
+
 void sideregion_prefetch_stats_reset() {
   g_stat_input_ids.store(0, std::memory_order_relaxed);
   g_stat_candidates.store(0, std::memory_order_relaxed);
@@ -1154,6 +1451,8 @@ void sideregion_prefetch_stats_reset() {
   g_stat_evictions.store(0, std::memory_order_relaxed);
   g_stat_pread_ok.store(0, std::memory_order_relaxed);
   g_stat_pread_fail.store(0, std::memory_order_relaxed);
+  for (auto& value : g_stat_layer_reads)
+    value.store(0, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lk(g_stat_unique_mutex);
     g_stat_unique_reads.clear();
@@ -1176,9 +1475,15 @@ std::vector<int32_t> sideregion_lookup_values(
   auto found = g_side.find({layer, gen});
   if (found == g_side.end()) return rows;
   const auto& e2r = found->second.e2r;
+  const char* lease_env = std::getenv("SIDEREGION_ROW_LEASES");
+  const bool acquire_leases = lease_env && lease_env[0] == '1';
   for (size_t index = 0; index < count; ++index) {
     auto row = e2r.find(static_cast<int>(expert_ids[index]));
-    if (row != e2r.end()) rows[index] = row->second;
+    if (row != e2r.end()) {
+      rows[index] = row->second;
+      if (acquire_leases)
+        g_side_row_leases[{layer, row->second}] += 1;
+    }
   }
   return rows;
 }

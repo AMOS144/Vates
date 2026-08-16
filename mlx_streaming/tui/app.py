@@ -42,6 +42,11 @@ def _mem_suffix(peak: bool = False) -> str:
 
 # 生成中状态栏用滑动窗口算「瞬时」tok/s 的时间窗(秒);越小越灵敏、越大越平滑。
 _TPS_WINDOW = 1.0
+# Textual's call_from_thread is synchronous. Rebuilding and laying out the
+# growing message on every speculative step puts UI work directly on the
+# decode critical path. Five visual updates per second remain fluid while
+# keeping rendering out of the model throughput measurement.
+_STREAM_UPDATE_INTERVAL = 0.2
 
 _HELP = (
     "可用命令:\n"
@@ -236,14 +241,31 @@ class VatesApp(App):
     @work(thread=True, exclusive=True, group="gen")
     def _generate(self, messages: list[dict]) -> None:
         # 生成在 worker 线程运行;on_text 返回 self._stop 让后端可提前中断
+        last_update = 0.0
+        update_interval = max(
+            0.0,
+            float(os.environ.get(
+                "TUI_STREAM_UPDATE_INTERVAL",
+                str(_STREAM_UPDATE_INTERVAL),
+            )),
+        )
+
         def on_text(full: str, n_tokens: int) -> bool:
+            nonlocal last_update
             # 应用已退出时,call_from_thread 会抛错;此时直接请求停止,避免 worker 线程未捕获异常。
             if not self.is_running:
                 return True
+            # Poll interruption on every model callback, but only cross into
+            # the UI thread at the display cadence. _on_done always publishes
+            # the complete final text, so skipped intermediate frames are safe.
+            now = time.monotonic()
+            if last_update and now - last_update < update_interval:
+                return self._stop
             try:
                 self.call_from_thread(self._on_stream, full, n_tokens)
             except Exception:  # noqa: BLE001
                 return True
+            last_update = time.monotonic()
             return self._stop
 
         try:

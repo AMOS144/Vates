@@ -106,6 +106,7 @@ static std::map<StagingTarget, long> g_stg_target_inflight;
 static std::set<StagingTarget> g_stg_refinement_ready;
 static std::set<StagingTarget> g_stg_demand_finished;
 static std::map<std::pair<int, long>, bool> g_stg_finished;
+static std::set<std::pair<int, long>> g_stg_consumed;
 static std::condition_variable g_stg_progress_cv;
 struct StagingWaitStats {
   long calls = 0;
@@ -322,6 +323,28 @@ class PrefetchStagingPrimitive : public mx::Primitive {
         });
   }
 
+  static void submit_ready(
+      const mx::array& staging, std::vector<uint32_t> ids, int layer,
+      long gen, std::string path, size_t stride, std::vector<int> resident,
+      int cap, bool parallel, int source_layer, int64_t forward_id,
+      int priority) {
+    mx::array stg = mx::contiguous(staging);
+    stg.eval();
+    prefetch_audit_note_submit(forward_id, source_layer, layer, gen);
+    staging_inflight_start(forward_id, layer);
+    auto work = [stg, ids = std::move(ids), layer, gen,
+                 path = std::move(path), stride,
+                 resident = std::move(resident), cap, forward_id,
+                 priority]() mutable {
+      fill(ids.data(), ids.size(), stg.data<uint8_t>(), layer, gen, path,
+           stride, resident, cap, forward_id, priority);
+    };
+    if (parallel)
+      bg_submit_task(std::move(work), priority);
+    else
+      work();
+  }
+
  private:
   static void fill(const uint32_t* idp, size_t n, uint8_t* stg,
                    int layer, long gen, const std::string& path, size_t stride,
@@ -331,6 +354,10 @@ class PrefetchStagingPrimitive : public mx::Primitive {
     prefetch_audit_note_callback(forward_id, layer, idp, n, resident);
     prefetch_audit_note_pread(forward_id, layer, 0);
     std::unordered_set<int> res(resident.begin(), resident.end());
+    // The source-time Python snapshot can be several layers old.  Recheck the
+    // authoritative unified pool at callback time so staging does not reread
+    // experts that demand or another prediction has already made resident.
+    for (int expert : real_present_experts(layer)) res.insert(expert);
     std::unordered_set<int> done;
     std::vector<std::pair<int, int>> reserved;
     reserved.reserve(static_cast<size_t>(cap));
@@ -411,6 +438,18 @@ class PrefetchStagingPrimitive : public mx::Primitive {
   int priority_;
 };
 
+void prefetch_staging_ready(
+    const mx::array& staging, const std::vector<int>& expert_ids, int layer,
+    long gen, const std::string& path, int stride,
+    const std::vector<int>& resident, int cap, bool parallel,
+    int source_layer, int64_t forward_id, int priority) {
+  std::vector<uint32_t> ids(expert_ids.begin(), expert_ids.end());
+  PrefetchStagingPrimitive::submit_ready(
+      staging, std::move(ids), layer, gen, path,
+      static_cast<size_t>(stride), resident, cap, parallel, source_layer,
+      forward_id, priority);
+}
+
 mx::array prefetch_into_staging(
     const mx::array& staging, const mx::array& expert_ids, int layer, long gen,
     const std::string& path, int stride, const std::vector<int>& resident, int cap,
@@ -434,6 +473,7 @@ void prefetch_staging_forget(int layer, long generation) {
   std::lock_guard<std::mutex> lk(g_stg_mutex);
   g_stg_ready.erase({layer, generation});
   g_stg_finished.erase({layer, generation});
+  g_stg_consumed.erase({layer, generation});
 }
 
 // 取走某层就绪记录：[gen, e0,r0,e1,r1,...]（首元素是 generation）；空表示无就绪。
@@ -451,6 +491,33 @@ std::vector<long> prefetch_staging_take(int layer, long generation) {
     g_stg_ready.erase(it);
   }
   return out;
+}
+
+std::vector<long> prefetch_staging_take_for_demand(
+    int layer, long generation) {
+  std::lock_guard<std::mutex> lk(g_stg_mutex);
+  const auto key = std::make_pair(layer, generation);
+  std::vector<long> out;
+  auto it = g_stg_ready.find(key);
+  if (it != g_stg_ready.end()) {
+    out.push_back(generation);
+    for (const auto& row : it->second) {
+      out.push_back(row.first);
+      out.push_back(row.second);
+    }
+    g_stg_ready.erase(it);
+  }
+  return out;
+}
+
+void prefetch_staging_mark_consumed(int layer, long generation) {
+  std::lock_guard<std::mutex> lk(g_stg_mutex);
+  g_stg_consumed.insert({layer, generation});
+}
+
+bool prefetch_staging_consumed(int layer, long generation) {
+  std::lock_guard<std::mutex> lk(g_stg_mutex);
+  return g_stg_consumed.count({layer, generation}) != 0;
 }
 
 // ---- handler 触发时刻探针接口 ----

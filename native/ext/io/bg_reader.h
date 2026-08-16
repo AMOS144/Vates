@@ -10,6 +10,8 @@ long bg_reader_submit(const mx::array& dst, const std::vector<int>& experts,
                       int stride, long ticket, int prio = 0);
 bool bg_reader_ready(long ticket);
 void bg_reader_wait(long ticket);
+void bg_reader_wait_all(const std::vector<long>& tickets);
+void bg_reader_wait_high_idle();
 void bg_reader_stop();
 long bg_pread_into_pool(
     const std::vector<mx::array>& dst,
@@ -17,6 +19,13 @@ long bg_pread_into_pool(
     const std::vector<long>& seg_nb,
     long slot, long expert,
     const std::string& path, long stride, long ticket, int prio = 0, bool nocache = true);
+long bg_preadv_into_pool(
+    const std::vector<mx::array>& dst,
+    const std::vector<long>& seg_off,
+    const std::vector<long>& seg_nb,
+    long slot, long expert,
+    const std::string& path, long stride, long ticket, int prio = 0,
+    bool nocache = true);
 
 // 通用后台任务入口。普通 early 预取进低优队列；progressive T-1 最终补位可用
 // prio>0 进入高优队列，避免已经失去大部分计算窗口的少量关键字节排在后续层 early

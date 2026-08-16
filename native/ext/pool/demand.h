@@ -8,6 +8,7 @@ void real_note_predictions(int layer, const uint32_t* expert_ids, size_t n);
 std::vector<int> real_pin(int layer, const std::vector<int>& experts, int cap);
 std::vector<int> real_pinned_contents(int layer);
 std::vector<int> real_region_contents(int layer);         // [expert, slot, ...]
+std::vector<int> real_present_experts(int layer);          // resident + in-flight
 std::vector<int> real_verified_contents(int layer);       // excludes prediction-share rows
 int real_region_count(int layer);
 bool real_should_predict(int layer, int min_resident, int cooldown);
@@ -15,12 +16,16 @@ mx::array real_slot_table(int layer, int cap);
 mx::array real_lease_table(int layer, int cap);
 std::vector<std::pair<int, int>> real_prefetch_reserve(
     const uint32_t* expert_ids, size_t count, int layer, int cap,
-    int speculative_limit, const std::vector<int>& resident);
+    int speculative_limit, const std::vector<int>& resident, int priority);
 void real_prefetch_publish(int layer, int expert, int row, int cap);
+void real_prefetch_publish_partial(int layer, int expert, int row, int cap);
 void real_prefetch_abort(int layer, int expert, int row, int cap);
 void real_prefetch_wait_pending(
     int layer, const uint32_t* expert_ids, size_t count);
 void real_prefetch_wait_all(int layer);
+std::unordered_map<int, int> real_prefetch_take_partial_route(
+    int layer, const uint32_t* expert_ids, size_t count,
+    std::vector<std::pair<int, int>>* all_partial);
 std::vector<int32_t> real_lookup_values(
     int layer, const uint32_t* expert_ids, size_t count);
 void real_release_before_layer(int layer);
@@ -42,6 +47,28 @@ mx::array demand_dual_async(
     bool use_side, bool wait_for_pending, bool wait_for_refinement,
     bool evaluator_submit,
     mx::StreamOrDevice s);
+std::pair<mx::array, mx::array> demand_staged_split_async(
+    const mx::array& inds, const std::vector<mx::array>& pool_list,
+    const std::vector<int>& seg_nbytes, int layer, const std::string& path,
+    int stride, int cap, bool lfu, int decay_interval, int64_t forward_id,
+    int sequence_length, bool evaluator_submit, int spec_limit,
+    const std::vector<mx::array>& staging_buffers,
+    const std::vector<long>& staging_generations,
+    mx::StreamOrDevice s);
+mx::array demand_dual_async_prefetch(
+    const mx::array& inds, const std::vector<mx::array>& pool_list,
+    const std::vector<int>& seg_nbytes, int layer, int side_gen,
+    const std::string& path, int stride, int cap, bool lfu,
+    int decay_interval, int64_t forward_id, int sequence_length,
+    bool use_side, bool wait_for_pending, bool wait_for_refinement,
+    bool evaluator_submit,
+    const mx::array& prefetch_ids,
+    const std::vector<mx::array>& prefetch_pool_list,
+    const std::vector<int>& prefetch_seg_nbytes, int prefetch_layer,
+    const std::string& prefetch_path, int prefetch_stride,
+    int prefetch_cap, int prefetch_spec_limit,
+    const std::vector<int>& prefetch_resident,
+    mx::StreamOrDevice s);
 mx::array demand_gpu_remap_only(
     const mx::array& inds, int layer, int side_gen, int cap,
     bool use_side, mx::StreamOrDevice s);
@@ -53,7 +80,19 @@ std::pair<mx::array, mx::array> demand_dual_split_async(
     bool use_side, bool wait_for_pending, bool wait_for_refinement,
     bool evaluator_submit,
     mx::StreamOrDevice s);
+std::tuple<mx::array, mx::array, mx::array>
+demand_dual_projection_split_async(
+    const mx::array& inds, const std::vector<mx::array>& pool_list,
+    const std::vector<int>& seg_nbytes, int layer, int side_gen,
+    const std::string& path, int stride, int cap, bool lfu,
+    int decay_interval, int64_t forward_id, int sequence_length,
+    bool use_side, bool wait_for_pending, bool wait_for_refinement,
+    bool evaluator_submit, mx::StreamOrDevice s);
 std::vector<long> demand_async_stats();
+std::vector<long> demand_async_layer_stats();
+std::vector<long> unified_prefetch_reads_by_layer();
+std::vector<long> demand_async_miss_histogram();
+std::vector<long> demand_async_seq_miss_histogram();
 void demand_async_stats_reset();
 void demand_async_check();
 mx::array demand_staged_multi(

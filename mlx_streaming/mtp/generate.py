@@ -17,6 +17,7 @@ from mlx_streaming import config
 from mlx_streaming.mtp.kv_cache import (
     enable_qwen3next_speculative_checkpoints, begin_speculative_checkpoints,
     _snapshot, _restore, commit_verified_prefix, commit_verified_snapshot,
+    _shallow_rollback_checkpoint, _restore_shallow_rollback,
     tile_caches, commit_tree_row)
 
 
@@ -62,7 +63,18 @@ def _batch_direct_commit_guaranteed(model) -> bool:
     return True
 
 
-def forward_with_hidden(model, ids, cache, compute_logits: bool = True):
+def _bind_progressive_cache_refs(layers, cache) -> None:
+    """Publish the current invocation's complete layer-cache vector."""
+    if not config.prefetch_progressive():
+        return
+    for layer, layer_cache in zip(layers, cache):
+        object.__setattr__(layer, "_target_cache_ref", layer_cache)
+
+
+def forward_with_hidden(
+    model, ids, cache, compute_logits: bool = True,
+    capture_layer_inputs: bool = False,
+):
     """跑主模型层循环 + 最终 norm,返回 (logits(1,L,V), hidden(1,L,H))。
 
     logits 恒由 final-norm 后的 H 经 lm_head 得到(保证与贪婪一致)。
@@ -76,22 +88,95 @@ def forward_with_hidden(model, ids, cache, compute_logits: bool = True):
     inner = model.model
     h = inner.embed_tokens(ids)
     layers = inner.layers
+    # Progressive T-1 movement needs the *current request's* target cache
+    # before the target decoder itself is reached.  Binding lazily inside each
+    # decoder leaves layer T holding the previous request's cache while source
+    # T-1 is executing, which can make baseline and speculative runs agree
+    # only because both corrupt the same recurrent state.  Publish the complete
+    # cache vector at the forward boundary so every moved target updates the
+    # cache owned by this invocation.
+    _bind_progressive_cache_refs(layers, cache)
     has_full = any(not l.is_linear for l in layers)
     has_linear = any(l.is_linear for l in layers)
     fa_idx = next((i for i, l in enumerate(layers) if not l.is_linear), 0)
     ssm_idx = next((i for i, l in enumerate(layers) if l.is_linear), 0)
     fa_mask = create_attention_mask(h, cache[fa_idx]) if has_full else None
     ssm_mask = create_ssm_mask(h, cache[ssm_idx]) if has_linear else None
+    layer_inputs = [] if capture_layer_inputs else None
     for layer, c in zip(layers, cache):
+        if layer_inputs is not None:
+            layer_inputs.append(h)
         mask = ssm_mask if layer.is_linear else fa_mask
         h = layer(h, mask=mask, cache=c)
     H = inner.norm(h)
     hidden = H if config.mtp_hidden() == "post_norm" else h
     logits = model.lm_head(H) if compute_logits else None
+    if layer_inputs is not None:
+        return logits, hidden, layer_inputs
     return logits, hidden
 
 
+def forward_with_hidden_suffix(model, h, cache, start_layer: int):
+    """Recompute an exact decoder suffix from a captured layer input."""
+    inner = model.model
+    layers = inner.layers
+    start = int(start_layer)
+    _bind_progressive_cache_refs(layers, cache)
+    has_full = any(not layer.is_linear for layer in layers[start:])
+    has_linear = any(layer.is_linear for layer in layers[start:])
+    fa_idx = next(
+        (i for i in range(start, len(layers)) if not layers[i].is_linear),
+        start,
+    )
+    ssm_idx = next(
+        (i for i in range(start, len(layers)) if layers[i].is_linear),
+        start,
+    )
+    fa_mask = create_attention_mask(h, cache[fa_idx]) if has_full else None
+    ssm_mask = create_ssm_mask(h, cache[ssm_idx]) if has_linear else None
+    for layer, layer_cache in zip(layers[start:], cache[start:]):
+        mask = ssm_mask if layer.is_linear else fa_mask
+        h = layer(h, mask=mask, cache=layer_cache)
+    H = inner.norm(h)
+    hidden = H if config.mtp_hidden() == "post_norm" else h
+    return model.lm_head(H), hidden
+
+
+def _take_optimistic_miss_flags(model):
+    """Return ``(any_miss, [(layer, lazy_flag), ...])`` for this forward."""
+    layer_flags = []
+    seen = set()
+    for layer in getattr(getattr(model, "model", model), "layers", ()):
+        vpool = getattr(getattr(layer, "mlp", None), "_vpool", None)
+        if (
+            vpool is not None
+            and id(vpool) not in seen
+            and hasattr(vpool, "take_optimistic_layer_miss_flags")
+        ):
+            seen.add(id(vpool))
+            layer_flags.extend(vpool.take_optimistic_layer_miss_flags())
+    if not layer_flags:
+        return mx.array(False), []
+    return mx.any(mx.stack([flag for _, flag in layer_flags])), layer_flags
+
+
+def _initial_optimistic_layers(model) -> set[int]:
+    """Return only layers with an exact progressive remap dependency."""
+    return {
+        layer for layer in range(1, len(model.model.layers))
+        if config.prefetch_progressive_for(layer)
+    }
+
+
 def prefill_chunked(model, ids, cache, chunk: "int | None" = None):
+    if config.prefetch_online_transition():
+        from mlx_streaming.core.prefetch.online_transition import prefill_collection
+        with prefill_collection():
+            return _prefill_chunked_impl(model, ids, cache, chunk)
+    return _prefill_chunked_impl(model, ids, cache, chunk)
+
+
+def _prefill_chunked_impl(model, ids, cache, chunk: "int | None" = None):
     """分块 prefill:把 ids 按 chunk 切片逐块喂入,增量更新 cache,返回最后一块的 (logits, hidden)。
 
     整段 prefill 一次前向的激活峰值 ∝ prompt 长度(每 MoE 层瞬时物化大量唯一专家 + 长序列激活)。
@@ -222,7 +307,8 @@ def tree_verify_step(model, drafter, x, H_last, x_ids, mtp_cache, main_cache, K,
 
 # ----------------------------------------------------------------- 主循环
 def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
-                 profile=False, on_tokens=None, main_cache=None, cached_len=0):
+                 profile=False, on_tokens=None, main_cache=None, cached_len=0,
+                 on_prefill_complete=None):
     """贪婪 MTP 自投机。
 
     drafter 需提供 draft(H_last(1,1,H), x_ids(1,1), mtp_cache, K) -> list[int](长度 K);
@@ -256,12 +342,26 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     produced = [x]
     _stop_from_initial = on_tokens is not None and on_tokens([x])
     mx.eval(H_last)
+    # Diagnostic deterministic-route replay must start at the exact
+    # prefill/decode boundary.  Prompt chunk sizes are not request markers
+    # (a nine-token prompt may be executed as 8+1), so resetting in layer 0
+    # based on sequence length is insufficient.
+    oracle_replay = getattr(model, "_prefetch_oracle_replay", None)
+    if oracle_replay is not None:
+        oracle_replay.reset()
+    if on_prefill_complete is not None:
+        on_prefill_complete()
     t0 = time.perf_counter()
     n_steps = 0
     # profile 分段累加(秒):把 sync/finalize 拆开,避免隐藏在 replay 名下。
     t_draft = t_verify = t_replay = t_snap = 0.0
     t_commit = t_sync = t_finalize = 0.0
     direct_commits = fallback_replays = replayed_tokens = 0
+    optimistic_attempts = optimistic_replays = 0
+    optimistic_layer_misses = {}
+    sparse_attempts = sparse_overflow_replays = 0
+    sparse_overflow_layers = {}
+    sparse_layer_flags = sparse_true_layer_flags = 0
     # matched 直方图:accept_hist[j] = 恰好命中 j 个草稿(j∈0..K)的步数。用于实测每位置接受率,
     # 不做几何分布假设。emitted/step = min(matched+1,K)，故上限为 K(本实现 verify 只喂 K-1 草稿)。
     accept_hist = [0] * (max(K, config.depth_max() if config.adaptive_depth() else K) + 1)
@@ -279,6 +379,29 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     adaptive_mode = config.adaptive_depth() and not tree_mode and not tree_verify_mode \
         and verify_mode != "step"
     adaptive_rescue_mode = adaptive_mode and config.adaptive_rescue()   # 深链叠加 pos0 救回
+    optimistic_verify_mode = (
+        config.prefetch_optimistic_verify()
+        and verify_mode != "step"
+        and not tree_verify_mode
+    )
+    sparse_replay_mode = (
+        config.demand_sparse_enabled()
+        and not config.demand_sparse_local_correction()
+        and config.demand_async()
+        and verify_mode != "step"
+        and not tree_verify_mode
+        and not tree_mode
+        and not adaptive_rescue_mode
+    )
+    # Only progressive targets own an exact route dependency that makes the
+    # handler-free remap safe.  Applying the override to every model layer
+    # made a small hybrid progressive set silently put all ordinary layers on
+    # the optimistic demand path (and forced a full-cache snapshot per verify).
+    # A layer that ever misses is removed permanently for this request;
+    # stable progressive layers retain the fast path.
+    optimistic_layers = _initial_optimistic_layers(model) \
+        if optimistic_verify_mode else set()
+    optimistic_verify_mode = optimistic_verify_mode and bool(optimistic_layers)
     conf_tau_v = config.conf_tau()
     depth_max_v = max(1, config.depth_max())
     tree_P = max(1, config.tree_branches())
@@ -288,7 +411,16 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
     # (snap_m 只用于 tree 救回 / step / replay 回退,这些路径都不满足下方条件)。省 ~72MiB 在途
     # 峰值和一次同步栅栏,数值完全不变(bit-exact,只改内存调度)。模型结构恒定,循环外算一次即可。
     _skip_snap = (verify_mode != "step") and (not tree_mode) and (not tree_verify_mode) \
-        and (not adaptive_rescue_mode) and _batch_direct_commit_guaranteed(model)
+        and (not adaptive_rescue_mode) and (not optimistic_verify_mode) \
+        and (not sparse_replay_mode) \
+        and _batch_direct_commit_guaranteed(model)
+    _shallow_sparse_rollback = sparse_replay_mode and \
+        _batch_direct_commit_guaranteed(model)
+    _suffix_sparse_replay = (
+        _shallow_sparse_rollback
+        and config.demand_sparse_suffix_replay()
+        and route_delta_trace is None
+    )
 
     while len(produced) < max_tokens and not _stop_from_initial:
         x0 = x
@@ -360,7 +492,12 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             t_draft += time.perf_counter() - _tic
             _tic = time.perf_counter()
 
-        snap_m = None if _skip_snap else _snapshot(main_cache)
+        if _skip_snap:
+            snap_m = None
+        elif _shallow_sparse_rollback:
+            snap_m = _shallow_rollback_checkpoint(main_cache)
+        else:
+            snap_m = _snapshot(main_cache)
         if profile:
             t_snap += time.perf_counter() - _tic
             _tic = time.perf_counter()
@@ -370,13 +507,137 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
             route_delta_trace,
             verify_in,
         )
+        oracle_verify_snapshot = (
+            oracle_replay.snapshot() if oracle_replay is not None else None
+        )
         if verify_mode == "step":
             vlogits, vH, verify_snaps = forward_with_hidden_stepwise(
                 model, verify_in, main_cache, capture_snapshots=True)
         else:
             begin_speculative_checkpoints(main_cache)
-            vlogits, vH = forward_with_hidden(model, verify_in, main_cache)
-            mx.eval(vlogits, vH)
+            if optimistic_verify_mode:
+                optimistic_attempts += 1
+                # Only verify is allowed to skip native callbacks. Prefill and
+                # all safe replays retain ordinary exact I/O semantics.
+                with config.override_prefetch_exact_no_io(optimistic_layers):
+                    vlogits, vH = forward_with_hidden(model, verify_in, main_cache)
+                    optimistic_miss, layer_miss_flags = _take_optimistic_miss_flags(model)
+                    mx.eval(
+                        vlogits, vH, optimistic_miss,
+                        *[flag for _, flag in layer_miss_flags],
+                    )
+                if bool(optimistic_miss.item()):
+                    optimistic_replays += 1
+                    failed_layers = {
+                        layer for layer, flag in layer_miss_flags
+                        if bool(flag.item())
+                    }
+                    for layer in failed_layers:
+                        optimistic_layer_misses[layer] = \
+                            optimistic_layer_misses.get(layer, 0) + 1
+                    if not config.prefetch_optimistic_reprobe():
+                        optimistic_layers.difference_update(failed_layers)
+                    if route_delta_trace is not None:
+                        route_delta_trace.discard_verify(route_forward_id)
+                    if snap_m is None:
+                        raise RuntimeError(
+                            "optimistic verify miss requires a main-cache snapshot",
+                        )
+                    # The optimistic output may have gathered safe row zero for
+                    # absent experts and must never be committed. Restore the
+                    # exact pre-verify state and rerun with native reads/events.
+                    _restore(main_cache, snap_m)
+                    if oracle_verify_snapshot is not None:
+                        oracle_replay.restore(oracle_verify_snapshot)
+                    begin_speculative_checkpoints(main_cache)
+                    route_forward_id = _begin_route_delta_verify(
+                        route_delta_trace,
+                        verify_in,
+                    )
+                    with config.override_prefetch_exact_no_io(False):
+                        vlogits, vH = forward_with_hidden(
+                            model, verify_in, main_cache,
+                        )
+                        mx.eval(vlogits, vH)
+                # A no-miss optimistic forward is exact: every requested row
+                # was already published in the GPU table before it was used.
+            else:
+                if sparse_replay_mode:
+                    sparse_attempts += 1
+                if _suffix_sparse_replay:
+                    vlogits, vH, sparse_layer_inputs = forward_with_hidden(
+                        model, verify_in, main_cache,
+                        capture_layer_inputs=True,
+                    )
+                else:
+                    sparse_layer_inputs = None
+                    vlogits, vH = forward_with_hidden(model, verify_in, main_cache)
+                if sparse_replay_mode:
+                    sparse_overflow, layer_overflow_flags = \
+                        _take_optimistic_miss_flags(model)
+                    mx.eval(
+                        vlogits, vH, sparse_overflow,
+                        *[flag for _, flag in layer_overflow_flags],
+                    )
+                    sparse_layer_flags += len(layer_overflow_flags)
+                    sparse_true_layer_flags += sum(
+                        bool(flag.item())
+                        for _, flag in layer_overflow_flags
+                    )
+                    if bool(sparse_overflow.item()):
+                        sparse_overflow_replays += 1
+                        failed_layers = {
+                            layer for layer, flag in layer_overflow_flags
+                            if bool(flag.item())
+                        }
+                        for layer in failed_layers:
+                            sparse_overflow_layers[layer] = \
+                                sparse_overflow_layers.get(layer, 0) + 1
+                        if route_delta_trace is not None:
+                            route_delta_trace.discard_verify(route_forward_id)
+                        if snap_m is None:
+                            raise RuntimeError(
+                                "sparse demand overflow requires a cache snapshot",
+                            )
+                        failed_start = min(failed_layers) if failed_layers else 0
+                        use_suffix = (
+                            _suffix_sparse_replay
+                            and oracle_replay is None
+                            and sparse_layer_inputs is not None
+                            and failed_start > 0
+                        )
+                        if use_suffix:
+                            _restore_shallow_rollback(
+                                main_cache[failed_start:],
+                                snap_m[failed_start:],
+                            )
+                        elif _shallow_sparse_rollback:
+                            _restore_shallow_rollback(main_cache, snap_m)
+                        else:
+                            _restore(main_cache, snap_m)
+                        if oracle_verify_snapshot is not None:
+                            oracle_replay.restore(oracle_verify_snapshot)
+                        begin_speculative_checkpoints(
+                            main_cache[failed_start:] if use_suffix else main_cache,
+                        )
+                        route_forward_id = _begin_route_delta_verify(
+                            route_delta_trace, verify_in,
+                        )
+                        with config.override_demand_async(False):
+                            if use_suffix:
+                                vlogits, vH = forward_with_hidden_suffix(
+                                    model,
+                                    sparse_layer_inputs[failed_start],
+                                    main_cache,
+                                    failed_start,
+                                )
+                            else:
+                                vlogits, vH = forward_with_hidden(
+                                    model, verify_in, main_cache,
+                                )
+                            mx.eval(vlogits, vH)
+                else:
+                    mx.eval(vlogits, vH)
         preds = [int(t) for t in mx.argmax(vlogits[0], axis=-1)]   # 长度 K
         matched = accept_prefix(drafts, preds)
         # 最小树救回:A 链首草稿被拒(matched==0)且 B 候选=模型真实 token(=preds[0])时,
@@ -547,6 +808,15 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
         "direct_commits": direct_commits,
         "fallback_replays": fallback_replays,
         "replayed_tokens": replayed_tokens,
+        "optimistic_attempts": optimistic_attempts,
+        "optimistic_replays": optimistic_replays,
+        "optimistic_fast_layers": sorted(optimistic_layers),
+        "optimistic_layer_misses": optimistic_layer_misses,
+        "sparse_attempts": sparse_attempts,
+        "sparse_overflow_replays": sparse_overflow_replays,
+        "sparse_overflow_layers": sparse_overflow_layers,
+        "sparse_layer_flags": sparse_layer_flags,
+        "sparse_true_layer_flags": sparse_true_layer_flags,
         "accept_hist": accept_hist,               # [恰好命中0,1,...,K 个草稿的步数]
         "tree_rescues": tree_rescues,             # 最小树第1 位成功救回步数(tree_top2 开时)
         "tree_rescues_p1": tree_rescues_p1,       # 最小树第2 位成功救回步数(tree_top2 开时)

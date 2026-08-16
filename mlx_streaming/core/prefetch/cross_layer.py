@@ -8,6 +8,7 @@ gate_L(post_attention_layernorm_L(h)) 预测目标层专家（对齐 recall≈0.
 （blob 字节预读）、STREAM_BLOB_LOADER（blob-loader 字节预热）、native stage 预取。
 """
 import time
+from contextlib import nullcontext
 
 import mlx.core as mx
 from mlx_lm.models.base import create_attention_mask, create_ssm_mask
@@ -24,6 +25,64 @@ _FILE_PREFETCH_REMAINING = 0
 _FILE_PREFETCH_LAST_LAYER = -1
 _STAGE_PREFETCH_REMAINING = 0
 _STAGE_PREFETCH_LAST_LAYER = -1
+PROGRESSIVE_REUSE = {"moved": 0, "hit": 0, "miss": 0}
+
+
+def progressive_reuse_reset() -> None:
+    for key in PROGRESSIVE_REUSE:
+        PROGRESSIVE_REUSE[key] = 0
+
+
+def _submit_late_candidate_rerank(source_mlp, target, target_idx, out):
+    """Score the frozen early top-64 with fresher post-source hidden state."""
+    states = getattr(source_mlp, "_prefetch_late_candidates", None)
+    state = None if states is None else states.pop(int(target_idx), None)
+    if state is None:
+        return None
+    candidate_ids = state
+    target_mlp = getattr(target, "mlp", None)
+    vpool = getattr(source_mlp, "_vpool", None)
+    if not isinstance(target_mlp, FileStreamingMoeBlock) or vpool is None:
+        return None
+    gate = getattr(target_mlp, "_prefetch_predict_gate", target_mlp.gate)
+    if not all(hasattr(gate, name) for name in ("bits", "group_size", "mode")):
+        return None
+
+    predictor_input = target.post_attention_layernorm(out)
+    # Keep the candidate rows packed and use MLX's mature quantized matmul.
+    # Explicit dequantize materialized a 64xH float matrix for every selected
+    # target and erased much of the one-row late-prefetch gain.
+    scores = mx.quantized_matmul(
+        predictor_input,
+        gate["weight"][candidate_ids],
+        gate["scales"][candidate_ids],
+        gate["biases"][candidate_ids],
+        transpose=True,
+        group_size=int(gate.group_size),
+        bits=int(gate.bits),
+        mode=gate.mode,
+    )
+    scores = mx.max(scores.reshape(-1, int(candidate_ids.size)), axis=0)
+    # Submit a ranked prefix, not merely the number of desired new reads.
+    # Native unified reservation skips rows already resident/pending from the
+    # early pass and backfills from this prefix under its separate late budget.
+    width = min(config.prefetch_late_candidate_width(), int(candidate_ids.size))
+    chosen = mx.argpartition(scores, kth=-width)[-width:]
+    order = mx.argsort(scores[chosen])[::-1]
+    late_ids = candidate_ids[chosen[order]].astype(mx.uint32)
+
+    if int(target_idx) not in target_mlp.store._resident._pools:
+        return None
+    segs = target_mlp.store._staging.src._segs
+    pool_list = [
+        target_mlp.store._resident._pools[int(target_idx)][f"{p}.{t}"]
+        for p, t, *_ in segs
+    ]
+    return vpool.prefetch(
+        int(target_idx), late_ids,
+        target_mlp.store.resident_experts(int(target_idx)), pool_list,
+        source_layer=int(source_mlp.layer_idx), priority=1,
+    )
 
 
 def _legacy_decoder_prefetch_enabled(native_staging) -> bool:
@@ -103,6 +162,7 @@ def _progressive_decoder_call(layer, x, *, mask=None, cache=None):
     reuse = getattr(layer, "_prefetch_adjacent_reuse", None)
     object.__setattr__(layer, "_prefetch_adjacent_reuse", None)
     if reuse is not None and reuse[0] is x and reuse[1] is cache:
+        PROGRESSIVE_REUSE["hit"] += 1
         (
             _input, _cache, post_attention, gate_input, logits, shared,
         ) = reuse
@@ -114,6 +174,8 @@ def _progressive_decoder_call(layer, x, *, mask=None, cache=None):
                     mlp, "_prefetch_reuse_shared", (gate_input, shared),
                 )
     else:
+        if reuse is not None:
+            PROGRESSIVE_REUSE["miss"] += 1
         normalized = layer.input_layernorm(x)
         if layer.is_linear:
             attention = layer.linear_attn(normalized, mask, cache)
@@ -153,10 +215,15 @@ def _progressive_decoder_call(layer, x, *, mask=None, cache=None):
     model = getattr(mlp, "_prefetch_model_ref", None)
     layers = getattr(model, "layers", ())
 
-    # Build and submit the tail on its own device stream. The original early
-    # callback remains in the main graph; target demand never waits for tail
-    # SSD I/O unless the explicit diagnostic compatibility switch is enabled.
-    with mx.stream(vpool.progressive_stream()):
+    # The early proxy remains on the auxiliary stream.  The exact adjacent
+    # target computation depends on ``out`` and is the next decoder operation;
+    # moving it to another stream adds a fence without creating overlap.
+    refine_context = (
+        mx.stream(vpool.progressive_stream())
+        if config.prefetch_progressive_refine_aux_stream()
+        else nullcontext()
+    )
+    with refine_context:
         for target_idx in target_indices:
             if not 0 <= target_idx < len(layers):
                 continue
@@ -182,6 +249,7 @@ def _progressive_decoder_call(layer, x, *, mask=None, cache=None):
                 object.__setattr__(
                     target, "_prefetch_adjacent_reuse", moved,
                 )
+                PROGRESSIVE_REUSE["moved"] += 1
                 exact_route = True
             if refinement_logits is None:
                 # First prefill has no committed cache. The state is discarded
@@ -372,7 +440,118 @@ def enable_cross_layer_prefetch():
                     pass
                 else:
                     target_mlp.store.prefetch(target_mlp.layer_idx, expert_ids)
-        return orig_call(self, x, mask=mask, cache=cache)
+        out = orig_call(self, x, mask=mask, cache=cache)
+        if (
+            config.prefetch_late_candidate_rerank()
+            and isinstance(mlp, FileStreamingMoeBlock)
+            and int(x.shape[1]) <= 8
+        ):
+            source = int(getattr(mlp, "layer_idx", -1))
+            layers = getattr(
+                getattr(mlp, "_prefetch_model_ref", None), "layers", (),
+            )
+            allowed = config.prefetch_target_layers()
+            selected = config.prefetch_late_candidate_layers()
+            vpool = getattr(mlp, "_vpool", None)
+            targets = (
+                vpool.targets_for(source)
+                if vpool is not None and hasattr(vpool, "targets_for")
+                else (source + 1,)
+            )
+            context = (
+                mx.stream(vpool.progressive_stream())
+                if vpool is not None else nullcontext()
+            )
+            with context:
+                for target_idx in targets:
+                    if not (
+                        0 <= target_idx < len(layers)
+                        and (allowed is None or target_idx in allowed)
+                        and (selected is None or target_idx in selected)
+                    ):
+                        continue
+                    dummy = _submit_late_candidate_rerank(
+                        mlp, layers[target_idx], target_idx, out,
+                    )
+                    if dummy is not None:
+                        mx.async_eval(dummy)
+        if (
+            config.prefetch_post_moe()
+            and isinstance(mlp, FileStreamingMoeBlock)
+            and int(x.shape[1]) <= 8
+        ):
+            source = int(getattr(mlp, "layer_idx", -1))
+            layers = getattr(
+                getattr(mlp, "_prefetch_model_ref", None), "layers", (),
+            )
+            allowed = config.prefetch_target_layers()
+            refinement_layers = (
+                config.prefetch_post_moe_refinement_layers()
+                if config.prefetch_post_moe_refinement()
+                else None
+            )
+            replacement_layers = (
+                config.prefetch_post_moe_replacement_layers()
+                if not config.prefetch_post_moe_refinement()
+                else None
+            )
+            vpool = getattr(mlp, "_vpool", None)
+            targets = (
+                vpool.targets_for(source)
+                if vpool is not None and hasattr(vpool, "targets_for")
+                else (source + 1,)
+            )
+            context = (
+                mx.stream(vpool.progressive_stream())
+                if config.prefetch_async_predict() and vpool is not None
+                else nullcontext()
+            )
+            with context:
+                for target in targets:
+                    if not (
+                        0 <= source
+                        and target < len(layers)
+                        and (allowed is None or target in allowed)
+                        and (
+                            refinement_layers is None
+                            or target in refinement_layers
+                        )
+                        and (
+                            replacement_layers is None
+                            or target in replacement_layers
+                        )
+                        and isinstance(
+                            getattr(layers[target], "mlp", None),
+                            FileStreamingMoeBlock,
+                        )
+                    ):
+                        continue
+                    target_mlp = layers[target].mlp
+                    dummy = mlp._native_fused_prefetch(
+                        out,
+                        target_layer=target,
+                        predictor_input_override=(
+                            layers[target].post_attention_layernorm(out)
+                        ),
+                        physical_rank_limit_override=(
+                            config.prefetch_post_moe_refine_width()
+                            if config.prefetch_post_moe_refinement()
+                            else 0
+                        ),
+                        prefetch_priority=(
+                            1 if config.prefetch_post_moe_refinement() else 0
+                        ),
+                    )
+                    if dummy is not None:
+                        # Predictor and SSD callback run while the main stream
+                        # traverses intervening decoder work. Target demand
+                        # remains the correctness join.
+                        mx.async_eval(dummy)
+                        if target == source + 1:
+                            object.__setattr__(
+                                target_mlp, "_prefetch_post_moe_dummy", dummy,
+                            )
+        return out
 
     Qwen3NextDecoderLayer.__call__ = patched_call
     _CROSS_LAYER_PREFETCH_PATCHED = True

@@ -6,6 +6,7 @@ import json
 import os
 import statistics
 import time
+from contextlib import contextmanager
 
 import mlx.core as mx
 from mlx_lm.models.qwen3_next import ModelArgs
@@ -31,40 +32,229 @@ WARMUP_TOK = int(os.environ.get("WARMUP_TOK", str(MAXTOK)))
 REPEAT = int(os.environ.get("REPEAT", "3"))
 
 
-def _spec_once(model, drafter, tok, n, k):
-    ids, stats = mtp_generate(model, drafter, tok,
-                              mx.array([tok.encode(PROMPT)]),
-                              n, K=k, ids_mode=True, profile=True)
+@contextmanager
+def _canonical_baseline_config():
+    """Disable speculative expert prefetch for the greedy oracle.
+
+    Comparing speculative decoding against a greedy run that uses the same
+    experimental prefetch path can hide a shared corruption: both token lists
+    are wrong in the same way and ``exact_match`` still reports true.  The
+    opt-in canonical oracle retains synchronous exact demand while disabling
+    every predictor that can mutate speculative pool rows.
+    """
+    if os.environ.get("BASELINE_DISABLE_PREFETCH") != "1":
+        yield
+        return
+    overrides = {
+        "PREFETCH_PROGRESSIVE": "0",
+        "NATIVE_FUSED_PREFETCH": "0",
+        "CROSS_LAYER_PREFETCH": "0",
+        "DEMAND_ASYNC": "0",
+        # The replay object is attached while the model is built, so changing
+        # PREFETCH_ORACLE_ROUTE_DATA here cannot detach it.  Explicitly gate
+        # oracle consumption or a 256-step greedy baseline exhausts a trace
+        # captured from ~108 speculative verification occurrences.
+        "PREFETCH_ORACLE_DISABLE": "1",
+    }
+    saved = {name: os.environ.get(name) for name in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _spec_once(model, drafter, tok, n, k, store=None):
+    split_after_prefill = os.environ.get("SPEC_SPLIT_DEMAND_AFTER_PREFILL") == "1"
+    progressive_after_prefill = (
+        os.environ.get("PREFETCH_PROGRESSIVE_AFTER_PREFILL") == "1"
+    )
+    saved_demand_async = os.environ.get("DEMAND_ASYNC")
+    saved_progressive = os.environ.get("PREFETCH_PROGRESSIVE")
+    saved_oracle_disable = os.environ.get("PREFETCH_ORACLE_DISABLE")
+    oracle_decode_only = bool(os.environ.get("PREFETCH_ORACLE_ROUTE_DATA", "").strip())
+    decode_only_stats = os.environ.get("DECODE_ONLY_STATS") == "1"
+    profiler_names = (
+        "PREFETCH_AUDIT_PROF",
+        "PREFETCH_DEADLINE_PROF",
+        "PREFETCH_RERANK_PROF",
+    )
+    saved_profilers = {name: os.environ.get(name) for name in profiler_names}
+    if split_after_prefill:
+        # Keep prompt ingestion on the mature synchronous path.  The split
+        # hit/miss primitive is a decode experiment; applying it to chunked
+        # prefill used to corrupt the comparison before timing even began.
+        os.environ["DEMAND_ASYNC"] = "0"
+    if progressive_after_prefill:
+        # Progressive moved-compute is a decode optimization.  Running it for
+        # every long-prompt chunk duplicates scheduler work and can make
+        # prefill dominate an otherwise healthy decode benchmark.
+        os.environ["PREFETCH_PROGRESSIVE"] = "0"
+    if decode_only_stats:
+        for name in profiler_names:
+            os.environ[name] = "0"
+    if _cfg.prefetch_rerank_data_out():
+        os.environ["PREFETCH_RERANK_DATA_ACTIVE"] = "0"
+    if oracle_decode_only:
+        # A chunked prompt commonly has seq=2, which is indistinguishable from
+        # a short verify by shape alone.  Replay traces contain decode
+        # occurrences only, so keep the oracle detached until the explicit
+        # prefill/decode boundary callback below.
+        os.environ["PREFETCH_ORACLE_DISABLE"] = "1"
+
+    def reset_decode_stats():
+        # This callback is also the exact prefill/decode mode boundary.  It
+        # must not depend on whether benchmark counters happen to be enabled.
+        if split_after_prefill:
+            os.environ["DEMAND_ASYNC"] = "1"
+        if progressive_after_prefill:
+            if saved_progressive is None:
+                os.environ.pop("PREFETCH_PROGRESSIVE", None)
+            else:
+                os.environ["PREFETCH_PROGRESSIVE"] = saved_progressive
+        if decode_only_stats:
+            for name, value in saved_profilers.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        if oracle_decode_only:
+            os.environ.pop("PREFETCH_ORACLE_DISABLE", None)
+        if store is None or os.environ.get("DECODE_ONLY_STATS") != "1":
+            return
+        if os.environ.get("SIDEREGION_STATS") == "1":
+            # Long prefill can submit tens of thousands of expert reads.  The
+            # I/O counter must use the same post-prefill boundary as tok/s and
+            # deadline stats, otherwise it mostly measures prompt ingestion.
+            import mlx_streaming.native_moe_ext as _side_native
+            _side_native.prefetch_staging_drain()
+            _side_native.sideregion_drain()
+            _side_native.sideregion_prefetch_stats_reset()
+        store.reset_stats()
+        from mlx_streaming.core.profiling import tprof_reset, union_reset
+        from mlx_streaming.core.profiling import rerank_reset
+        tprof_reset()
+        union_reset()
+        rerank_reset()
+        _prefetch_audits_reset(store)
+        from mlx_streaming.core.prefetch.cross_layer import progressive_reuse_reset
+        progressive_reuse_reset()
+        if _cfg.prefetch_rerank_data_out():
+            os.environ["PREFETCH_RERANK_DATA_ACTIVE"] = "1"
+
+    try:
+        ids, stats = mtp_generate(model, drafter, tok,
+                                  mx.array([tok.encode(PROMPT)]),
+                                  n, K=k, ids_mode=True, profile=True,
+                                  on_prefill_complete=reset_decode_stats)
+    finally:
+        if split_after_prefill:
+            if saved_demand_async is None:
+                os.environ.pop("DEMAND_ASYNC", None)
+            else:
+                os.environ["DEMAND_ASYNC"] = saved_demand_async
+        if progressive_after_prefill:
+            if saved_progressive is None:
+                os.environ.pop("PREFETCH_PROGRESSIVE", None)
+            else:
+                os.environ["PREFETCH_PROGRESSIVE"] = saved_progressive
+        if oracle_decode_only:
+            if saved_oracle_disable is None:
+                os.environ.pop("PREFETCH_ORACLE_DISABLE", None)
+            else:
+                os.environ["PREFETCH_ORACLE_DISABLE"] = saved_oracle_disable
+        if decode_only_stats:
+            for name, value in saved_profilers.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
     tps = round(stats["tokens"] / stats["wall_s"], 2)
     return ids, stats, tps
 
 
-def _baseline_greedy(model, tok, prompt, n):
+def _baseline_greedy(model, tok, prompt, n, on_prefill_complete=None):
     cache = model.make_cache()
     ids = mx.array([tok.encode(prompt)])
-    t0 = time.perf_counter()
+    split_after_prefill = os.environ.get("SPEC_SPLIT_DEMAND_AFTER_PREFILL") == "1"
+    saved_demand_async = os.environ.get("DEMAND_ASYNC")
+    progressive_after_prefill = (
+        os.environ.get("PREFETCH_PROGRESSIVE_AFTER_PREFILL") == "1"
+    )
+    saved_progressive = os.environ.get("PREFETCH_PROGRESSIVE")
+    decode_only_stats = os.environ.get("DECODE_ONLY_STATS") == "1"
+    profiler_names = (
+        "PREFETCH_AUDIT_PROF",
+        "PREFETCH_DEADLINE_PROF",
+        "PREFETCH_RERANK_PROF",
+    )
+    saved_profilers = {name: os.environ.get(name) for name in profiler_names}
+    if split_after_prefill:
+        # Use the same safe boundary as speculative generation: large prompt
+        # chunks stay on synchronous demand, while token decode uses the
+        # callback-driven split hit/miss path.  Previously only MTP crossed
+        # this boundary, so the reported baseline paid a per-layer sync even
+        # when cross-layer rerank had the next layer almost fully resident.
+        os.environ["DEMAND_ASYNC"] = "0"
+    if progressive_after_prefill:
+        os.environ["PREFETCH_PROGRESSIVE"] = "0"
+    if decode_only_stats:
+        for name in profiler_names:
+            os.environ[name] = "0"
     # prefill 分块:把整段 prompt 的激活峰值压到与 decode 同稳态(见 config.prefill_chunk)。
-    logits, _ = prefill_chunked(model, ids, cache)
+    try:
+        logits, _ = prefill_chunked(model, ids, cache)
+    finally:
+        if progressive_after_prefill:
+            if saved_progressive is None:
+                os.environ.pop("PREFETCH_PROGRESSIVE", None)
+            else:
+                os.environ["PREFETCH_PROGRESSIVE"] = saved_progressive
+        if decode_only_stats:
+            for name, value in saved_profilers.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+    if split_after_prefill:
+        os.environ["DEMAND_ASYNC"] = "1"
+    if on_prefill_complete is not None:
+        on_prefill_complete()
+    # 与 mtp_generate 的 wall_s 保持同一口径：只统计 decode，不把 prompt
+    # prefill 混入 tok/s。否则 prompt 越长，baseline 数字越低，MTP speedup
+    # 会被人为放大；交互界面也是从首 token（prefill 完成）后开始计时。
+    t0 = time.perf_counter()
     _dump_margin = bool(os.environ.get("DUMP_MARGIN"))
     out = []
-    for _ in range(n):
-        lg = logits[:, -1, :]
-        nxt = int(mx.argmax(lg))
-        out.append(nxt)
-        if _dump_margin:
-            # 诊断:每步 top-2 logit 与差值,用于判定路径间发散是「FP 近平局」还是「真错」。
-            v = lg.reshape(-1)
-            top2 = mx.argpartition(-v, 2)[:2]
-            t2 = [int(x) for x in top2.tolist()]
-            vv = {t: float(v[t]) for t in t2}
-            st = sorted(t2, key=lambda t: -vv[t])
-            print(f"MARGIN step={len(out)-1} top1={st[0]}({vv[st[0]]:.5f}) "
-                  f"top2={st[1]}({vv[st[1]]:.5f}) gap={vv[st[0]]-vv[st[1]]:.6f}", flush=True)
-        cur = mx.array([[nxt]])
-        mx.eval(cur)
-        if len(out) >= n:
-            break
-        logits, _ = forward_with_hidden(model, cur, cache)
+    try:
+        for _ in range(n):
+            lg = logits[:, -1, :]
+            nxt = int(mx.argmax(lg))
+            out.append(nxt)
+            if _dump_margin:
+                # 诊断:每步 top-2 logit 与差值,用于判定路径间发散是「FP 近平局」还是「真错」。
+                v = lg.reshape(-1)
+                top2 = mx.argpartition(-v, 2)[:2]
+                t2 = [int(x) for x in top2.tolist()]
+                vv = {t: float(v[t]) for t in t2}
+                st = sorted(t2, key=lambda t: -vv[t])
+                print(f"MARGIN step={len(out)-1} top1={st[0]}({vv[st[0]]:.5f}) "
+                      f"top2={st[1]}({vv[st[1]]:.5f}) gap={vv[st[0]]-vv[st[1]]:.6f}", flush=True)
+            cur = mx.array([[nxt]])
+            mx.eval(cur)
+            if len(out) >= n:
+                break
+            logits, _ = forward_with_hidden(model, cur, cache)
+    finally:
+        if split_after_prefill:
+            if saved_demand_async is None:
+                os.environ.pop("DEMAND_ASYNC", None)
+            else:
+                os.environ["DEMAND_ASYNC"] = saved_demand_async
     return out, round(n / (time.perf_counter() - t0), 2)
 
 
@@ -166,28 +356,55 @@ def main():
     # warmup:同时跑 baseline + spec 两条路径,编译 Metal kernel(含 multistate/batch verify)
     # 并把专家常驻池/预取热起来,确保后续测的是稳态而非冷启动。默认 warmup=MAXTOK 跑满全长。
     if WARMUP_TOK > 0:
-        _baseline_greedy(model, tok, PROMPT, WARMUP_TOK)
-        _spec_once(model, drafter, tok, WARMUP_TOK, K)
+        with _canonical_baseline_config():
+            _baseline_greedy(model, tok, PROMPT, WARMUP_TOK)
+        if os.environ.get("BASELINE_ONLY") != "1":
+            _spec_once(model, drafter, tok, WARMUP_TOK, K, store)
+
+    # Diagnostic upper bound: warm the exact deterministic route safely, then
+    # let measured MTP verify use miss-detecting handler-free remaps.  This is
+    # deliberately applied only after warmup, never to prompt ingestion.
+    if os.environ.get("PREFETCH_OPTIMISTIC_AFTER_WARMUP") == "1":
+        os.environ["PREFETCH_OPTIMISTIC_VERIFY"] = "1"
 
     # ---- baseline 稳态:重复 REPEAT 次取中位数;最后一次清零统计供命中率口径 ----
     base = None
     base_tps_runs = []
+    def reset_baseline_decode_stats():
+        """Use the same post-prefill accounting boundary as speculative decode."""
+        store.reset_stats()
+        if _cfg.demand_async():
+            from mlx_streaming import native_moe_ext as _async_native
+            _async_native.demand_async_stats_reset()
+        from mlx_streaming.core.profiling import tprof_reset, union_reset
+        from mlx_streaming.core.profiling import rerank_reset
+        tprof_reset()
+        union_reset()
+        rerank_reset()
+        _prefetch_audits_reset(store)
+
     for r in range(REPEAT):
-        if r == REPEAT - 1:
-            store.reset_stats()
-            if _cfg.demand_async():
-                from mlx_streaming import native_moe_ext as _async_native
-                _async_native.demand_async_stats_reset()
-            from mlx_streaming.core.profiling import rerank_reset
-            rerank_reset()
-            _prefetch_audits_reset(store)
-        base, bt = _baseline_greedy(model, tok, PROMPT, MAXTOK)
+        with _canonical_baseline_config():
+            base, bt = _baseline_greedy(
+                model,
+                tok,
+                PROMPT,
+                MAXTOK,
+                on_prefill_complete=(
+                    reset_baseline_decode_stats if r == REPEAT - 1 else None
+                ),
+            )
         base_tps_runs.append(bt)
     base_async = None
-    if _cfg.demand_async():
+    base_async_miss_hist = None
+    if (_cfg.demand_async()
+            or os.environ.get("SPEC_SPLIT_DEMAND_AFTER_PREFILL") == "1"):
         from mlx_streaming import native_moe_ext as _async_native
         _async_native.demand_async_check()
         base_async = list(_async_native.demand_async_stats())
+        base_async_miss_hist = list(
+            _async_native.demand_async_miss_histogram()
+        )
     base_tps = statistics.median(base_tps_runs)
     base_miss, base_hit = store.misses, store.hits
     if base_async is not None:
@@ -198,6 +415,23 @@ def main():
     base_prefetch_audit = _prefetch_audit_prof(primary_seq=1)
     base_prefetch_deadline = _prefetch_deadline_prof()
     base_rerank = _rerank_prof()
+
+    if os.environ.get("BASELINE_ONLY") == "1":
+        baseline_mem = snapshot()
+        print(json.dumps({
+            "max_tokens": MAXTOK,
+            "baseline_tok_per_s": base_tps,
+            "baseline_tps_runs": base_tps_runs,
+            "baseline_disk_loads": base_miss,
+            "baseline_async_stats": base_async,
+            "baseline_async_miss_histogram": base_async_miss_hist,
+            "baseline_prefetch_deadline": base_prefetch_deadline,
+            "expert_slots": int(os.environ.get("EXPERT_SLOTS", "0")),
+            "expert_pool_rows": sum(store.cap_for(layer) for layer in range(48)),
+            "mlx_active_gb": round(baseline_mem.mlx_active_bytes / 1e9, 2),
+            "mlx_peak_gb": round(baseline_mem.mlx_peak_bytes / 1e9, 2),
+        }, indent=2))
+        return
 
     # 可选:baseline 之后、spec 之前校准每层热专家，并预取/钉入 resident pool。
     # 这样 disk_load_ratio 的分母仍是未 pin baseline，能直接衡量 pin 是否压低 spec miss。
@@ -220,7 +454,8 @@ def main():
     for r in range(REPEAT):
         if r == REPEAT - 1:
             store.reset_stats()
-            if _cfg.demand_async():
+            if (_cfg.demand_async()
+                    or os.environ.get("SPEC_SPLIT_DEMAND_AFTER_PREFILL") == "1"):
                 from mlx_streaming import native_moe_ext as _async_native
                 _async_native.demand_async_stats_reset()
             reset_peak()
@@ -237,13 +472,48 @@ def main():
                 import mlx_streaming.native_moe_ext as _side_native
                 _side_native.prefetch_staging_drain()
                 _side_native.sideregion_prefetch_stats_reset()
-        ids, stats, st = _spec_once(model, drafter, tok, MAXTOK, K)
+        ids, stats, st = _spec_once(model, drafter, tok, MAXTOK, K, store)
         spec_tps_runs.append(st)
     spec_async = None
-    if _cfg.demand_async():
+    spec_async_miss_hist = None
+    spec_async_seq_miss_hist = None
+    spec_async_layers = None
+    # _spec_once restores DEMAND_ASYNC after every measured request, so the
+    # post-run config value is false in split mode even though decode used the
+    # async primitive. Read its counters explicitly.
+    if (_cfg.demand_async()
+            or os.environ.get("SPEC_SPLIT_DEMAND_AFTER_PREFILL") == "1"):
         from mlx_streaming import native_moe_ext as _async_native
         _async_native.demand_async_check()
         spec_async = list(_async_native.demand_async_stats())
+        spec_async_miss_hist = list(
+            _async_native.demand_async_miss_histogram()
+        )
+        flat_seq_hist = list(
+            _async_native.demand_async_seq_miss_histogram()
+        )
+        spec_async_seq_miss_hist = {
+            str(sequence_length): {
+                str(misses): int(calls)
+                for misses, calls in enumerate(
+                    flat_seq_hist[sequence_length * 31:(sequence_length + 1) * 31]
+                )
+                if calls
+            }
+            for sequence_length in range(1, 4)
+        }
+        layer_values = list(_async_native.demand_async_layer_stats())
+        names = (
+            "calls", "fallback_layers", "loads", "entry_misses",
+            "max_entry_misses", "fallback_wait_us", "pending_wait_us",
+        )
+        spec_async_layers = {
+            str(layer): dict(zip(
+                names, layer_values[layer * 7:layer * 7 + 7], strict=True,
+            ))
+            for layer in range(64)
+            if any(layer_values[layer * 7:layer * 7 + 7])
+        }
     spec_tps = statistics.median(spec_tps_runs)
     spec_miss, spec_hit = store.misses, store.hits
     if spec_async is not None:
@@ -256,6 +526,9 @@ def main():
     spec_deadline = _prefetch_deadline_prof()
     spec_prejoin = _prefetch_prejoin_prof()
     spec_acceptance = _progressive_acceptance_prof(store)
+    rerank_training_data = _export_rerank_training_data(store)
+    from mlx_streaming.core.prefetch.cross_layer import PROGRESSIVE_REUSE
+    progressive_reuse = dict(PROGRESSIVE_REUSE)
     legacy_base_pool_hit = round(base_hit / max(base_hit + base_miss, 1), 3)
     legacy_spec_pool_hit = round(spec_hit / max(spec_hit + spec_miss, 1), 3)
     # Global staging is not GPU-addressable until demand-time promotion, while
@@ -268,13 +541,27 @@ def main():
         if direct_slots
         else _resident_ready_hit_rate(spec_prejoin)
     )
+    mismatch_positions = [
+        i for i, (spec_id, base_id) in enumerate(zip(ids, base))
+        if spec_id != base_id
+    ]
     result = {
         "K": K,
         "max_tokens": MAXTOK,
         "warmup_tok": WARMUP_TOK,
         "repeat": REPEAT,
         "exact_match": ids == base,
-        "n_mismatch": sum(1 for a, b in zip(ids, base) if a != b),
+        "n_mismatch": len(mismatch_positions),
+        "first_mismatch": (
+            mismatch_positions[0] if mismatch_positions else None
+        ),
+        "first_mismatch_tokens": (
+            {
+                "spec": ids[mismatch_positions[0]],
+                "baseline": base[mismatch_positions[0]],
+            }
+            if mismatch_positions else None
+        ),
         "avg_accept_len": stats["avg_accept_len"],
         "accept_hist": stats.get("accept_hist"),
         "steps": stats["steps"],
@@ -282,6 +569,25 @@ def main():
         "direct_commits": stats.get("direct_commits"),
         "fallback_replays": stats.get("fallback_replays"),
         "replayed_tokens": stats.get("replayed_tokens"),
+        "optimistic_attempts": stats.get("optimistic_attempts"),
+        "optimistic_replays": stats.get("optimistic_replays"),
+        "optimistic_fast_layers": stats.get("optimistic_fast_layers"),
+        "optimistic_layer_misses": stats.get("optimistic_layer_misses"),
+        "sparse_attempts": stats.get("sparse_attempts"),
+        "sparse_overflow_replays": stats.get("sparse_overflow_replays"),
+        "sparse_overflow_layers": stats.get("sparse_overflow_layers"),
+        "sparse_layer_flags": stats.get("sparse_layer_flags"),
+        "sparse_true_layer_flags": stats.get("sparse_true_layer_flags"),
+        "sparse_miss_budget": _cfg.demand_sparse_miss_budget(),
+        "sparse_miss_budget_overrides": (
+            _cfg.demand_sparse_miss_budget_overrides()
+        ),
+        "prefetch_low_workers": int(
+            os.environ.get("PREFETCH_LOW_WORKERS", "0")
+        ),
+        "prefetch_refinement_wait_all": (
+            os.environ.get("PREFETCH_REFINEMENT_WAIT_ALL", "0") == "1"
+        ),
         "spec_tok_per_s": spec_tps,
         "baseline_tok_per_s": base_tps,
         "speedup": round(spec_tps / max(base_tps, 1e-6), 2),
@@ -356,6 +662,16 @@ def main():
             }
             if spec_async is not None else None
         ),
+        "async_entry_miss_histogram": (
+            {
+                str(misses): int(calls)
+                for misses, calls in enumerate(spec_async_miss_hist)
+                if calls
+            }
+            if spec_async_miss_hist is not None else None
+        ),
+        "async_entry_miss_histogram_by_sequence": spec_async_seq_miss_hist,
+        "async_demand_per_layer": spec_async_layers,
         "pin_hot": PIN_HOT,
         "pin_cal_tok": PIN_CAL_TOK,
         "pinned_experts": store.pinned_count(),
@@ -380,6 +696,8 @@ def main():
         # 逐 occurrence 的逻辑 rerank 验收：selected 不超过真实并集 150%，
         # 且每层 selected recall 至少保留 raw top64 recall 的 95%。
         "progressive_acceptance": spec_acceptance,
+        "rerank_training_data": rerank_training_data,
+        "progressive_reuse": progressive_reuse,
         "rerank_physical_alignment": _rerank_physical_alignment(
             spec_acceptance, spec_deadline,
         ),
@@ -609,12 +927,23 @@ def _sideregion_prefetch_prof():
         "input_ids", "candidates", "side_hits", "reserved_reads",
         "evictions", "pread_ok", "pread_fail", "unique_layer_expert_reads",
     )
-    return {name: int(value) for name, value in zip(names, values, strict=True)}
+    result = {name: int(value) for name, value in zip(names, values, strict=True)}
+    if hasattr(native, "sideregion_prefetch_reads_by_layer"):
+        result["reads_by_layer"] = {
+            str(layer): int(value)
+            for layer, value in enumerate(native.sideregion_prefetch_reads_by_layer())
+            if value
+        }
+    return result
 
 
 def _prefetch_audits_reset(store=None):
     """在测量轮边界排空旧 fill，再开启独立的 deadline/audit 统计。"""
-    if not (_cfg.prefetch_deadline_prof() or _cfg.prefetch_audit_prof()):
+    if not (
+        _cfg.prefetch_deadline_prof()
+        or _cfg.prefetch_audit_prof()
+        or _cfg.prefetch_rerank_data_out()
+    ):
         return
     from mlx_streaming import native_moe_ext as N
     # reset 时若旧 callback 仍在途，它会污染新一轮 key；先排空才有严格边界。
@@ -626,8 +955,13 @@ def _prefetch_audits_reset(store=None):
         N.demand_deadline_stats_reset()
         N.demand_prejoin_stats_reset()
         N.prefetch_staging_wait_stats_reset()
-    if _cfg.prefetch_audit_prof():
-        N.prefetch_audit_stats_reset()
+    if (
+        _cfg.prefetch_audit_prof()
+        or _cfg.prefetch_acceptance_prof()
+        or _cfg.prefetch_rerank_data_out()
+    ):
+        if _cfg.prefetch_audit_prof():
+            N.prefetch_audit_stats_reset()
         from mlx_streaming.core.prefetch import progressive_acceptance
         progressive_acceptance.reset()
         vpool = getattr(store, "_vpool", None)
@@ -637,13 +971,26 @@ def _prefetch_audits_reset(store=None):
 
 def _progressive_acceptance_prof(store=None):
     """Return the requested per-layer top64-retention/150%-width contract."""
-    if not _cfg.prefetch_audit_prof():
+    if not (
+        _cfg.prefetch_audit_prof() or _cfg.prefetch_acceptance_prof()
+    ):
         return None
     vpool = getattr(store, "_vpool", None)
     if vpool is not None:
         vpool.flush_progressive_acceptance()
     from mlx_streaming.core.prefetch import progressive_acceptance
     return progressive_acceptance.report(threshold=0.95)
+
+
+def _export_rerank_training_data(store=None):
+    path = _cfg.prefetch_rerank_data_out()
+    if not path:
+        return None
+    vpool = getattr(store, "_vpool", None)
+    if vpool is not None:
+        vpool.flush_progressive_acceptance()
+    from mlx_streaming.core.prefetch import progressive_acceptance
+    return progressive_acceptance.export_training_data(path)
 
 
 def _rerank_physical_alignment(acceptance, deadline):

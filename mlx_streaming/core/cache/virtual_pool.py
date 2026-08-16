@@ -14,6 +14,8 @@
 - 调度器：VirtualPool(num_layers=.., cutoff=.., ahead_lo=.., ahead_hi=..)
 - 协调器：VirtualPool(resident, staging, spec_slots)，dual-source 下再补调度参数即可两职合一。
 """
+import os
+
 import mlx.core as mx
 
 from mlx_streaming import config
@@ -39,8 +41,11 @@ class VirtualPool:
         self._progressive_last_width = {}
         self._progressive_waitable = {}
         self._progressive_ready_dummy = {}
+        self._progressive_debug_ids = {}
         self._progressive_acceptance = {}
         self._progressive_stream = None
+        self._optimistic_miss_flags = []
+        self._fused_prefetch_pending = {}
         # --- ahead 调度 ---
         self._num_layers = int(num_layers) if num_layers is not None else 0
         self._cutoff = int(cutoff) if cutoff is not None else 0
@@ -77,9 +82,11 @@ class VirtualPool:
         source = int(src_layer)
         if source < 0 or source >= self._num_layers - 1:
             return ()
+        allowed = config.prefetch_target_layers()
         return tuple(
             target
             for target in range(source + 1, self._num_layers)
+            if allowed is None or target in allowed
             if target - self.ahead_for(target) == source
         )
 
@@ -94,6 +101,11 @@ class VirtualPool:
         稳健：不依赖首个 MoE 层是 layer 0、也不要求 MoE 层连续。"""
         if layer_idx <= self._last_layer:
             self._gen += 1
+            # Lazy miss/overflow flags are consumed explicitly after every
+            # speculative target forward.  Silently clearing an unconsumed
+            # flag here can commit a throwaway sparse result with uncorrected
+            # route positions.  A stale flag is safely conservative (it
+            # forces replay); dropping it is a correctness violation.
             # 上一个 forward 到此已经越过所有 target demand；未被消费的项只
             # 可能来自首次空 cache/prefill，不能泄漏到下一次 refinement。
             self._progressive = {
@@ -116,10 +128,61 @@ class VirtualPool:
                 for key, value in self._progressive_ready_dummy.items()
                 if key[0] >= self._gen
             }
+            self._progressive_debug_ids = {
+                key: value
+                for key, value in self._progressive_debug_ids.items()
+                if key[0] >= self._gen
+            }
+            self._fused_prefetch_pending = {
+                key: value
+                for key, value in self._fused_prefetch_pending.items()
+                if key[0] >= self._gen
+            }
             # Acceptance samples are intentionally retained until the final
             # benchmark/report barrier.  Evaluating them here would restore a
             # per-layer ids.eval() sync; pruning would silently erase them.
         self._last_layer = layer_idx
+
+    def record_fused_prefetch(
+        self, trigger_layer, target_layer, predicted_ids, resident,
+    ) -> None:
+        key = (int(self._gen), int(trigger_layer))
+        if key in self._fused_prefetch_pending:
+            raise RuntimeError(f"duplicate fused prefetch trigger={key}")
+        self._fused_prefetch_pending[key] = (
+            int(target_layer), predicted_ids,
+            tuple(int(value) for value in (resident or ())),
+        )
+
+    def take_fused_prefetch(self, trigger_layer):
+        return self._fused_prefetch_pending.pop(
+            (int(self._gen), int(trigger_layer)), None,
+        )
+
+    def optimistic_safe_local(self, layer, local):
+        """Record a lazy miss flag and replace invalid rows before MoE use.
+
+        The optimistic forward is discarded and replayed when any flag is
+        true.  Mapping -1 to row zero here prevents an out-of-bounds gather in
+        the throwaway forward without hiding the miss from the verifier.
+        """
+        self._optimistic_miss_flags.append((int(layer), mx.any(local < 0)))
+        return mx.maximum(local, 0)
+
+    def record_lazy_replay_flag(self, layer, flag):
+        """Record any device-side condition that makes this forward replay."""
+        self._optimistic_miss_flags.append((int(layer), flag))
+
+    def take_optimistic_layer_miss_flags(self):
+        flags, self._optimistic_miss_flags = self._optimistic_miss_flags, []
+        return flags
+
+    def take_optimistic_miss_flag(self):
+        layer_flags = self.take_optimistic_layer_miss_flags()
+        flags = [flag for _, flag in layer_flags]
+        if not flags:
+            return mx.array(False)
+        return mx.any(mx.stack(flags))
 
     def _gens(self) -> int:
         # 代数取自常驻池;单代(=1)时读=填=0(持久 LFU 单区),双代(=2)时交替(%2==&1)。
@@ -127,12 +190,15 @@ class VirtualPool:
         return max(1, int(g))
 
     def read_gen(self) -> int:
-        return (self._gen - 1) % self._gens()   # 读上一前向填好的代;单代恒 0
+        return (self._gen - 1) % self._gens()   # compatibility staging reads prior generation
 
     def fill_gen(self) -> int:
         return self._gen % self._gens()         # fill 写本代;单代恒 0
 
-    def acquire(self, layer, inds, num_experts, *, seq_len=None, layer_cap=None):
+    def acquire(
+        self, layer, inds, num_experts, *, seq_len=None, layer_cap=None,
+        fused_prefetch=None,
+    ):
         """统一取用入口（GPU-remap 路径）：对外呈现「所有专家都在」的视角。
 
         返回 (pool_arrays, local, n_experts)，计算侧零分支：
@@ -152,6 +218,7 @@ class VirtualPool:
             if self._direct_slots:
                 pool, local, n_exp = self._acquire_direct(
                     layer, inds, side_gen, cap, seq_len=seq_len,
+                    fused_prefetch=fused_prefetch,
                 )
             else:
                 pool, local, n_exp = self._acquire_native(
@@ -202,6 +269,31 @@ class VirtualPool:
         pool_list, seg_nbytes, path, stride = self._native_meta(layer)
         progressive_key = (int(self._gen), int(layer))
         progressive_demand = progressive_key in self._progressive_last_width
+        if config.demand_async():
+            leases = self._stg.attach_for_demand(layer, int(self._gen))
+            staging_buffers = [lease[1] for lease in leases]
+            staging_generations = [lease[2] for lease in leases]
+            entry_local, final_local = N.demand_staged_split_async(
+                inds, pool_list, seg_nbytes, int(layer), path, stride,
+                int(cap), rp.eviction_policy == "lfu",
+                int(rp.lfu_decay_interval), forward_id=int(self._gen),
+                sequence_length=(-1 if seq_len is None else int(seq_len)),
+                evaluator_submit=(
+                    config.demand_async_python_submit()
+                    or config.demand_async_eval_boundary()
+                ),
+                spec_limit=int(self._spec),
+                staging_buffers=staging_buffers,
+                staging_generations=staging_generations,
+            )
+            mx.async_eval(entry_local)
+            split_mapping = (
+                config.demand_sparse_miss_budget_for(layer) > 0
+                or config.custom_fused_moe()
+            )
+            local = (entry_local, final_local) if split_mapping else final_local
+            self._defer_progressive_acceptance(layer, inds)
+            return rp._pools[layer], local, int(cap)
         if progressive_demand:
             if self._progressive_waitable.get(progressive_key, False):
                 # The route is now known. Join only its experts that early/tail
@@ -234,6 +326,13 @@ class VirtualPool:
                 self._progressive_waitable.pop(progressive_key, None)
         self._record_progressive_acceptance(layer, inds)
         st = N.demand_last_stats()                           # [hitpos, misspos, loads, fallback012]
+        if config.prefetch_tprof():
+            by_layer = getattr(rp, "_demand_layer_stats", None)
+            if by_layer is None:
+                by_layer = rp._demand_layer_stats = {}
+            row = by_layer.setdefault(int(layer), [0, 0])
+            row[0] += int(st[0])
+            row[1] += int(st[2])
         if st[3] == 2:
             # C++ 已在真实区发生任何分配/驱逐前判定：本次非 side 唯一专家 + 无关
             # pinned 无法同时容纳。临时堆叠完整真实路由，保证小 per-layer cap 只影响
@@ -248,7 +347,6 @@ class VirtualPool:
             rp.gpu_fastpath += 1
         else:
             rp.gpu_fallback += 1
-        from mlx_streaming import config
         if config.stg_verify():                              # 诊断:方案B 池字节逐 key 真值校验(默认关)
             self._verify_native_bytes(layer, inds, local)
         return (
@@ -256,7 +354,10 @@ class VirtualPool:
             int(cap),
         )
 
-    def _acquire_direct(self, layer, inds, side_gen, cap, *, seq_len=None):
+    def _acquire_direct(
+        self, layer, inds, side_gen, cap, *, seq_len=None,
+        fused_prefetch=None,
+    ):
         """Consume prefetch rows in-place; no staging-to-main promotion."""
         import mlx_streaming.native_moe_ext as N
 
@@ -266,6 +367,7 @@ class VirtualPool:
         # are therefore ordinary final pool rows owned by the real table,
         # rather than an unreachable reserved range.
         demand_cap = int(rp.native_real_cap_for(layer))
+        use_side = bool(config.prefetch_isolated_side_for(layer) and int(layer) > 0)
         pool_list, seg_nbytes, path, stride = self._native_meta(layer)
         progressive_key = (int(self._gen), int(layer))
         ready_dummy = self._progressive_ready_dummy.pop(progressive_key, None)
@@ -275,16 +377,52 @@ class VirtualPool:
             )
         if config.prefetch_pinned_gpu_demand():
             local = N.demand_gpu_remap_only(
-                inds, int(layer), int(side_gen), demand_cap, False,
+                inds, int(layer), int(side_gen), demand_cap, use_side,
             )
             return (
                 rp._pools[layer], local,
                 int(rp.allocated_slots(layer)),
             )
-        if ready_dummy is not None and config.prefetch_exact_gpu_demand():
-            local = N.demand_gpu_remap_only(
-                inds, int(layer), int(side_gen), demand_cap, False,
+        # Optimistic verification is also valid for the ordinary T-ahead
+        # rerank path.  Its rows were submitted before this target, but unlike
+        # progressive refinement it has no per-target ``ready_dummy``.  A GPU
+        # table miss is still lossless: ``optimistic_safe_local`` records the
+        # lazy miss flag, the caller discards this forward, restores the cache,
+        # and replays with exact demand.  Requiring ``ready_dummy`` here kept
+        # every ordinary all-hit layer on the callback path and erased the
+        # main benefit of early prefetch.
+        optimistic_gpu_only = (
+            config.prefetch_optimistic_verify()
+            and config.prefetch_exact_no_io(layer)
+        )
+        gpu_only_exact = (
+            config.prefetch_exact_gpu_demand()
+            and (ready_dummy is not None or optimistic_gpu_only)
+            # In split-demand mode the early rerank is allowed to miss.  Its
+            # handler-free T-1 route dependency feeds the native entry/final
+            # mappings below, where only missing positions are corrected.
+            # Treating it as GPU-only would replace misses with row zero and
+            # force an expensive whole-forward replay.
+            and not (
+                config.prefetch_exact_no_io(layer)
+                and config.demand_async()
             )
+            and (
+                not config.prefetch_optimistic_verify()
+                or config.prefetch_exact_no_io(layer)
+            )
+        )
+        if gpu_only_exact:
+            local = N.demand_gpu_remap_only(
+                inds, int(layer), int(side_gen), demand_cap, use_side,
+            )
+            if os.environ.get("PREFETCH_GPU_REMAP_VERIFY") == "1":
+                debug_ids = self._progressive_debug_ids.pop(
+                    progressive_key, None,
+                )
+                self._verify_gpu_remap(layer, inds, local, debug_ids)
+            if config.prefetch_exact_no_io(layer):
+                local = self.optimistic_safe_local(layer, local)
             self._progressive_last_width.pop(progressive_key, None)
             self._progressive_waitable.pop(progressive_key, None)
             self._defer_progressive_acceptance(layer, inds)
@@ -321,10 +459,20 @@ class VirtualPool:
                 stride, demand_cap, rp.eviction_policy == "lfu",
                 int(rp.lfu_decay_interval),
             )
+            # Sparse correction requires both entry and final mappings.  Make
+            # its positive budget sufficient to select the split primitive;
+            # requiring a second, easy-to-miss environment switch previously
+            # made the optimization silently run the ordinary waiting path.
+            split_mapping = (
+                config.demand_async_python_submit()
+                or config.demand_async_eval_boundary()
+                or config.demand_sparse_miss_budget_for(layer) > 0
+                or config.custom_fused_moe()
+            )
             demand_kwargs = dict(
                 forward_id=int(self._gen),
                 sequence_length=(-1 if seq_len is None else int(seq_len)),
-                use_side=False,
+                use_side=use_side,
                 wait_for_pending=(
                     config.prefetch_wait_predicted_pending()
                     or (
@@ -338,9 +486,34 @@ class VirtualPool:
                     and self._progressive_waitable.get(progressive_key, False)
                     and config.prefetch_progressive_demand_wait()
                 ),
-                evaluator_submit=config.demand_async_python_submit(),
+                # Only the explicit diagnostic path relies on an evaluator
+                # submission boundary. Sparse and masked production paths use
+                # the native command-buffer boundary instead.
+                evaluator_submit=(
+                    config.demand_async_python_submit()
+                    or config.demand_async_eval_boundary()
+                ),
             )
-            if config.demand_async_python_submit():
+            if config.prefetch_partial_projections():
+                if use_side:
+                    raise RuntimeError(
+                        "partial projection prefetch requires the unified pool"
+                    )
+                entry_local, prefix_local, final_local = \
+                    N.demand_dual_projection_split_async(
+                        *demand_args, **demand_kwargs,
+                    )
+                mx.async_eval(entry_local)
+                # Demand-tail mode still uses the native prefix/tail reader,
+                # but waits once and executes the mature full MoE kernel once.
+                # This avoids the costly MLX gate/up submission boundary used
+                # by the projection-overlap experiment.
+                local = (
+                    final_local
+                    if config.prefetch_partial_demand_tail()
+                    else (entry_local, prefix_local, final_local)
+                )
+            elif split_mapping:
                 entry_local, final_local = N.demand_dual_split_async(
                     *demand_args, **demand_kwargs,
                 )
@@ -349,7 +522,35 @@ class VirtualPool:
                 # SharedEvent wait is encoded. No ids.eval() and no native
                 # max_ops no-op padding are needed.
                 mx.async_eval(entry_local)
-                local = final_local
+                # Preserve both views for sparse miss correction.  The entry
+                # mapping describes what was resident at the compute deadline;
+                # the final mapping is event-gated and contains every demanded
+                # expert once I/O completes.
+                local = (
+                    final_local
+                    if config.demand_async_eval_boundary()
+                    else (entry_local, final_local)
+                )
+            elif fused_prefetch is not None:
+                target_layer, predicted_ids, target_resident = fused_prefetch
+                target_pool, target_seg_nbytes, target_path, target_stride = \
+                    self._native_meta(int(target_layer))
+                local = N.demand_dual_async_prefetch(
+                    *demand_args,
+                    **demand_kwargs,
+                    prefetch_ids=predicted_ids,
+                    prefetch_pool_list=target_pool,
+                    prefetch_seg_nbytes=target_seg_nbytes,
+                    prefetch_layer=int(target_layer),
+                    prefetch_path=target_path,
+                    prefetch_stride=int(target_stride),
+                    prefetch_cap=int(self._rp.native_real_cap_for(target_layer)),
+                    prefetch_spec_limit=int(self._spec),
+                    prefetch_resident=[
+                        int(value) for value in (target_resident or ())
+                    ],
+                )
+                self._stg.submitted += 1
             else:
                 local = N.demand_dual_async(
                     *demand_args, **demand_kwargs,
@@ -360,7 +561,7 @@ class VirtualPool:
                 stride, demand_cap, rp.eviction_policy == "lfu",
                 int(rp.lfu_decay_interval), forward_id=int(self._gen),
                 sequence_length=(-1 if seq_len is None else int(seq_len)),
-                use_side=False,
+                use_side=use_side,
                 record_deadline=not pre_wait_deadline,
             )
         if config.demand_async():
@@ -373,6 +574,13 @@ class VirtualPool:
                 int(rp.allocated_slots(layer)),
             )
         st = N.demand_last_stats()
+        if config.prefetch_tprof():
+            by_layer = getattr(rp, "_demand_layer_stats", None)
+            if by_layer is None:
+                by_layer = rp._demand_layer_stats = {}
+            row = by_layer.setdefault(int(layer), [0, 0])
+            row[0] += int(st[0])
+            row[1] += int(st[2])
         rp.hits += st[0]
         rp.misses += st[2]
         if st[3] == 0:
@@ -425,7 +633,25 @@ class VirtualPool:
             online_width=state["online_width"],
             actual_ids=state["actual_ids"],
             resident=state["resident"],
+            proxy_logits=state.get("proxy_logits"),
+            predictor_hidden=state.get("predictor_hidden"),
+            actual_logits=state.get("actual_logits"),
         )
+
+    def attach_rerank_actual_logits(self, layer, actual_logits) -> bool:
+        """Attach the real target router logits to an offline capture row.
+
+        The prediction row is created at its earlier source layer.  Keeping
+        the target logits lazy under the same forward/layer key lets the final
+        generation barrier export a soft ranking target without adding a
+        target-boundary synchronization to production.
+        """
+        key = (int(self._gen), int(layer))
+        state = self._progressive_acceptance.get(key)
+        if state is None:
+            return False
+        state["actual_logits"] = actual_logits
+        return True
 
     def flush_progressive_acceptance(self) -> int:
         """Materialize completed samples once, after the generation barrier."""
@@ -445,7 +671,7 @@ class VirtualPool:
 
     def record_rerank_acceptance(
         self, target_layer, *, candidate_ids, selected_ids, online_width,
-        resident,
+        resident, proxy_logits=None, predictor_hidden=None,
     ) -> None:
         """Retain an early-only rerank sample until target truth is available.
 
@@ -463,6 +689,8 @@ class VirtualPool:
             "selected_ids": selected_ids,
             "online_width": online_width,
             "resident": tuple(int(value) for value in (resident or ())),
+            "proxy_logits": proxy_logits,
+            "predictor_hidden": predictor_hidden,
         }
 
     def _temporary_fetch(self, layer, inds):
@@ -489,6 +717,35 @@ class VirtualPool:
             [remap[expert] for expert in flat], dtype=inds.dtype,
         ).reshape(inds.shape)
         return stacked, local, len(unique)
+
+    @staticmethod
+    def _verify_gpu_remap(layer, inds, local, submitted):
+        """Diagnostic: compare the lazy Metal table lookup to native truth."""
+        import mlx_streaming.native_moe_ext as N
+
+        mx.eval(inds, local)
+        expert_ids = [int(value) for value in inds.reshape(-1).tolist()]
+        gpu_rows = [int(value) for value in local.reshape(-1).tolist()]
+        ownership = list(N.real_region_contents(int(layer)))
+        ownership = dict(zip(ownership[::2], ownership[1::2]))
+        native_rows = [ownership.get(expert, -1) for expert in expert_ids]
+        submitted_ids = None
+        if submitted is not None:
+            selected, width = submitted
+            mx.eval(selected, width)
+            submitted_ids = [
+                int(value) for value in selected[:int(width.item())].tolist()
+            ]
+        for position, (expert, gpu_row, native_row) in enumerate(zip(
+            expert_ids, gpu_rows, native_rows,
+        )):
+            if gpu_row != native_row or gpu_row < 0:
+                raise RuntimeError(
+                    "GPU-only expert remap disagrees with native ownership: "
+                    f"layer={layer}, position={position}, expert={expert}, "
+                    f"gpu_row={gpu_row}, native_row={native_row}, "
+                    f"submitted={submitted_ids}"
+                )
 
     def _verify_native_bytes(self, layer, inds, local):
         """诊断(STG_VERIFY，方案B)：校验「字节落池不变量」——真实区每个占用槽的池字节 == 该槽当前
@@ -547,23 +804,65 @@ class VirtualPool:
         fetched = self._rp.fetch(layer, uniq_sorted)
         return fetched, local, len(uniq_sorted)
 
-    def prefetch(self, layer, pred, resident, pool_list, *, source_layer=None):
+    def prefetch(
+        self, layer, pred, resident, pool_list, *, source_layer=None,
+        priority=0,
+    ):
         """Submit either into final direct rows or the global staging ring."""
         if self._direct_slots:
             gen = self.fill_gen()
-            # Negative base selects unified-main ownership in native code;
-            # its magnitude is the full real capacity.  No side rows/table.
-            base = -int(self._rp.cap_for(layer))
+            # Default negative base selects unified-main ownership.  The
+            # isolated mode restores the original logical split inside the
+            # same allocation: demand owns the prefix, prediction owns the
+            # fixed tail and therefore cannot evict main rows before demand.
+            base = self._direct_prefetch_base(layer, gen)
             return self._stg.submit_pool_sideregion(
                 layer, pred, resident, pool_list, base, gen=gen,
                 source_layer=(-1 if source_layer is None else int(source_layer)),
                 forward_id=int(self._gen),
+                priority=int(priority),
             )
         del pool_list
         return self._stg.submit(
             layer, pred, resident,
             source_layer=(-1 if source_layer is None else int(source_layer)),
             forward_id=int(self._gen),
+        )
+
+    def _direct_prefetch_base(self, layer: int, gen: int) -> int:
+        """Return the one authoritative row base for every direct submit.
+
+        Progressive refinement must use the same ownership layout as its
+        early submission and target demand.  Mixing ``-full_cap`` unified
+        reservation with an isolated ``full_cap-admission`` real region
+        initializes the native real table twice with different capacities.
+        """
+        if config.prefetch_isolated_side_for(layer) and int(layer) > 0:
+            return (
+                int(self._rp.native_real_cap_for(layer))
+                + int(gen) * int(self._rp.spec_slots)
+            )
+        return -int(self._rp.cap_for(layer))
+
+    def prefetch_ready_ids(self, layer: int, expert_ids, *, source_layer: int):
+        """Submit IDs materialized by source demand to direct rows or staging."""
+        if not expert_ids:
+            return
+        layer = int(layer)
+        if not self._direct_slots:
+            self._stg.submit_ready_ids(
+                layer, expert_ids, self._rp.resident_experts(layer),
+                source_layer=int(source_layer), forward_id=int(self._gen),
+            )
+            return
+        if layer not in self._rp._pools:
+            return
+        segs = self._stg.src._segs
+        pool_list = [self._rp._pools[layer][f"{p}.{t}"] for p, t, *_ in segs]
+        self._stg.submit_unified_ready(
+            layer, expert_ids, self._rp.resident_experts(layer), pool_list,
+            source_layer=int(source_layer), forward_id=int(self._gen),
+            real_cap=int(self._rp.cap_for(layer)),
         )
 
     # ---- progressive early-core + exact late-fill coordination ----
@@ -578,6 +877,7 @@ class VirtualPool:
         top_k,
         candidate_width=64,
         early_dummy=None,
+        exact_only=False,
     ):
         """Freeze the original source candidate state for same-forward T-1."""
         key = (int(self._gen), int(target_layer))
@@ -593,6 +893,7 @@ class VirtualPool:
             "top_k": int(top_k),
             "candidate_width": int(candidate_width),
             "early_dummy": early_dummy,
+            "exact_only": bool(exact_only),
         }
 
     def progressive_stream(self):
@@ -613,10 +914,71 @@ class VirtualPool:
         if state is None:
             return None
         from mlx_streaming.core.prefetch.progressive import (
+            exact_candidate_route_ids,
             exact_route_union_ids,
             refined_ids,
         )
 
+        if state.get("exact_only") and exact_route:
+            if config.prefetch_exact_gpu_demand():
+                # In GPU-only demand mode every actual route must have a valid
+                # row.  Restricting the exact route back to the old proxy's
+                # top64 can leave a legitimate ~2% tail unmapped and silently
+                # feed row -1 into the fused MoE.  The moved gate is the real
+                # target computation, so its full route union is both exact
+                # and no wider than the actual set itself.
+                ids, width = exact_route_union_ids(
+                    exact_logits,
+                    top_k=state["top_k"],
+                    side_capacity=self._spec,
+                    resident=state["resident"],
+                )
+            else:
+                ids, width = exact_candidate_route_ids(
+                    exact_logits,
+                    state["candidate_logits"],
+                    top_k=state["top_k"],
+                    side_capacity=min(self._spec, 15),
+                    resident=state["resident"],
+                    candidate_width=state["candidate_width"],
+                )
+            if os.environ.get("PREFETCH_GPU_REMAP_VERIFY") == "1":
+                self._progressive_debug_ids[key] = (ids, width)
+            if config.prefetch_exact_no_io(target_layer):
+                num_experts = int(exact_logits.shape[-1])
+                route_ids = mx.contiguous(mx.argpartition(
+                    exact_logits.reshape(-1, num_experts),
+                    kth=-state["top_k"], axis=-1,
+                )[:, -state["top_k"]:].reshape(-1).astype(mx.uint32))
+                # Unlike an independent zero, this scalar keeps the moved
+                # gate/route graph ordered across the progressive and main
+                # streams without introducing a CPU completion handler.
+                dummy = mx.sum(route_ids.astype(mx.uint32)) * 0
+                self._progressive_last_width[key] = width
+                self._progressive_waitable[key] = True
+                self._progressive_ready_dummy[key] = dummy
+                return dummy, route_ids
+            gen = self.fill_gen()
+            base = self._direct_prefetch_base(target_layer, gen)
+            dummy = self._stg.submit_pool_sideregion(
+                int(target_layer), ids, state["resident"],
+                state["pool_list"], base, gen=gen,
+                source_layer=int(source_layer), forward_id=int(self._gen),
+                stream=self.progressive_stream(),
+                priority=(
+                    2 if config.prefetch_progressive_callback_wait() else 1
+                ),
+            )
+            self._progressive_last_width[key] = width
+            self._progressive_waitable[key] = dummy is not None
+            if dummy is not None:
+                self._progressive_ready_dummy[key] = dummy
+            num_experts = int(exact_logits.shape[-1])
+            route_ids = mx.contiguous(mx.argpartition(
+                exact_logits.reshape(-1, num_experts),
+                kth=-state["top_k"], axis=-1,
+            )[:, -state["top_k"]:].reshape(-1).astype(mx.uint32))
+            return dummy, route_ids
         if exact_route and config.prefetch_exact_gpu_demand():
             # The exact adjacent decoder computation is moved (and later
             # reused), so its real route can close the last few top64 misses
@@ -627,6 +989,8 @@ class VirtualPool:
                 side_capacity=self._spec,
                 resident=state["resident"],
             )
+            if os.environ.get("PREFETCH_GPU_REMAP_VERIFY") == "1":
+                self._progressive_debug_ids[key] = (ids, width)
         elif exact_route:
             # Adjacent attention provides a better ranking signal, not a new
             # candidate universe.  Keep the same frozen raw-top64 contract so
@@ -666,6 +1030,23 @@ class VirtualPool:
                     int(target_layer),
                 ),
             )
+        if exact_route and config.prefetch_exact_no_io(target_layer):
+            # The early rerank submission already had the full T-ahead I/O
+            # window.  Optimistic verify must not recreate the per-layer T-1
+            # callback/event that it is meant to remove.  Keep only the real
+            # moved-gate route dependency; acquire() will GPU-remap it and
+            # record a lazy miss flag so the whole verify is safely replayed
+            # if the early rerank missed any expert.
+            num_experts = int(exact_logits.shape[-1])
+            route_ids = mx.contiguous(mx.argpartition(
+                exact_logits.reshape(-1, num_experts),
+                kth=-state["top_k"], axis=-1,
+            )[:, -state["top_k"]:].reshape(-1).astype(mx.uint32))
+            dummy = mx.sum(route_ids.astype(mx.uint32)) * 0
+            self._progressive_last_width[key] = width
+            self._progressive_waitable[key] = True
+            self._progressive_ready_dummy[key] = dummy
+            return dummy, route_ids
         # Preserve callback order across streams without a host wait: the
         # final full-union submission cannot become ready before early submit.
         early_dummy = state.get("early_dummy")
@@ -715,13 +1096,17 @@ class VirtualPool:
                 # the full legal union: already-published core rows are native
                 # hits (no reread), while the complete P-set remains protected.
                 gen = self.fill_gen()
-                base = -int(self._rp.cap_for(target_layer))
+                base = self._direct_prefetch_base(target_layer, gen)
                 dummy = self._stg.submit_pool_sideregion(
                     int(target_layer), ids, state["resident"],
                     state["pool_list"], base, gen=gen,
                     source_layer=int(source_layer), forward_id=int(self._gen),
                     stream=self.progressive_stream(),
-                    priority=2 if exact_route else 1,
+                    priority=(
+                        2 if exact_route
+                        and config.prefetch_progressive_callback_wait()
+                        else 1
+                    ),
                 )
             else:
                 dummy = self._stg.submit(

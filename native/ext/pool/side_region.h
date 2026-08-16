@@ -31,7 +31,11 @@ mx::array sideregion_lease_table(int layer, int gen);
 void sideregion_reset();
 // 预取取证统计：[输入ID、过滤后唯一候选、侧区已有命中、真实预留读取、淘汰、pread成功、pread失败]。
 std::vector<long> sideregion_prefetch_stats();
+std::vector<long> sideregion_prefetch_reads_by_layer();
 void sideregion_prefetch_stats_reset();
+// Once target demand reaches a layer, queued speculative reads for that same
+// forward/layer should yield to the high-priority demand reader.
+void sideregion_mark_target_consumed(int64_t forward_id, int layer);
 
 // 逐 forward/目标层的生产预取审计。提交侧记录 rerank 唯一候选与真实 I/O
 // 时间线；demand 侧用同一 forward_id 配对真实路由，因而即使 callback 晚于
@@ -79,7 +83,10 @@ void sideregion_note_demand_values(
 // Resolve only the experts in the current route against the published direct
 // rows.  Unlike sideregion_snapshot this is O(route width), does not copy the
 // complete ownership table, and is used after waiting for predicted-pending
-// reads so those rows can bypass the CPU fallback allocator.
+// reads so those rows can bypass the CPU fallback allocator.  When row leases
+// are enabled, lookup and lease acquisition are one locked operation: callers
+// may perform slow fallback I/O after return without exposing the resolved
+// rows to speculative reuse.
 std::vector<int32_t> sideregion_lookup_values(
     int layer, int gen, const uint32_t* expert_ids, size_t count);
 

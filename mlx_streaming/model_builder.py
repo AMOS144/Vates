@@ -370,11 +370,19 @@ def build_streaming_model():
     # Shared lazy arrays from the most recent *normal* target gate execution.
     # This is request-local state: layer 0 clears it at the next long prefill.
     gate_history = {}
+    proxy_history = {}
+    residual_history = {}
+    route_history = {}
     from mlx_streaming.core.moe.block import FileStreamingMoeBlock
     for layer in model.layers:
         mlp = getattr(layer, "mlp", None)
         if isinstance(mlp, FileStreamingMoeBlock):
             object.__setattr__(mlp, "_prefetch_gate_history", gate_history)
+            object.__setattr__(mlp, "_prefetch_proxy_history", proxy_history)
+            object.__setattr__(
+                mlp, "_prefetch_residual_history", residual_history,
+            )
+            object.__setattr__(mlp, "_prefetch_route_history", route_history)
     transition_profile = {}
     if config.prefetch_transition_profile():
         from mlx_streaming.core.prefetch.source_transition_runtime import (
@@ -389,6 +397,57 @@ def build_streaming_model():
             mlp = getattr(layer, "mlp", None)
             if isinstance(mlp, FileStreamingMoeBlock):
                 mlp._prefetch_transition_profile = transition_profile
+    transition_only_profile = {}
+    if config.prefetch_transition_only_profile():
+        from mlx_streaming.core.prefetch.transition_only_runtime import (
+            load_transition_only_profile,
+        )
+        transition_only_profile = load_transition_only_profile(
+            config.prefetch_transition_only_profile(),
+            config.prefetch_target_layers(),
+        )
+        if transition_profile:
+            raise ValueError(
+                "PREFETCH_TRANSITION_PROFILE and transition-only are exclusive"
+            )
+        for layer in model.layers:
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, FileStreamingMoeBlock):
+                object.__setattr__(
+                    mlp, "_prefetch_transition_only_profile",
+                    transition_only_profile,
+                )
+    if config.prefetch_online_transition():
+        if transition_only_profile or transition_profile:
+            raise ValueError("online transition is exclusive with frozen transitions")
+        from mlx_streaming.core.prefetch.online_transition import (
+            OnlineRouteTransition,
+        )
+        online_transition = OnlineRouteTransition(
+            lambda target: (
+                config.cross_layer_ahead_profile().get(int(target))
+                or (config.cross_layer_ahead_lo()
+                    if int(target) <= config.cross_layer_cutoff()
+                    else config.cross_layer_ahead_hi())
+            ),
+        )
+        for layer in model.layers:
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, FileStreamingMoeBlock):
+                object.__setattr__(
+                    mlp, "_prefetch_online_transition", online_transition,
+                )
+    oracle_route_data = os.environ.get("PREFETCH_ORACLE_ROUTE_DATA", "").strip()
+    if oracle_route_data:
+        from mlx_streaming.core.prefetch.oracle_route_replay import (
+            OracleRouteReplay,
+        )
+        oracle_replay = OracleRouteReplay(oracle_route_data)
+        object.__setattr__(model, "_prefetch_oracle_replay", oracle_replay)
+        for layer in model.layers:
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, FileStreamingMoeBlock):
+                object.__setattr__(mlp, "_prefetch_oracle_replay", oracle_replay)
     if config.prefetch_target_cache():
         raise ValueError(
             "PREFETCH_TARGET_CACHE clone/replay 已移除：它会重复目标层 "
@@ -477,9 +536,11 @@ def build_streaming_model():
             raise ValueError(
                 "PREFETCH_PROGRESSIVE 需要可用的 ZEROCOPY_DUAL_SOURCE native staging",
             )
-        if any(not 1 <= core <= 15 for core in cores):
+        max_core = 26 if mode == "k3" else 15
+        if any(not 1 <= core <= max_core for core in cores):
             raise ValueError(
-                "所有 PREFETCH_PROGRESSIVE_CORE 必须在 [1,15]；15 是 top_k=10 的最小合法 150% 上限",
+                "PREFETCH_PROGRESSIVE_CORE 超过模式上限："
+                f"mode={mode}, legal=[1,{max_core}]",
             )
         physical_prefetch_slots = (
             admission_slots if direct_slots

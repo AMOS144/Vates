@@ -57,6 +57,24 @@ def test_sideregion_segment_scatter():
     os.unlink(path)
 
 
+def test_sideregion_physical_read_budget(monkeypatch):
+    """Logical candidates stay wide while isolated side reads one row."""
+    monkeypatch.setenv("PREFETCH_PHYSICAL_READ_BUDGET", "1")
+    N.sideregion_reset()
+    path = tempfile.NamedTemporaryFile(suffix=".blob", delete=False).name
+    _blob(path)
+    pool = _pool()
+    pred = mx.array([5, 6, 7], dtype=mx.uint32)
+    ready = N.prefetch_pool_sideregion(
+        pool, SEG, pred, 27, path, STRIDE, [], SPEC, CAP,
+    )
+    mx.eval(ready); N.sideregion_drain()
+    flat = N.sideregion_contents(27)
+    assert len(flat) == 2
+    assert flat[0] == 5
+    os.unlink(path)
+
+
 def test_direct_prefetch_publishes_only_unified_real_table():
     """Negative base writes final main rows and never creates side ownership."""
     N.real_reset(); N.sideregion_reset(); N.demand_async_stats_reset()
@@ -163,12 +181,14 @@ def test_sideregion_prefetch_stats_count_real_reads_and_hits():
     N.sideregion_drain()
     first = N.sideregion_prefetch_stats()
     assert first == [4, 2, 0, 2, 0, 2, 0, 2]
+    assert N.sideregion_prefetch_reads_by_layer()[2] == 2
 
     d = N.prefetch_pool_sideregion(pool, SEG, pred, 2, path, STRIDE, [1], SPEC, CAP)
     mx.eval(d)
     N.sideregion_drain()
     second = N.sideregion_prefetch_stats()
     assert second == [8, 4, 2, 2, 0, 2, 0, 2]
+    assert N.sideregion_prefetch_reads_by_layer()[2] == 2
     os.unlink(path)
 
 

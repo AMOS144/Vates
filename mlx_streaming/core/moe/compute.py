@@ -137,27 +137,16 @@ class PersistentSubGLU:
         self._n = n
 
     def forward(self, fetched: dict, n: int, x: mx.array, local: mx.array) -> mx.array:
-        self._ensure(n)
-        signature = (
-            int(n),
-            *((key, id(value)) for key, value in sorted(fetched.items())),
-        )
-        if getattr(self, "_bound_signature", None) != signature:
-            _update_qsl(self._glu.gate_proj, "gate_proj", fetched)
-            _update_qsl(self._glu.up_proj, "up_proj", fetched)
-            _update_qsl(self._glu.down_proj, "down_proj", fetched)
-            self._bound_signature = signature
+        self._bind(fetched, n)
         if self.swiglu_limit > 0:
-            # DeepSeek 路径：手动 gate/up/clip/silu/down，不能用 SwiGLU 融合激活
-            # （镜像 deepseek_v4.Experts：up 双侧 clip、gate 上侧 minimum）。
-            x_exp = mx.expand_dims(x, (-2, -3))            # (..., 1, 1, D)
+            # DeepSeek path below retains its special clipping semantics.
+            x_exp = mx.expand_dims(x, (-2, -3))
             gate = self._glu.gate_proj(x_exp, local)
             up = self._glu.up_proj(x_exp, local)
             up = mx.clip(up, -self.swiglu_limit, self.swiglu_limit)
             gate = mx.minimum(gate, self.swiglu_limit)
             h = nn.silu(gate) * up
-            y = self._glu.down_proj(h, local)
-            return y.squeeze(-2)
+            return self._glu.down_proj(h, local).squeeze(-2)
         max_fused_seq = config.custom_fused_moe_max_seq()
         if (x.shape[1] <= max_fused_seq
                 and _custom_fused_moe_enabled(
@@ -173,6 +162,35 @@ class PersistentSubGLU:
                 )):
             return self._custom_gate_up_forward(x, local)
         return self._glu(x, local)
+
+    def _bind(self, fetched: dict, n: int) -> None:
+        self._ensure(n)
+        signature = (
+            int(n),
+            *((key, id(value)) for key, value in sorted(fetched.items())),
+        )
+        if getattr(self, "_bound_signature", None) != signature:
+            _update_qsl(self._glu.gate_proj, "gate_proj", fetched)
+            _update_qsl(self._glu.up_proj, "up_proj", fetched)
+            _update_qsl(self._glu.down_proj, "down_proj", fetched)
+            self._bound_signature = signature
+
+    def forward_gate_up(
+        self, fetched: dict, n: int, x: mx.array, local: mx.array,
+    ) -> mx.array:
+        """Consume only the six gate/up arrays of a partially-ready row."""
+        self._bind(fetched, n)
+        x_exp = mx.expand_dims(x, (-2, -3))
+        gate = self._glu.gate_proj(x_exp, local)
+        up = self._glu.up_proj(x_exp, local)
+        return self._glu.activation(up, gate)
+
+    def forward_down(
+        self, fetched: dict, n: int, hidden: mx.array, local: mx.array,
+    ) -> mx.array:
+        """Consume the down arrays after their second readiness event."""
+        self._bind(fetched, n)
+        return self._glu.down_proj(hidden, local).squeeze(-2)
 
     def _custom_fused_forward(
         self,
