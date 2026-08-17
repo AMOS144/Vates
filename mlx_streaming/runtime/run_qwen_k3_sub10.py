@@ -124,23 +124,69 @@ def _chat_argv(argv: list[str]) -> list[str] | None:
     if not argv or argv[0] not in ("chat", "--chat"):
         return None
     rest = list(argv[1:])
-    for option, expected in (
-        ("--expert-slots", FINAL_DEFAULTS["EXPERT_SLOTS"]),
-        ("--spec-slots", FINAL_DEFAULTS["POOL_SPEC_SLOTS"]),
+    for options, expected in (
+        (("--expert-slots",), FINAL_DEFAULTS["EXPERT_SLOTS"]),
+        (("--spec-slots",), FINAL_DEFAULTS["POOL_SPEC_SLOTS"]),
+        (("-k", "--k"), FINAL_DEFAULTS["K"]),
     ):
-        while option in rest:
-            index = rest.index(option)
-            if index + 1 >= len(rest) or rest[index + 1] != expected:
-                raise ValueError(
-                    f"{option} is fixed at {expected} on the optimal branch",
-                )
-            del rest[index:index + 2]
+        rest = _remove_fixed_option(rest, options, expected)
     return [
         "chat",
         "--expert-slots", FINAL_DEFAULTS["EXPERT_SLOTS"],
         "--spec-slots", FINAL_DEFAULTS["POOL_SPEC_SLOTS"],
         *rest,
     ]
+
+
+def _remove_fixed_option(
+    argv: list[str],
+    options: tuple[str, ...],
+    expected: str,
+) -> list[str]:
+    """校验并移除用户重复传入的固定配置项。"""
+    kept: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        matched = next((option for option in options if token == option), None)
+        if matched is not None:
+            if index + 1 >= len(argv) or argv[index + 1] != expected:
+                raise ValueError(
+                    f"{matched} is fixed at {expected} by the production profile",
+                )
+            index += 2
+            continue
+        attached = next(
+            (
+                (option, token[len(option) + 1:])
+                for option in options
+                if option.startswith("--") and token.startswith(f"{option}=")
+            ),
+            None,
+        )
+        if attached is None:
+            attached = next(
+                (
+                    (option, token[len(option):])
+                    for option in options
+                    if option.startswith("-")
+                    and not option.startswith("--")
+                    and token.startswith(option)
+                    and token != option
+                ),
+                None,
+            )
+        if attached is not None:
+            option, value = attached
+            if value != expected:
+                raise ValueError(
+                    f"{option} is fixed at {expected} by the production profile",
+                )
+            index += 1
+            continue
+        kept.append(token)
+        index += 1
+    return kept
 
 
 def main() -> None:

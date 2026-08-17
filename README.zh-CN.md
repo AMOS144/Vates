@@ -158,10 +158,10 @@ vates --demo
 准备好下文列出的四类模型资产后，在项目根目录启动实测固定配置：
 
 ```bash
-.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 --chat --stats
+vates --stats
 ```
 
-该启动器会在导入模型运行时之前锁定完整配置。直接运行裸 `vates` 使用的是通用可调 CLI，不等同于本文的实测配置。
+公开 `vates` 命令会在导入模型运行时之前锁定完整配置。内部实验和 benchmark runner 仍供开发者使用，但不是支持的用户入口。
 
 > [!IMPORTANT]
 > 仓库不包含模型权重。真实推理前需要自行准备兼容的 Qwen3-Next-80B-A3B 4-bit MLX 主模型、专家数据和 MTP 权重；本项目当前未提供统一下载地址。
@@ -220,22 +220,19 @@ BITS=4 GROUP=64 LAYERS=all \
 
 ```bash
 # 以固定 K=3 配置启动全屏 TUI
-.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 --chat
+vates
 
 # 调整生成长度，并分别输出 Prefill/Decode 统计
-.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 \
-  --chat -n 800 --stats
+vates -n 800 --stats
 
 # 设置系统提示词
-.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 \
-  --chat --system "你是一个简洁的助手"
+vates --system "你是一个简洁的助手"
 
 # 不加载模型，直接预览界面
 vates --demo
 
 # 终端不兼容时使用纯文本 REPL
-.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 \
-  --chat --plain --stats
+vates --plain --stats
 ```
 
 未激活虚拟环境时，也可以直接使用：
@@ -266,10 +263,10 @@ TUI 支持以下操作：
 | `--expert-dir` | 专家根目录；默认在其 `blobs/` 子目录读取 blob。若直接指定 blob 目录，请设置 `BLOB_DIR` | `models/qwen3_next_experts_4bit_g64` |
 | `--mtp-out` | MTP 权重文件 | `models/qn_mtp_weights.safetensors` |
 | `--qn-config` | Qwen3-Next 配置文件 | `models/qwen3_next_80b_4bit/config.json` |
-| `-k`, `--k` | MTP 投机宽度；应保持验证值 | `3` |
+| `-k`, `--k` | MTP 投机宽度；由公开 CLI 固定 | `3` |
 | `-n`, `--max-tokens` | 每轮最多生成的新 token 数 | `4096` |
-| `--expert-slots` | 主模型专家池容量；由启动器固定 | `152` |
-| `--spec-slots` | 旧侧区行数；由启动器固定 | `0` |
+| `--expert-slots` | 主模型专家池容量；由公开 CLI 固定 | `152` |
+| `--spec-slots` | 旧侧区行数；由公开 CLI 固定 | `0` |
 | `--system` | 系统提示词 | 无 |
 | `--stats` | 输出 token 数、吞吐与接受长度 | 关闭 |
 | `--plain` | 使用纯文本 REPL | 关闭 |
@@ -278,12 +275,12 @@ TUI 支持以下操作：
 使用以下命令查看当前版本的完整参数：
 
 ```bash
-.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 --chat --help
+vates --help
 ```
 
 ## 配置说明
 
-`mlx_streaming.runtime.run_qwen_k3_sub10` 是实测固定配置的权威入口。它会主动覆盖性能相关环境变量，避免旧 shell 变量悄然改变结果。关键约束是：
+公开 `vates` 入口是实测固定配置的权威入口。它会在导入推理运行时前安装配置，并主动覆盖性能相关环境变量，避免旧 shell 变量悄然改变结果。关键约束是：
 
 - **Prefill**：Expert-major 提示词摄入、同步 demand 与固定有界 superblock；
 - **Decode**：K=3 批量 MTP 验证、最大深度 3，并在阶段边界后启用异步 demand；
@@ -292,7 +289,7 @@ TUI 支持以下操作：
 - K4/V3 旋转 KV 量化；
 - 原生预测式预取与固定候选重排、目标层、物理读取预算。
 
-模型路径、system prompt 和最大生成 token 数仍然是 CLI 参数。只有在有意进行其他池容量或环境开关实验时才使用裸 `vates`；该通用路径的结果不能标成固定配置的实测结果。
+模型路径、system prompt 和最大生成 token 数仍然是 CLI 参数。公开命令会固定池容量和关键配置；开发者测试变体时应使用内部 benchmark runner，且不能将结果标成固定配置的实测数据。
 
 ## 项目结构
 
@@ -361,7 +358,7 @@ TUI 支持以下操作：
 .venv/bin/python -m pytest
 ```
 
-测试覆盖 Expert-major Prefill、专家池、blob 布局、MTP、KV 量化、预测式预取、原生 I/O、固定启动器、TUI 和流式 detokenize。性能路径还使用原生测试、容量不变性、逐字节真值校验与 32K Prefill 验证器。
+测试覆盖 Expert-major Prefill、专家池、blob 布局、MTP、KV 量化、预测式预取、原生 I/O、公开命令入口、TUI 和流式 detokenize。性能路径还使用原生测试、容量不变性、逐字节真值校验与 32K Prefill 验证器。
 
 ## 常见问题 FAQ
 
@@ -375,7 +372,7 @@ TUI 支持以下操作：
 <details>
 <summary><strong>为什么提示 <code>vates: command not found</code>？</strong></summary>
 
-`vates` 安装在 `.venv/bin/` 中。请先运行 `source .venv/bin/activate`，或直接执行 `.venv/bin/vates`。实测固定配置始终可用 `.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 --chat` 启动。如果虚拟环境创建后被移动或重命名，请使用 `uv venv --clear && uv sync` 重建。
+`vates` 安装在 `.venv/bin/` 中。请先运行 `source .venv/bin/activate`，或直接执行 `.venv/bin/vates`。如果虚拟环境创建后被移动或重命名，请使用 `uv venv --clear && uv sync` 重建。
 
 </details>
 

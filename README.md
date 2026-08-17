@@ -165,10 +165,10 @@ vates --demo
 After preparing all four model assets below, launch the measured profile from the repository root:
 
 ```bash
-.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 --chat --stats
+vates --stats
 ```
 
-This launcher installs the fixed profile before importing the model runtime. Running bare `vates` uses the configurable generic CLI and is not the same benchmark configuration.
+The public `vates` command installs the fixed profile before importing the model runtime. Internal experiment and benchmark runners remain available to developers, but they are not the supported user entry point.
 
 ## Data preparation
 
@@ -232,21 +232,19 @@ Run all commands from the repository root.
 Start the full-screen TUI with the fixed K=3 profile:
 
 ```bash
-.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 --chat
+vates
 ```
 
 Set the generation length and print separate prefill/decode statistics:
 
 ```bash
-.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 \
-  --chat -n 800 --stats
+vates -n 800 --stats
 ```
 
 Set a system prompt:
 
 ```bash
-.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 \
-  --chat --system "You are a concise assistant."
+vates --system "You are a concise assistant."
 ```
 
 Preview the interface without loading a model:
@@ -258,8 +256,7 @@ vates --demo
 Use the plain-text REPL when the terminal is incompatible with the TUI:
 
 ```bash
-.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 \
-  --chat --plain --stats
+vates --plain --stats
 ```
 
 Without activating the virtual environment, run either:
@@ -289,10 +286,10 @@ TUI controls:
 | `--expert-dir` | Expert root directory; blobs are read from its `blobs/` subdirectory by default. If specifying the blob directory directly, set `BLOB_DIR` | `models/qwen3_next_experts_4bit_g64` |
 | `--mtp-out` | MTP weights file | `models/qn_mtp_weights.safetensors` |
 | `--qn-config` | Qwen3-Next configuration file | `models/qwen3_next_80b_4bit/config.json` |
-| `-k`, `--k` | MTP speculative width; keep at the validated value | `3` |
+| `-k`, `--k` | MTP speculative width; fixed by the public CLI | `3` |
 | `-n`, `--max-tokens` | Maximum new tokens per turn | `4096` |
-| `--expert-slots` | Main-model expert-pool capacity; fixed by the launcher | `152` |
-| `--spec-slots` | Legacy side-region rows; fixed by the launcher | `0` |
+| `--expert-slots` | Main-model expert-pool capacity; fixed by the public CLI | `152` |
+| `--spec-slots` | Legacy side-region rows; fixed by the public CLI | `0` |
 | `--system` | System prompt | None |
 | `--stats` | Print token count, throughput, and accepted length | Off |
 | `--plain` | Use the plain-text REPL | Off |
@@ -301,12 +298,12 @@ TUI controls:
 View the complete option set for the installed version:
 
 ```bash
-.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 --chat --help
+vates --help
 ```
 
 ## Configuration
 
-`mlx_streaming.runtime.run_qwen_k3_sub10` is the authority for the measured profile. It deliberately overwrites performance-related environment variables so a stale shell cannot silently alter the result. Its key contract is:
+The public `vates` entry point is the authority for the measured profile. It installs the fixed configuration before importing the inference runtime and deliberately overwrites performance-related environment variables so a stale shell cannot silently alter the result. Its key contract is:
 
 - **Prefill:** Expert-major prompt ingestion, synchronous demand, and a fixed bounded superblock;
 - **Decode:** K=3 batch MTP verification, adaptive depth capped at 3, and asynchronous demand after the phase boundary;
@@ -315,7 +312,7 @@ View the complete option set for the installed version:
 - K4/V3 rotated KV quantization; and
 - native predictive prefetch with fixed reranking, target-layer, and physical-read-budget policies.
 
-Model paths, the system prompt, and the maximum generated-token count remain CLI options. Use bare `vates` only when intentionally experimenting with other pool sizes or environment switches. Results from that generic path must not be presented as measurements of the fixed profile.
+Model paths, the system prompt, and the maximum generated-token count remain CLI options. Pool sizes and profile-critical switches are fixed on the public command; developers testing variants should use the internal benchmark runners and must not present those results as measurements of the fixed profile.
 
 ## Repository layout
 
@@ -384,7 +381,7 @@ After installing development dependencies, run the complete Python test suite:
 .venv/bin/python -m pytest
 ```
 
-The suite covers Expert-major prefill, expert pools, blob layout, MTP, KV quantization, predictive prefetch, native I/O, the fixed launcher, the TUI, and streaming detokenization. The benchmarked path is also validated with native tests, capacity-invariance checks, byte-level pool-oracle checks, and the 32K prefill validator.
+The suite covers Expert-major prefill, expert pools, blob layout, MTP, KV quantization, predictive prefetch, native I/O, the public entry point, the TUI, and streaming detokenization. The benchmarked path is also validated with native tests, capacity-invariance checks, byte-level pool-oracle checks, and the 32K prefill validator.
 
 ## FAQ
 
@@ -398,7 +395,7 @@ The project is built on MLX and depends on Apple Silicon's unified-memory archit
 <details>
 <summary><strong>Why do I get <code>vates: command not found</code>?</strong></summary>
 
-`vates` is installed in `.venv/bin/`. Run `source .venv/bin/activate` first, or invoke `.venv/bin/vates` directly. The measured profile can always be launched with `.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 --chat`. If the virtual environment was moved or renamed after creation, rebuild it with `uv venv --clear && uv sync`.
+`vates` is installed in `.venv/bin/`. Run `source .venv/bin/activate` first, or invoke `.venv/bin/vates` directly. If the virtual environment was moved or renamed after creation, rebuild it with `uv venv --clear && uv sync`.
 
 </details>
 
