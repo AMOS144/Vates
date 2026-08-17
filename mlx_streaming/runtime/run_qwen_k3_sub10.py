@@ -45,7 +45,7 @@ FINAL_DEFAULTS = {
     # 128 slots measured 39.81 tok/s; 256 is the smallest point that stays
     # above 40 tok/s (40.89) while keeping active memory near 10 GiB.
     "MTP_EXPERT_SLOTS": "256",
-    "MTP_EXPERT_DIR": "models/qn_mtp_experts_4bit_g64",
+    "MTP_EXPERT_DIR": "models/vates-runtime/mtp/experts",
     "MTP_ADAPTIVE_DEPTH": "1",
     "MTP_CONF_TAU": "0.3",
     "MTP_DEPTH_MAX": "3",
@@ -109,14 +109,19 @@ def configure() -> None:
         # This branch represents one measured profile, not an experiment
         # matrix. Prevent stale shell variables from silently changing it.
         os.environ[name] = value
-    # Worktrees do not duplicate the large model directory.  When the caller
-    # supplies an absolute target MODEL, resolve the default MTP expert shard
-    # beside it instead of relative to the worktree's current directory.
+    runtime_root = Path(os.environ.get("VATES_RUNTIME_DIR", "models/vates-runtime"))
+    os.environ["MTP_EXPERT_DIR"] = str(runtime_root / "mtp" / "experts")
+    # worktree 不复制大模型；MODEL 指向紧凑 bundle 的绝对路径时，从 bundle 根解析 MTP。
     mtp_dir = Path(os.environ["MTP_EXPERT_DIR"])
     model = os.environ.get("MODEL")
     if not mtp_dir.is_absolute() and model and not mtp_dir.exists():
-        sibling = Path(model).expanduser().resolve().parent / mtp_dir.name
-        if sibling.exists():
+        model_path = Path(model).expanduser().resolve()
+        candidates = (
+            model_path.parent / "mtp" / "experts",
+            model_path.parent / "qn_mtp_experts_4bit_g64",
+        )
+        sibling = next((path for path in candidates if path.exists()), None)
+        if sibling is not None:
             os.environ["MTP_EXPERT_DIR"] = str(sibling)
 
 

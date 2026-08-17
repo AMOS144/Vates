@@ -36,15 +36,17 @@ def _s(name: str, default: str = "") -> str:
 
 # ============================ 模型 / 目录 ============================
 # 默认放持久目录 models/（不要放 /tmp，会被系统清空）。运行从仓库根目录起，相对路径即可。
-def model_path() -> str: return _s("MODEL", "models/qwen3_next_80b_4bit")
-def qn_config() -> str: return _s("QN_CONFIG", "models/qwen3_next_80b_4bit/config.json")
-def mtp_out() -> str: return _s("MTP_OUT", "models/qn_mtp_weights.safetensors")
+def runtime_dir() -> str: return _s("VATES_RUNTIME_DIR", "models/vates-runtime")
+def model_path() -> str: return _s("MODEL", f"{runtime_dir()}/model")
+def qn_config() -> str: return _s("QN_CONFIG", f"{runtime_dir()}/model/config.json")
+def mtp_out() -> str: return _s("MTP_OUT", f"{runtime_dir()}/mtp/core.safetensors")
 def mtp_bits() -> int: return max(2, min(8, _i("MTP_BITS", 4)))
 def mtp_group_size() -> int: return max(32, _i("MTP_GROUP_SIZE", 64))
 def mtp_stream_experts() -> bool: return _b("MTP_STREAM_EXPERTS", "0")
-def mtp_expert_dir() -> str: return _s("MTP_EXPERT_DIR", "models/qn_mtp_experts_4bit_g64")
+def mtp_expert_dir() -> str: return _s("MTP_EXPERT_DIR", f"{runtime_dir()}/mtp/experts")
 def mtp_expert_slots() -> int: return max(10, _i("MTP_EXPERT_SLOTS", 32))
-def expert_dir(default: str = "models/qwen3_next_experts_4bit_g64") -> str: return _s("EXPERT_DIR", default)
+def expert_dir(default: str = "") -> str:
+    return _s("EXPERT_DIR", default or f"{runtime_dir()}/experts")
 def expert_slots() -> int: return _i("EXPERT_SLOTS", 64)
 # 长期运行内存防御:封顶 MLX 可回收缓冲(默认 1GB),防长会话缓存膨胀;
 # 双源侧区池的专家 buffer 走 C++ owned pool、不经 MLX 缓冲缓存,故 1GB 缓冲复用额度已够,

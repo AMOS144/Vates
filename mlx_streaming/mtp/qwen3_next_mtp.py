@@ -178,7 +178,13 @@ def load_mtp(args: ModelArgs, weights_path: str, quantize: bool = True,
         )
     mx.eval(model.parameters())
     if stream_experts:
-        if not expert_dir or not os.path.exists(os.path.join(expert_dir, "expert000.safetensors")):
+        has_blob = bool(expert_dir) and os.path.exists(
+            os.path.join(expert_dir, "layer100.blob"),
+        )
+        has_files = bool(expert_dir) and os.path.exists(
+            os.path.join(expert_dir, "expert000.safetensors"),
+        )
+        if not (has_blob or has_files):
             raise FileNotFoundError(
                 f"MTP streamed expert directory is incomplete: {expert_dir}",
             )

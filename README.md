@@ -30,7 +30,7 @@ The complete weights of a large Mixture-of-Experts (MoE) model often exceed the 
 vates targets **Qwen3-Next-80B-A3B 4-bit MLX**, which has 48 MoE transformer layers. Of those layers, 12 use full attention and the remaining 36 use linear attention. Each layer selects 10 routed experts from 512 and also uses a resident shared expert. vates uses the model's built-in MTP head for self-speculative decoding to improve generation throughput.
 
 > [!NOTE]
-> The 4-bit main-model weights occupy approximately 41 GB on disk. The profile merged in [PR #1](https://github.com/AMOS144/Vates/pull/1) measured approximately 10.96 GiB of active MLX memory and an approximately 11.51 GiB MLX peak. These figures are not process RSS or total system memory, and they do not mean that a machine with only that much unified memory is sufficient. macOS, mapped files, native allocations, the filesystem cache, and other applications require additional headroom. Actual memory use and speed depend on hardware, prompt length, model files, and cache warmth. The repository does not include the main model, expert blobs, MTP weights, or streamed MTP expert files.
+> The prepared runtime bundle is estimated at approximately 42.7 GiB (shown as roughly 43 GB by `du`, below the 44 GB target); the downloaded 4-bit main-model source alone is approximately 41.8 GiB. The profile merged in [PR #1](https://github.com/AMOS144/Vates/pull/1) measured approximately 10.96 GiB of active MLX memory and an approximately 11.51 GiB MLX peak. These figures are not process RSS or total system memory, and they do not mean that a machine with only that much unified memory is sufficient. macOS, mapped files, native allocations, the filesystem cache, and other applications require additional headroom. Actual memory use and speed depend on hardware, prompt length, model files, and cache warmth. The repository does not include model weights.
 
 ## Demo
 
@@ -162,7 +162,7 @@ Preview the interface without preparing a model:
 vates --demo
 ```
 
-After preparing all four model assets below, launch the measured profile from the repository root:
+After preparing the runtime bundle below, launch the measured profile from the repository root:
 
 ```bash
 vates --stats
@@ -172,56 +172,51 @@ The public `vates` command installs the fixed profile before importing the model
 
 ## Data preparation
 
-The example below uses separate directories for intermediate per-expert files and the final runtime blobs:
+The supported path is one command. It downloads the official 4-bit MLX main model and the original Qwen MTP shard, converts them, performs a full output hash pass, verifies every recorded SHA-256 digest, and then deletes the original weight shards:
+
+```bash
+vates prepare --download
+```
+
+The command writes the runtime-ready `models/vates-runtime` directory:
 
 ```text
-models/
-├── qwen3_next_80b_4bit/                  # 4-bit MLX main model
-├── qwen3_next_expert_files_4bit_g64/     # Intermediate per-expert files
-├── qwen3_next_experts_4bit_g64/          # CLI default expert directory
-│   └── blobs/                            # Final runtime blobs
-├── qn_mtp_weights.safetensors            # Source MTP weights
-└── qn_mtp_experts_4bit_g64/               # Streamed 4-bit MTP experts
+models/vates-runtime/
+├── model/                 # Compact main-model core without routed experts
+├── experts/blobs/         # 48 direct-from-shard main expert blobs
+├── mtp/core.safetensors   # Compact MTP core
+├── mtp/experts/           # One 4-bit MTP expert blob
+└── vates_manifest.json    # Sizes and SHA-256 integrity records
 ```
 
-Expert weights must be converted into blobs where each expert occupies one contiguous byte range, allowing a runtime expert read to use a single `pread`.
+`vates prepare` never creates the old 24,576 per-expert intermediate files. It copies non-expert tensors into compact main-model shards while writing each stacked `switch_mlp` tensor directly to its final blob offset. MTP is split directly into a compact core and a 4-bit/group-64 expert blob. The current source headers give an estimated result of approximately 42.7 GiB (roughly 43 GB as shown by `du`), depending slightly on model metadata.
 
-Split the stacked `switch_mlp` weights from the main model into the intermediate per-expert directory:
+If the files were downloaded separately, use the Hugging Face CLI and then prepare them locally:
 
 ```bash
-.venv/bin/python -m mlx_streaming.prep.split_experts \
-  models/qwen3_next_80b_4bit \
-  models/qwen3_next_expert_files_4bit_g64
+hf download mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit \
+  --local-dir models/.vates-source/main
+
+hf download Qwen/Qwen3-Next-80B-A3B-Instruct \
+  model-00041-of-00041.safetensors \
+  --local-dir models/.vates-source/mtp
+
+vates prepare
 ```
 
-Pack those files into one contiguous blob per layer under the CLI's default expert directory, and generate `blob_index.json`. With the default `--expert-dir models/qwen3_next_experts_4bit_g64`, `model_builder.py` resolves runtime blobs from its `blobs/` subdirectory:
+Existing source locations can also be passed explicitly:
 
 ```bash
-EXPERT_DIR=models/qwen3_next_expert_files_4bit_g64 \
-BLOB_DIR=models/qwen3_next_experts_4bit_g64/blobs \
-BITS=4 GROUP=64 LAYERS=all \
-  .venv/bin/python -m mlx_streaming.prep.pack_blob_from_experts
+vates prepare \
+  --main-source /path/to/Qwen3-Next-80B-A3B-Instruct-4bit \
+  --mtp-source /path/to/model-00041-of-00041.safetensors
 ```
 
-Extract and organize MTP weights. This command downloads the original `model-00041-of-00041.safetensors` shard, approximately 3.30 GB (3.07 GiB), and writes the default `models/qn_mtp_weights.safetensors` output:
+> [!CAUTION]
+> Source cleanup is the default and occurs only after structural checks and output hash verification succeed. Use `--keep-source` if the original shards must remain. Existing output directories are never overwritten.
 
-```bash
-.venv/bin/python -m mlx_streaming.prep.extract_mtp
-```
-
-Split and quantize the MTP experts for the bounded 4-bit MTP pool used by the optimal profile:
-
-```bash
-.venv/bin/python -m mlx_streaming.tools.split_mtp_experts \
-  --bits 4 \
-  --group-size 64 \
-  --out models/qn_mtp_experts_4bit_g64
-```
-
-`mlx_streaming/prep/blob_layout.py` is the single definition of the byte layout and stays aligned with the runtime blob loader.
-
-> [!WARNING]
-> Data preparation needs substantially more disk space than the approximately 41 GB main-model directory alone. The split files and final blobs coexist during packing, and the MTP source shard adds approximately 3.30 GB (3.07 GiB). After validating `models/qwen3_next_experts_4bit_g64/blobs` and its `blob_index.json`, you may delete the intermediate `models/qwen3_next_expert_files_4bit_g64` directory. The 41 GB figure describes only the main-model weights, not peak preparation storage.
+> [!NOTE]
+> When downloading and converting in one run, allow roughly 90 GiB of temporary free space because source and output weights coexist before verification. After successful cleanup, only the approximately 42.7 GiB runtime bundle remains (plus negligible download metadata). This flow removes the former per-expert-file duplication, which pushed the old preparation layout to roughly 128 GB.
 
 ## Usage
 
@@ -282,10 +277,10 @@ TUI controls:
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `--model` | Path to the 4-bit MLX main model | `models/qwen3_next_80b_4bit` |
-| `--expert-dir` | Expert root directory; blobs are read from its `blobs/` subdirectory by default. If specifying the blob directory directly, set `BLOB_DIR` | `models/qwen3_next_experts_4bit_g64` |
-| `--mtp-out` | MTP weights file | `models/qn_mtp_weights.safetensors` |
-| `--qn-config` | Qwen3-Next configuration file | `models/qwen3_next_80b_4bit/config.json` |
+| `--model` | Path to the compact 4-bit MLX main-model core | `models/vates-runtime/model` |
+| `--expert-dir` | Expert root directory; blobs are read from its `blobs/` subdirectory by default. If specifying the blob directory directly, set `BLOB_DIR` | `models/vates-runtime/experts` |
+| `--mtp-out` | Compact MTP core file | `models/vates-runtime/mtp/core.safetensors` |
+| `--qn-config` | Qwen3-Next configuration file | `models/vates-runtime/model/config.json` |
 | `-k`, `--k` | MTP speculative width; fixed by the public CLI | `3` |
 | `-n`, `--max-tokens` | Maximum new tokens per turn | `4096` |
 | `--expert-slots` | Main-model expert-pool capacity; fixed by the public CLI | `152` |
@@ -350,7 +345,7 @@ The current production numbers come from the fixed profile merged in [PR #1](htt
 
 | Item | Result |
 | --- | --- |
-| Storage and memory | Main-model weights: approximately 41 GB on disk. Fixed profile: approximately 10.96 GiB active MLX memory and approximately 11.51 GiB MLX peak; neither is process RSS or total system memory. |
+| Storage and memory | Prepared runtime bundle: approximately 42.7 GiB (roughly 43 GB as shown by `du`) on disk. Fixed profile: approximately 10.96 GiB active MLX memory and approximately 11.51 GiB MLX peak; neither is process RSS or total system memory. |
 | Prefill | Reported independently as prompt tokens, seconds, and tokens/second. It is synchronous and excluded from the decode figure. Time to first token varies with uncached prompt length and SSD state. |
 | Steady decode | Approximately 31–37 tok/s in existing fixed 128-token steady-state runs; cache warmth and prompts materially affect the result. |
 | TUI overhead A/B | 31.65 tok/s with asynchronous TUI streaming versus 31.76 tok/s with streaming disabled in the same warm-pool comparison, a difference of approximately 0.35%. |
@@ -421,7 +416,7 @@ make -C native/ext PYTHON="$VATES_PYTHON" native_moe_ext
 <details>
 <summary><strong>Where should model files be placed?</strong></summary>
 
-The defaults are under `models/` at the repository root. The fixed profile also requires `models/qn_mtp_experts_4bit_g64`. Use `--model`, `--expert-dir`, `--mtp-out`, and `--qn-config` to select other main-model locations.
+Run `vates prepare --download`; the default bundle is `models/vates-runtime`. Set `VATES_RUNTIME_DIR` to relocate the whole bundle, or use `--model`, `--expert-dir`, `--mtp-out`, and `--qn-config` for individual paths.
 
 </details>
 

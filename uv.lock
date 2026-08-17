@@ -379,6 +379,7 @@ name = "mlx-streaming-moe"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "huggingface-hub" },
     { name = "mlx" },
     { name = "mlx-lm" },
     { name = "numpy" },
@@ -394,6 +395,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "huggingface-hub", specifier = ">=0.27" },
     { name = "mlx", specifier = ">=0.31" },
     { name = "mlx-lm", specifier = ">=0.31" },
     { name = "numpy", specifier = ">=2.0" },
