@@ -4,7 +4,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-**Run an 80B MoE model on Apple Silicon with about an 8.3 GiB MLX in-flight tensor-allocation high-water mark**
+**Run Qwen3-Next-80B-A3B on Apple Silicon with a reproducible, disk-streamed K=3 inference path**
 
 An out-of-core streaming MoE inference engine for MLX, with Qwen3-Next MTP self-speculative decoding.
 
@@ -30,7 +30,7 @@ The complete weights of a large Mixture-of-Experts (MoE) model often exceed the 
 vates targets **Qwen3-Next-80B-A3B 4-bit MLX**, which has 48 MoE transformer layers. Of those layers, 12 use full attention and the remaining 36 use linear attention. Each layer selects 10 routed experts from 512 and also uses a resident shared expert. vates uses the model's built-in MTP head for self-speculative decoding to improve generation throughput.
 
 > [!NOTE]
-> The 4-bit main-model weights occupy approximately 41 GB on disk. The approximately 8.23–8.27 GiB figure comes from MLX `get_peak_memory` results in the repository's benchmark reports and measures the in-flight tensor-allocation high-water mark for the reported configuration. It is not process RSS, total system memory use, or evidence that a machine with only that much unified memory has sufficient capacity. The end-to-end configuration was tested on a MacBook Pro with an Apple M5 (10-core CPU), 32 GB of physical unified memory, and a 1 TB internal Apple SSD. The system requires additional memory headroom for macOS and non-MLX allocations. Actual memory use and speed depend on hardware, context length, model files, and configuration. The repository does not include the main model, expert data, or MTP weights, and there is no single download location for all three.
+> The 4-bit main-model weights occupy approximately 41 GB on disk. The profile merged in [PR #1](https://github.com/AMOS144/Vates/pull/1) measured approximately 10.96 GiB of active MLX memory and an approximately 11.51 GiB MLX peak. These figures are not process RSS or total system memory, and they do not mean that a machine with only that much unified memory is sufficient. macOS, mapped files, native allocations, the filesystem cache, and other applications require additional headroom. Actual memory use and speed depend on hardware, prompt length, model files, and cache warmth. The repository does not include the main model, expert blobs, MTP weights, or streamed MTP expert files.
 
 ## Demo
 
@@ -40,15 +40,28 @@ Click the image below to play the demo:
 
 ## Features
 
-- **Low-memory inference:** streams expert weights from disk on demand while retaining only a small resident pool and an LFU side-region cache.
+- **Low-memory inference:** streams expert weights from disk on demand while retaining bounded main-model and MTP expert pools.
+- **Bounded Expert-major prefill:** groups prompt tokens by routed expert instead of materializing the old token-major activation path.
 - **MTP self-speculative decoding:** drafts tokens with Qwen3-Next's built-in MTP head, then batch-verifies them with the main model and either accepts or falls back.
-- **Zero-copy dual-source expert pool:** the capacity and side regions share one expert pool, with no pool-to-pool copy when selecting between those regions. Disk reads still copy expert bytes into the pool.
+- **Measured K=3 decode profile:** fixes the main-model pool, streamed 4-bit MTP pool, physical read budget, reranking policy, and prefetch targets as one reproducible configuration.
 - **Native benchmark-validated path:** a C++ extension handles parallel `pread`, pool-state management, predictive prefetching, and fused MoE computation.
 - **Long-context optimization:** IsoQuant K4/V3 with SO(4) block rotations reduces KV storage for a 128k context from approximately 3.0 GiB to approximately 0.68 GiB.
-- **Correctness checks:** runs capacity-invariance tests, byte-level pool-oracle checks, and the full test suite for the configurations covered by the repository's reports.
-- **Interactive terminal:** includes a full-screen Textual TUI, a plain-text REPL, streaming output, and throughput and memory status.
+- **Correctness checks:** includes targeted regression tests, capacity-invariance checks, byte-level pool oracles, and a 32K prefill validator.
+- **Nonblocking interactive terminal:** detokenization and Textual rendering run outside the inference hot path; the TUI reports prefill and decode separately.
 
 ## Architecture and data flow
+
+Each turn has two separately timed phases with different I/O policies:
+
+```text
+prompt → PREFILL → first-token boundary → DECODE → token stream
+           │                              │
+           ├─ Expert-major MoE             ├─ K=3 MTP draft + batch verify
+           ├─ synchronous expert reads     ├─ async demand + native prefetch
+           └─ build KV/recurrent state     └─ nonblocking detokenizer + TUI
+```
+
+Both phases use the same disk-backed native runtime stack:
 
 ```text
 ┌──────────────────────────────────────────────────────────────┐
@@ -70,11 +83,27 @@ Click the image below to play the demo:
 
 Core mechanisms:
 
-1. **Zero-copy dual-source pool:** each layer maintains a capacity region and a persistent LFU side region inside one unified expert pool. Selecting experts from either region requires no pool-to-pool copy; loading a miss from SSD into the pool is still a data transfer.
+1. **Bounded expert pools:** the main model uses a checked-in per-layer capacity profile and MTP uses a separate 256-slot 4-bit pool. Missing experts are loaded from SSD into those pools.
 2. **Unified C++ pool state:** the native extension owns slot state, eviction, demand reads, and prefetching, reducing synchronization work on the Python main thread.
 3. **Predictive cross-layer prefetching:** routing results from the current layer predict experts needed by later layers, allowing reads to overlap computation.
 4. **Adaptive-depth MTP:** draft confidence controls verification depth, avoiding unnecessary expert loads during low-confidence steps.
 5. **KV quantization:** only the 12 full-attention layers have their KV caches compressed; recurrent state in the linear-attention layers remains unchanged.
+
+### Prefill: ingest the prompt
+
+Prefill processes the entire uncached prompt and builds the KV cache and linear-attention recurrent state needed by generation. Its route unions are much wider than decode, so the production path deliberately keeps expert demand **synchronous** during this phase.
+
+The Expert-major implementation groups tokens by routed expert and reuses one bounded transient bank. This avoids the old token-major large-activation path and makes memory use depend on the fixed superblock rather than growing unchecked with prompt length. The implementation preserves canonical route-rank accumulation order for deterministic reduction. A dedicated 32K-boundary validator compares logits, hidden state, argmax, cache offsets, and memory across runs.
+
+Prefill latency is time to first token, not decode throughput. The CLI and TUI report prefill tokens, seconds, and tokens/second separately. In a multi-turn chat, a valid prefix cache means only the newly appended suffix is prefetched; if the prefix is not authoritative, the cache is discarded and the prompt is rebuilt.
+
+### Decode: generate new tokens
+
+At the exact prefill/decode boundary, the fixed profile enables asynchronous expert demand and predictive cross-layer prefetch. Decode uses Qwen3-Next's streamed 4-bit MTP experts to draft up to K=3 tokens, then batch-verifies them with the main model. Only target-verified tokens are committed; low-confidence steps can stop at a shallower adaptive depth.
+
+The main-model expert pool uses a checked-in per-layer capacity profile, native C++ pool state, batched `preadv` demand reads, reranked prefetch candidates, and a physical SSD-read budget. K4/V3 rotated KV quantization applies only to the 12 full-attention layers; the 36 linear-attention recurrent states remain unquantized.
+
+Decode throughput uses the engine's decode-only `wall_s`, which starts after prefill. Token detokenization runs in a separate thread and publishes the latest text snapshot to the TUI without backpressure; final text is reconciled from the complete authoritative token sequence.
 
 ## Tech stack
 
@@ -115,11 +144,11 @@ uv sync
 source .venv/bin/activate
 ```
 
-Build the native extension used by the benchmark-validated path. The Makefile's default `PY_SITE` is version-specific, so derive the active virtual environment's `purelib` path and override it:
+Build the native extension with the virtual environment's Python. Pass an absolute path because `make -C` changes the working directory before evaluating the Makefile:
 
 ```bash
-PY_SITE="$("./.venv/bin/python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
-make -C native/ext PY_SITE="$PY_SITE" native_moe_ext
+VATES_PYTHON="$PWD/.venv/bin/python"
+make -C native/ext PYTHON="$VATES_PYTHON" native_moe_ext
 ```
 
 > [!TIP]
@@ -133,11 +162,13 @@ Preview the interface without preparing a model:
 vates --demo
 ```
 
-After preparing the model and expert data, run this from the repository root:
+After preparing all four model assets below, launch the measured profile from the repository root:
 
 ```bash
-vates
+.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 --chat --stats
 ```
+
+This launcher installs the fixed profile before importing the model runtime. Running bare `vates` uses the configurable generic CLI and is not the same benchmark configuration.
 
 ## Data preparation
 
@@ -149,7 +180,8 @@ models/
 ├── qwen3_next_expert_files_4bit_g64/     # Intermediate per-expert files
 ├── qwen3_next_experts_4bit_g64/          # CLI default expert directory
 │   └── blobs/                            # Final runtime blobs
-└── qn_mtp_weights.safetensors            # MTP weights
+├── qn_mtp_weights.safetensors            # Source MTP weights
+└── qn_mtp_experts_4bit_g64/               # Streamed 4-bit MTP experts
 ```
 
 Expert weights must be converted into blobs where each expert occupies one contiguous byte range, allowing a runtime expert read to use a single `pread`.
@@ -177,6 +209,15 @@ Extract and organize MTP weights. This command downloads the original `model-000
 .venv/bin/python -m mlx_streaming.prep.extract_mtp
 ```
 
+Split and quantize the MTP experts for the bounded 4-bit MTP pool used by the optimal profile:
+
+```bash
+.venv/bin/python -m mlx_streaming.tools.split_mtp_experts \
+  --bits 4 \
+  --group-size 64 \
+  --out models/qn_mtp_experts_4bit_g64
+```
+
 `mlx_streaming/prep/blob_layout.py` is the single definition of the byte layout and stays aligned with the runtime blob loader.
 
 > [!WARNING]
@@ -188,22 +229,24 @@ Extract and organize MTP weights. This command downloads the original `model-000
 
 Run all commands from the repository root.
 
-Start the full-screen TUI:
+Start the full-screen TUI with the fixed K=3 profile:
 
 ```bash
-vates
+.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 --chat
 ```
 
-Set the MTP speculative width and generation length, and print statistics:
+Set the generation length and print separate prefill/decode statistics:
 
 ```bash
-vates -k 4 -n 800 --stats
+.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 \
+  --chat -n 800 --stats
 ```
 
 Set a system prompt:
 
 ```bash
-vates --system "You are a concise assistant."
+.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 \
+  --chat --system "You are a concise assistant."
 ```
 
 Preview the interface without loading a model:
@@ -215,7 +258,8 @@ vates --demo
 Use the plain-text REPL when the terminal is incompatible with the TUI:
 
 ```bash
-vates chat --plain
+.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 \
+  --chat --plain --stats
 ```
 
 Without activating the virtual environment, run either:
@@ -245,10 +289,10 @@ TUI controls:
 | `--expert-dir` | Expert root directory; blobs are read from its `blobs/` subdirectory by default. If specifying the blob directory directly, set `BLOB_DIR` | `models/qwen3_next_experts_4bit_g64` |
 | `--mtp-out` | MTP weights file | `models/qn_mtp_weights.safetensors` |
 | `--qn-config` | Qwen3-Next configuration file | `models/qwen3_next_80b_4bit/config.json` |
-| `-k`, `--k` | MTP speculative width | `3` |
+| `-k`, `--k` | MTP speculative width; keep at the validated value | `3` |
 | `-n`, `--max-tokens` | Maximum new tokens per turn | `4096` |
-| `--expert-slots` | Resident expert-pool capacity | `32` |
-| `--spec-slots` | Number of side-region rows | Same as `--expert-slots` |
+| `--expert-slots` | Main-model expert-pool capacity; fixed by the launcher | `152` |
+| `--spec-slots` | Legacy side-region rows; fixed by the launcher | `0` |
 | `--system` | System prompt | None |
 | `--stats` | Print token count, throughput, and accepted length | Off |
 | `--plain` | Use the plain-text REPL | Off |
@@ -257,34 +301,21 @@ TUI controls:
 View the complete option set for the installed version:
 
 ```bash
-vates chat --help
+.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 --chat --help
 ```
 
 ## Configuration
 
-The CLI uses `setdefault` to select the benchmark-validated configuration. Explicitly defined environment variables therefore take precedence.
+`mlx_streaming.runtime.run_qwen_k3_sub10` is the authority for the measured profile. It deliberately overwrites performance-related environment variables so a stale shell cannot silently alter the result. Its key contract is:
 
-| Environment variable | Production default | Purpose |
-| --- | --- | --- |
-| `STREAM_BLOB_LOADER` | `1` | Handle expert-pool misses with direct blob reads |
-| `ZEROCOPY_DUAL_SOURCE` | `1` | Enable the zero-copy dual-source expert pool |
-| `NATIVE_FUSED_PREFETCH` | `1` | Enable native predictive cross-layer prefetching |
-| `SIDEREGION_LFU` | `1` | Enable the persistent LFU side-region cache |
-| `KV_QUANT` | `1` | Enable K4/V3 KV quantization with SO(4) rotations |
-| `MTP_ADAPTIVE_DEPTH` | `1` | Enable confidence-gated adaptive depth |
-| `MTP_CONF_TAU` | `0.3` | Adaptive-depth confidence threshold |
-| `MTP_DEPTH_MAX` | `3` | Maximum adaptive depth |
+- **Prefill:** Expert-major prompt ingestion, synchronous demand, and a fixed bounded superblock;
+- **Decode:** K=3 batch MTP verification, adaptive depth capped at 3, and asynchronous demand after the phase boundary;
+- streamed 4-bit MTP experts with 256 MTP slots;
+- a 152-slot main pool plus checked-in per-layer capacity overrides;
+- K4/V3 rotated KV quantization; and
+- native predictive prefetch with fixed reranking, target-layer, and physical-read-budget policies.
 
-For example, explicitly override the resident-pool and side-region capacities:
-
-```bash
-EXPERT_SLOTS=32 POOL_SPEC_SLOTS=16 vates --stats
-```
-
-See `mlx_streaming/config.py` for additional experimental switches and their defaults.
-
-> [!WARNING]
-> `EXPERT_SLOTS` affects memory use, speed, and correctness. For K=3 and top-k=10, the default configuration uses `32` as the validated capacity floor. Rerun capacity-invariance and byte-level pool-oracle checks after changing it. The cap=48 unified-pool ablation below is a separate experiment, not the CLI default.
+Model paths, the system prompt, and the maximum generated-token count remain CLI options. Use bare `vates` only when intentionally experimenting with other pool sizes or environment switches. Results from that generic path must not be presented as measurements of the fixed profile.
 
 ## Repository layout
 
@@ -318,26 +349,25 @@ See `mlx_streaming/config.py` for additional experimental switches and their def
 
 ## Benchmarks, correctness, and rejected experiments
 
-The figures below come from the ablation reports in this repository. Each ablation was measured in an independent experiment; the results were not obtained in one common hardware run and **must not be added together**. The observed 13–15 tok/s range comes from several end-to-end experiments with different configurations, prompts, warmup lengths, and output lengths. It is not a single standardized benchmark. Actual performance depends on the device, model files, context, and configuration.
-
-**End-to-end production configuration test device:** MacBook Pro, Apple M5 (10-core CPU), 32 GB of physical unified memory, and a 1 TB internal Apple SSD.
+The current production numbers come from the fixed profile merged in [PR #1](https://github.com/AMOS144/Vates/pull/1). Older reports under `benchmarks/reports/` are independent ablations with different pool sizes, prompts, warmup lengths, and clocks; their gains **must not be added together**.
 
 | Item | Result |
 | --- | --- |
-| Storage and memory | 4-bit main-model weights: approximately 41 GB on disk; reported configuration: approximately 8.23–8.27 GiB from MLX `get_peak_memory`, measuring the in-flight tensor-allocation high-water mark—not process RSS or total system memory. Additional system headroom is required. See the [peak-memory report](benchmarks/reports/peak-shrink-2026-07-03.md). |
-| Observed generation range | Approximately 13–15 tok/s across several end-to-end experiments; configurations, prompts, warmup lengths, and output lengths differ, so this is not a standardized benchmark |
+| Storage and memory | Main-model weights: approximately 41 GB on disk. Fixed profile: approximately 10.96 GiB active MLX memory and approximately 11.51 GiB MLX peak; neither is process RSS or total system memory. |
+| Prefill | Reported independently as prompt tokens, seconds, and tokens/second. It is synchronous and excluded from the decode figure. Time to first token varies with uncached prompt length and SSD state. |
+| Steady decode | Approximately 31–37 tok/s in existing fixed 128-token steady-state runs; cache warmth and prompts materially affect the result. |
+| TUI overhead A/B | 31.65 tok/s with asynchronous TUI streaming versus 31.76 tok/s with streaming disabled in the same warm-pool comparison, a difference of approximately 0.35%. |
+| Decode clock | Uses the engine's decode-only `wall_s`, which starts after prefill; detokenization and UI rendering do not run on the inference hot path. |
 | KV storage | Approximately 3.0 GiB to approximately 0.68 GiB at 128k context |
-| Persistent LFU | Hit rate from 0.76 to approximately 0.81; measured throughput gain of approximately 8%–12% |
-| Unified C++ pool ablation | With cap=48, K=3, MAXTOK=48, WARMUP=48, and REPEAT=2: 13.70 to 14.80 tok/s; the side region changed from double buffering to single buffering. This cap differs from the default cap=32. See the [unified-pool report](benchmarks/reports/cpp-unified-pool-final-2026-07-04.md). |
-| MTP top-2 rescue | Approximately 10.8% throughput gain with zero output mismatches on the deterministic greedy prompts and configurations covered by the [top-2 rescue report](benchmarks/reports/tree-top2-rescue-2026-07-05.md) |
-| Adaptive-depth MTP | Approximately 5%–6% throughput gain with zero output mismatches on the deterministic greedy prompts and configurations covered by the [adaptive-depth report](benchmarks/reports/adaptive-depth-2026-07-05.md) |
-| Peak optimization | Avoiding unnecessary KV snapshots reduced the MLX allocation high-water mark by approximately 0.18–0.22 GiB |
+| Long-prefill validation | Includes a 32K-boundary tool that compares logits, hidden state, argmax, cache offsets, and memory between runs. |
 
 Correctness validation includes:
 
 - byte-for-byte identical output for the deterministic greedy prompts and configurations exercised by the capacity-invariance reports;
 - `0 BAD` as the acceptance condition for the byte-level pool-oracle checks `DUAL_VERIFY` and `STG_VERIFY` in the reports that used them;
-- a measured maximum per-layer routed-expert union of 30 in a single forward pass, which is why the default configuration uses 32 slots; and
+- deterministic Expert-major route reduction that preserves canonical route-rank accumulation order;
+- main-model batch verification that commits only target-verified tokens;
+- final TUI text reconciled from the complete authoritative token sequence; and
 - test coverage for both Python and native paths.
 
 These oracles cover the documented deterministic greedy prompts, pool states, and benchmark configurations. They are regression evidence for those cases, not a mathematical guarantee of byte-identical output for every prompt, decoding mode, hardware state, or configuration.
@@ -354,7 +384,7 @@ After installing development dependencies, run the complete Python test suite:
 .venv/bin/python -m pytest
 ```
 
-The repository currently contains 60 test files covering expert pools, dual-source caching, blob layout, MTP, KV quantization, the TUI, configuration, and related modules. The benchmarked path is also validated with native tests, capacity-invariance checks, and byte-level pool-oracle checks.
+The suite covers Expert-major prefill, expert pools, blob layout, MTP, KV quantization, predictive prefetch, native I/O, the fixed launcher, the TUI, and streaming detokenization. The benchmarked path is also validated with native tests, capacity-invariance checks, byte-level pool-oracle checks, and the 32K prefill validator.
 
 ## FAQ
 
@@ -368,18 +398,18 @@ The project is built on MLX and depends on Apple Silicon's unified-memory archit
 <details>
 <summary><strong>Why do I get <code>vates: command not found</code>?</strong></summary>
 
-`vates` is installed in `.venv/bin/`. Run `source .venv/bin/activate` first, or invoke `.venv/bin/vates` directly. If the virtual environment was moved or renamed after creation, rebuild it with `uv venv --clear && uv sync`.
+`vates` is installed in `.venv/bin/`. Run `source .venv/bin/activate` first, or invoke `.venv/bin/vates` directly. The measured profile can always be launched with `.venv/bin/python -m mlx_streaming.runtime.run_qwen_k3_sub10 --chat`. If the virtual environment was moved or renamed after creation, rebuild it with `uv venv --clear && uv sync`.
 
 </details>
 
 <details>
 <summary><strong>Can vates run without compiling the native extension?</strong></summary>
 
-It can fall back to a slower path, but native features such as predictive prefetching and the unified pool will be disabled. For real inference, derive the virtual environment's Python library path and pass it to Make:
+It can fall back to a slower path, but native features such as predictive prefetching and the unified pool will be disabled. For real inference, pass the virtual environment's Python executable to Make:
 
 ```bash
-PY_SITE="$("./.venv/bin/python" -c 'import sysconfig; print(sysconfig.get_path("purelib"))')"
-make -C native/ext PY_SITE="$PY_SITE" native_moe_ext
+VATES_PYTHON="$PWD/.venv/bin/python"
+make -C native/ext PYTHON="$VATES_PYTHON" native_moe_ext
 ```
 
 </details>
@@ -394,7 +424,7 @@ make -C native/ext PY_SITE="$PY_SITE" native_moe_ext
 <details>
 <summary><strong>Where should model files be placed?</strong></summary>
 
-The defaults are under `models/` at the repository root. Use `--model`, `--expert-dir`, `--mtp-out`, and `--qn-config` to select other locations.
+The defaults are under `models/` at the repository root. The fixed profile also requires `models/qn_mtp_experts_4bit_g64`. Use `--model`, `--expert-dir`, `--mtp-out`, and `--qn-config` to select other main-model locations.
 
 </details>
 
