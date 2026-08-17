@@ -1,7 +1,7 @@
 # 生产 MLX 扩展构建：cmake 把 native_moe_mlx_ext.cpp 编成
 # mlx_streaming/native_moe_ext$(EXT_SUFFIX).so（nanobind + MLX Primitive）。
-PYTHON ?= ../../.venv/bin/python
-PY_SITE := $(abspath ../../.venv/lib/python3.12/site-packages)
+PYTHON ?= python3
+PY_SITE := $(shell $(PYTHON) -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
 NANOBIND_DIR := $(shell $(PYTHON) -m nanobind --cmake_dir)
 MLX_CMAKE_DIR := $(PY_SITE)/mlx/share/cmake/MLX
 

@@ -1,4 +1,4 @@
-"""native-fused-prefetch 的 miss→hit 落地：per-layer 环形 staging buffer + 池 promote。
+"""native-fused-prefetch 的 miss→hit 落地：全局多-bank staging。
 
 机制（预读 IO 全在 GPU 完成回调里、主线程零 pread/零 .tolist/零 np→mx.array）：
 - submit(layer, inds_lazy)：取该层环里的一块 buffer，调 prefetch_into_staging →
@@ -6,14 +6,8 @@
 - promote(layer, store)：读 C++ 记录（纯锁）→ 按 gen 取回 handler 真正写过的那块 buffer →
   惰性切片直接 _place_expert 写进池槽（不 eval，避免每层 host 同步拖慢 verify 流水线）。
 
-为何必须 per-layer（而非全局共享小环）：预读在 GPU 完成回调里异步发生，且 batched verify
-是「整块前向、最后一次 eval」——同一前向里全部 48 层的 submit 都在飞行，其 handler 可能要到
-接近末尾才触发。若用全局小环，buffer 会在它的 handler 落地/promote 消费**之前**就被后续层的
-submit 复用、被 handler 覆盖成别层数据（gen 匹配只保证 buffer 对象、保证不了内容新鲜）→ 非确定性
-串扰损坏（实测全局环 n_mismatch=60~85）。所以每层各留独立 buffer，环大小只用于跨 token 复用。
-
-内存 = 层数 × ring × budget × stride。ring 默认从 4 降到 2（STAGING_RING），在保持逐位精确的前提下
-把 staging 占用减半（48×2×budget×stride）。
+每个bank从submit开始由(layer,generation)独占，直到目标demand晋升或迟到任务被回收；
+资源不足时安全跳过预取，绝不覆盖在途字节。内存与层数无关。
 """
 import os
 import time
@@ -57,23 +51,33 @@ def route_used_subset(cand: "list[int]", route_inds: mx.array, num_experts: int)
 
 
 class NativeStagingManager:
-    """per-layer 环形 staging：每层 ring 块 buffer 轮转，按 gen 严格匹配回收。
-
-    submit 写 ring[layer][rr]、记 (gen→buffer)；C++ handler 按 gen 原子记 (expert→row)；
-    promote 按 gen 取回**正是 handler 写过**的那块 buffer。只要某层的 buffer 在该层下一次（ring 个
-    submit 之后）被复用前，其 handler 已落地且 promote 的惰性切片已随本前向 eval 被消费，即不串扰。
-    """
+    """全局多-bank staging，支持同一目标的 early + refinement 两次提交。"""
     def __init__(self, blob_source, budget: int, ring: int | None = None):
         self.src = blob_source            # BlobExpertSource：有 dir / stride / _segs
         self.budget = int(budget)
+        self.read_budget = max(
+            1, min(
+                self.budget,
+                int(os.environ.get("GLOBAL_STAGING_READ_SLOTS", self.budget)),
+            ),
+        )
         self.stride = int(blob_source.stride)
-        # 安全下限=2：MTP 每步 verify+replay 会对同层各 submit 一次（2 个在飞），ring=1 实测串扰损坏。
-        self.ring = max(2, int(ring) if ring is not None else config.staging_ring())
-        self._ring: "dict[int, list]" = {}     # layer -> [mx.array]*ring
-        self._rr: "dict[int, int]" = {}        # layer -> 下一个要写的环索引
+        self.ring = max(
+            2, int(ring) if ring is not None else config.global_staging_banks(),
+        )
+        self._banks: "list[mx.array] | None" = None
+        self._bank_owner: "list[tuple[int, int, str, int] | None]" = [
+            None for _ in range(self.ring)
+        ]
+        self._gen_bank: "dict[int, int]" = {}
+        self._layer_gens: "dict[int, list[int]]" = {}
         self._gen = 1                          # 全局单调 generation
         self._gen_buf: "dict[int, mx.array]" = {}  # gen -> 该次 submit 写的 buffer
+        self._late_promoter = None
         self.submitted = 0
+        self.host_ready_ids = 0
+        self.skipped_no_bank = 0
+        self.max_busy_banks = 0
         self.promoted = 0
         # 诊断用:每层最近一次 promote take 到的"已就绪(C++ pread 完成)专家集"。
         # miss_attrib 据此把 miss_A 拆成 时序(不在就绪集) / 驱逐(在就绪集但 acquire 前已不在池)。
@@ -82,19 +86,79 @@ class NativeStagingManager:
         # 供消费侧字节校验定位「损坏来自哪一代 staging」。默认不影响主路径(只是写 dict)。
         self.placed_gen: "dict[tuple, int]" = {}
 
-    def _bufs(self, layer: int) -> list:
-        bl = self._ring.get(layer)
-        if bl is None:
-            bl = []
-            for _ in range(self.ring):
-                a = mx.zeros((self.budget, self.stride), dtype=mx.uint8)
-                mx.eval(a)
-                bl.append(a)
-            self._ring[layer] = bl
-            self._rr[layer] = 0
-        return bl
+    def reset_stats(self) -> None:
+        self.submitted = 0
+        self.host_ready_ids = 0
+        self.promoted = 0
+        self.skipped_no_bank = 0
+        self.max_busy_banks = sum(
+            owner is not None for owner in self._bank_owner
+        )
 
-    def submit(self, layer: int, inds_lazy: mx.array, resident: "list[int] | None" = None):
+    def _bufs(self, layer: int) -> list:
+        del layer
+        if self._banks is None:
+            self._banks = []
+            for _ in range(self.ring):
+                a = mx.zeros((self.read_budget, self.stride), dtype=mx.uint8)
+                mx.eval(a)
+                self._banks.append(a)
+        return self._banks
+
+    def register_late_promoter(self, promoter) -> None:
+        self._late_promoter = promoter
+
+    def _release_bank(self, bank: int) -> None:
+        owner = self._bank_owner[int(bank)]
+        if owner is None:
+            return
+        layer, gen, _state, _forward_id = owner
+        try:
+            import mlx_streaming.native_moe_ext as native
+            native.prefetch_staging_forget(int(layer), int(gen))
+        except (ImportError, AttributeError):
+            # Unit-test fakes and non-native inspection paths need no cleanup.
+            pass
+        self._gen_bank.pop(gen, None)
+        self._gen_buf.pop(gen, None)
+        gens = self._layer_gens.get(layer, [])
+        if gen in gens:
+            gens.remove(gen)
+        if not gens:
+            self._layer_gens.pop(layer, None)
+        self._bank_owner[int(bank)] = None
+
+    def _reap_missed(self) -> None:
+        import mlx_streaming.native_moe_ext as native
+        for bank, owner in enumerate(tuple(self._bank_owner)):
+            if owner is None or owner[2] not in ("missed", "attached"):
+                continue
+            layer, gen, _state, _forward_id = owner
+            if _state == "attached":
+                if (native.prefetch_staging_consumed(layer, gen)
+                        and native.prefetch_staging_finished(layer, gen)):
+                    self._release_bank(bank)
+                continue
+            flat = native.prefetch_staging_take(layer, gen)
+            finished = native.prefetch_staging_finished(layer, gen)
+            staging = self._gen_buf.get(gen)
+            if (
+                config.prefetch_staging_late_promote()
+                and flat and len(flat) > 1
+                and self._late_promoter is not None and staging is not None
+            ):
+                self._late_promoter(
+                    int(layer), staging, [int(value) for value in flat[1:]],
+                )
+            if finished:
+                self._release_bank(bank)
+
+    def submit(
+        self, layer: int, inds_lazy: mx.array,
+        resident: "list[int] | None" = None, *, source_layer=-1,
+        forward_id=-1, stream=None,
+        priority=0,
+    ):
         """方案B：inds_lazy 为"预测宽集合"(lazy uint32 [N]，按门控分降序，N 可远大于 budget)。
 
         resident：目标层提交时刻的常驻专家快照（host 侧）。C++ 回调按 resident 过滤、再按降序
@@ -102,23 +166,158 @@ class NativeStagingManager:
         """
         import mlx_streaming.native_moe_ext as _N
         layer = int(layer)
+        self._reap_missed()
         bufs = self._bufs(layer)
-        rr = self._rr[layer]
-        buf = bufs[rr]
-        self._rr[layer] = (rr + 1) % self.ring
+        busy = sum(owner is not None for owner in self._bank_owner)
+        self.max_busy_banks = max(self.max_busy_banks, busy)
+        bank = next(
+            (index for index, owner in enumerate(self._bank_owner)
+             if owner is None),
+            None,
+        )
+        if bank is None:
+            self.skipped_no_bank += 1
+            return None
+        buf = bufs[bank]
         gen = self._gen
         self._gen += 1
+        self._bank_owner[bank] = (
+            layer, gen, "reserved", int(forward_id),
+        )
+        self._gen_bank[gen] = bank
+        self._layer_gens.setdefault(layer, []).append(gen)
         self._gen_buf[gen] = buf
-        if len(self._gen_buf) > self.ring * 64:
-            for g in sorted(self._gen_buf)[:len(self._gen_buf) - self.ring * 64]:
-                self._gen_buf.pop(g, None)
-        path = f"{self.src.dir}/layer{layer:02d}.blob"
+        path = (
+            self.src.native_blob_path(layer)
+            if hasattr(self.src, "native_blob_path")
+            else f"{self.src.dir}/layer{layer:02d}.blob"
+        )
         self.submitted += 1
         res = [int(e) for e in (resident or [])]
-        # cap=self.budget：回调最多往 buffer 写 budget 行（覆盖缺口分布，p99≈15 → budget=16 够）。
+        # Physical bank rows are independent from the target pool's bounded
+        # speculative-admission allowance.
+        kwargs = {"stream": stream} if stream is not None else {}
         return _N.prefetch_into_staging(
-            buf, inds_lazy, layer, gen, path, self.stride, res, self.budget,
-            config.staging_pread_parallel())
+            buf, inds_lazy, layer, gen, path, self.stride, res, self.read_budget,
+            config.staging_pread_parallel(), int(source_layer), int(forward_id),
+            int(priority),
+            **kwargs)
+
+    def submit_ready_ids(
+        self, layer: int, expert_ids, resident=None, *, source_layer=-1,
+        forward_id=-1,
+    ) -> bool:
+        """Start a staging read for IDs already materialized by source demand."""
+        values = [int(value) for value in expert_ids]
+        if not values:
+            return False
+        import mlx_streaming.native_moe_ext as native
+
+        layer = int(layer)
+        self._reap_missed()
+        bufs = self._bufs(layer)
+        busy = sum(owner is not None for owner in self._bank_owner)
+        self.max_busy_banks = max(self.max_busy_banks, busy)
+        bank = next(
+            (index for index, owner in enumerate(self._bank_owner)
+             if owner is None),
+            None,
+        )
+        if bank is None:
+            self.skipped_no_bank += 1
+            return False
+        gen = self._gen
+        self._gen += 1
+        buf = bufs[bank]
+        self._bank_owner[bank] = (
+            layer, gen, "reserved", int(forward_id),
+        )
+        self._gen_bank[gen] = bank
+        self._layer_gens.setdefault(layer, []).append(gen)
+        self._gen_buf[gen] = buf
+        path = (
+            self.src.native_blob_path(layer)
+            if hasattr(self.src, "native_blob_path")
+            else f"{self.src.dir}/layer{layer:02d}.blob"
+        )
+        self.submitted += 1
+        native.prefetch_staging_ready_ids(
+            buf, values, layer, gen, path, self.stride,
+            [int(value) for value in (resident or ())], self.read_budget,
+            config.staging_pread_parallel(), int(source_layer),
+            int(forward_id), 0,
+        )
+        self.host_ready_ids += len(values)
+        return True
+
+    def wait_for_demand(self, forward_id: int, layer: int, expert_ids) -> None:
+        """Join only real-route experts already pending in early/refinement."""
+        import mlx_streaming.native_moe_ext as native
+
+        native.prefetch_staging_wait_experts(
+            int(forward_id), int(layer), expert_ids,
+        )
+
+    @staticmethod
+    def note_prejoin(forward_id: int, layer: int, expert_ids) -> None:
+        import mlx_streaming.native_moe_ext as native
+
+        native.prefetch_staging_note_prejoin(
+            int(forward_id), int(layer), expert_ids,
+        )
+
+    @staticmethod
+    def finish_demand(forward_id: int, layer: int) -> None:
+        import mlx_streaming.native_moe_ext as native
+
+        native.prefetch_staging_finish_demand(int(forward_id), int(layer))
+
+    def take_ready(self, layer: int):
+        """Return ready bank leases after the target route synchronization."""
+        import mlx_streaming.native_moe_ext as native
+        layer = int(layer)
+        leases = []
+        for gen in tuple(self._layer_gens.get(layer, ())):
+            bank = self._gen_bank.get(gen)
+            if bank is None:
+                continue
+            flat = native.prefetch_staging_take(layer, gen)
+            if not flat:
+                self._bank_owner[bank] = (
+                    layer, gen, "missed", int(self._bank_owner[bank][3]),
+                )
+                continue
+            pairs = [int(value) for value in flat[1:]]
+            self.last_ready.setdefault(layer, set()).update(pairs[0::2])
+            finished = native.prefetch_staging_finished(layer, gen)
+            if not finished:
+                self._bank_owner[bank] = (
+                    layer, gen, "missed", int(self._bank_owner[bank][3]),
+                )
+            leases.append((bank, self._gen_buf[gen], pairs, finished))
+        return leases
+
+    def attach_for_demand(self, layer: int, forward_id: int):
+        """Attach target banks without inspecting readiness during graph build."""
+        layer = int(layer)
+        forward_id = int(forward_id)
+        leases = []
+        for gen in tuple(self._layer_gens.get(layer, ())):
+            bank = self._gen_bank.get(gen)
+            if bank is None:
+                continue
+            owner = self._bank_owner[bank]
+            if (owner is None or owner[2] != "reserved"
+                    or int(owner[3]) != forward_id):
+                continue
+            self._bank_owner[bank] = (
+                layer, gen, "attached", forward_id,
+            )
+            leases.append((bank, self._gen_buf[gen], int(gen)))
+        return leases
+
+    def release(self, bank: int) -> None:
+        self._release_bank(int(bank))
 
     def promote(self, layer: int, store, used: "set[int] | None" = None,
                 route_inds: "mx.array | None" = None,
@@ -186,7 +385,10 @@ class NativeStagingManager:
         return placed
 
     # ---- zero-copy 双源解码：池侧区直接散写（C++ 维护侧区 e→物理行） ----
-    def submit_pool_sideregion(self, layer, pred, resident, pool_list, base_row, gen=0):
+    def submit_pool_sideregion(
+        self, layer, pred, resident, pool_list, base_row, gen=0, *,
+        source_layer=-1, forward_id=-1, priority=0, stream=None,
+    ):
         """zero-copy 预取：触发 C++ 把预读专家段散写进池侧区行（填代 gen）。pool_list 为 _segs 顺序的 per-key 池数组。
         seg_nbytes 取自 blob 段表（与 pool key 顺序一致）。spec_slots = 侧区行数（=self.budget）。"""
         import mlx_streaming.native_moe_ext as _N
@@ -195,9 +397,32 @@ class NativeStagingManager:
         path = f"{self.src.dir}/layer{layer:02d}.blob"
         self.submitted += 1
         res = [int(e) for e in (resident or [])]
+        kwargs = {}
+        if stream is not None:
+            kwargs["stream"] = stream
         return _N.prefetch_pool_sideregion(
             pool_list, seg_nbytes, pred, layer, path, self.stride, res,
-            int(self.budget), int(base_row), gen=int(gen))
+            int(self.budget), int(base_row), gen=int(gen),
+            source_layer=int(source_layer), forward_id=int(forward_id),
+            priority=int(priority), **kwargs)
+
+    def submit_unified_ready(
+        self, layer, expert_ids, resident, pool_list, *, source_layer,
+        forward_id, real_cap,
+    ):
+        """Submit already-materialized IDs without an MLX callback primitive."""
+        import mlx_streaming.native_moe_ext as _N
+        layer = int(layer)
+        seg_nbytes = [int(nb) for *_, nb in self.src._segs]
+        path = f"{self.src.dir}/layer{layer:02d}.blob"
+        self.submitted += 1
+        self.host_ready_ids = getattr(self, "host_ready_ids", 0) + len(expert_ids)
+        _N.prefetch_unified_ready_ids(
+            pool_list, seg_nbytes, [int(value) for value in expert_ids],
+            layer, path, int(self.stride),
+            [int(value) for value in (resident or ())], int(self.budget),
+            int(real_cap), int(source_layer), int(forward_id),
+        )
 
     def sideregion_contents(self, layer, gen=0):
         """读该层某代 C++ 侧区缓存当前内容 {expert: 物理侧区行}（纯锁，不消费）。"""

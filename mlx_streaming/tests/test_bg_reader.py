@@ -22,7 +22,9 @@ def test_bg_reader_reads_correct_bytes():
         # 把专家 2→行0、专家0→行1、专家3→行2 读进 dst
         N.bg_reader_submit(dst, [2, 0, 3], [0, 1, 2], path, stride, 100)
         N.bg_reader_wait(100)
-        assert N.bg_reader_ready(100) is True
+        # wait consumes the completion ticket; ready only reports an
+        # unconsumed completion and must be false after wait returns.
+        assert N.bg_reader_ready(100) is False
         arr = np.array(dst)                           # 读 dst 当前 buffer（应见 C++ 写入的字节）
         assert int(arr[0, 0]) == 2 and int(arr[0, -1]) == 2
         assert int(arr[1, 0]) == 0

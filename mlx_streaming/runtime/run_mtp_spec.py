@@ -6,6 +6,7 @@ import json
 import os
 import statistics
 import time
+from contextlib import contextmanager
 
 import mlx.core as mx
 from mlx_lm.models.qwen3_next import ModelArgs
@@ -31,70 +32,409 @@ WARMUP_TOK = int(os.environ.get("WARMUP_TOK", str(MAXTOK)))
 REPEAT = int(os.environ.get("REPEAT", "3"))
 
 
-def _spec_once(model, drafter, tok, n, k):
-    ids, stats = mtp_generate(model, drafter, tok,
-                              mx.array([tok.encode(PROMPT)]),
-                              n, K=k, ids_mode=True, profile=True)
+@contextmanager
+def _canonical_baseline_config():
+    """Disable speculative expert prefetch for the greedy oracle.
+
+    Comparing speculative decoding against a greedy run that uses the same
+    experimental prefetch path can hide a shared corruption: both token lists
+    are wrong in the same way and ``exact_match`` still reports true.  The
+    The default canonical oracle retains synchronous exact demand while
+    disabling every predictor that can mutate speculative pool rows.  The
+    old shared-path comparison remains available only through the explicit
+    ``BASELINE_ALLOW_PREFETCH=1`` diagnostic override.
+    """
+    if os.environ.get("BASELINE_ALLOW_PREFETCH") == "1":
+        yield
+        return
+    overrides = {
+        "PREFETCH_PROGRESSIVE": "0",
+        "NATIVE_FUSED_PREFETCH": "0",
+        "CROSS_LAYER_PREFETCH": "0",
+        "DEMAND_ASYNC": "0",
+        "SHARED_EXPERT_OVERLAP": "0",
+        # The replay object is attached while the model is built, so changing
+        # PREFETCH_ORACLE_ROUTE_DATA here cannot detach it.  Explicitly gate
+        # oracle consumption or a 256-step greedy baseline exhausts a trace
+        # captured from ~108 speculative verification occurrences.
+        "PREFETCH_ORACLE_DISABLE": "1",
+    }
+    saved = {name: os.environ.get(name) for name in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _spec_once(model, drafter, tok, n, k, store=None):
+    split_after_prefill = os.environ.get("SPEC_SPLIT_DEMAND_AFTER_PREFILL") == "1"
+    progressive_after_prefill = (
+        os.environ.get("PREFETCH_PROGRESSIVE_AFTER_PREFILL") == "1"
+    )
+    saved_demand_async = os.environ.get("DEMAND_ASYNC")
+    saved_progressive = os.environ.get("PREFETCH_PROGRESSIVE")
+    saved_oracle_disable = os.environ.get("PREFETCH_ORACLE_DISABLE")
+    oracle_decode_only = bool(os.environ.get("PREFETCH_ORACLE_ROUTE_DATA", "").strip())
+    decode_only_stats = os.environ.get("DECODE_ONLY_STATS") == "1"
+    profiler_names = (
+        "PREFETCH_AUDIT_PROF",
+        "PREFETCH_DEADLINE_PROF",
+        "PREFETCH_RERANK_PROF",
+    )
+    saved_profilers = {name: os.environ.get(name) for name in profiler_names}
+    if split_after_prefill:
+        # Keep prompt ingestion on the mature synchronous path.  The split
+        # hit/miss primitive is a decode experiment; applying it to chunked
+        # prefill used to corrupt the comparison before timing even began.
+        os.environ["DEMAND_ASYNC"] = "0"
+    if progressive_after_prefill:
+        # Progressive moved-compute is a decode optimization.  Running it for
+        # every long-prompt chunk duplicates scheduler work and can make
+        # prefill dominate an otherwise healthy decode benchmark.
+        os.environ["PREFETCH_PROGRESSIVE"] = "0"
+    if decode_only_stats:
+        for name in profiler_names:
+            os.environ[name] = "0"
+    if _cfg.prefetch_rerank_data_out():
+        os.environ["PREFETCH_RERANK_DATA_ACTIVE"] = "0"
+    if oracle_decode_only:
+        # A chunked prompt commonly has seq=2, which is indistinguishable from
+        # a short verify by shape alone.  Replay traces contain decode
+        # occurrences only, so keep the oracle detached until the explicit
+        # prefill/decode boundary callback below.
+        os.environ["PREFETCH_ORACLE_DISABLE"] = "1"
+
+    def reset_decode_stats():
+        # This callback is also the exact prefill/decode mode boundary.  It
+        # must not depend on whether benchmark counters happen to be enabled.
+        if split_after_prefill:
+            os.environ["DEMAND_ASYNC"] = "1"
+        if progressive_after_prefill:
+            if saved_progressive is None:
+                os.environ.pop("PREFETCH_PROGRESSIVE", None)
+            else:
+                os.environ["PREFETCH_PROGRESSIVE"] = saved_progressive
+        if decode_only_stats:
+            for name, value in saved_profilers.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        if oracle_decode_only:
+            os.environ.pop("PREFETCH_ORACLE_DISABLE", None)
+        if store is None or os.environ.get("DECODE_ONLY_STATS") != "1":
+            return
+        if os.environ.get("SIDEREGION_STATS") == "1":
+            # Long prefill can submit tens of thousands of expert reads.  The
+            # I/O counter must use the same post-prefill boundary as tok/s and
+            # deadline stats, otherwise it mostly measures prompt ingestion.
+            import mlx_streaming.native_moe_ext as _side_native
+            _side_native.prefetch_staging_drain()
+            _side_native.sideregion_drain()
+            _side_native.sideregion_prefetch_stats_reset()
+        store.reset_stats()
+        from mlx_streaming.core.profiling import tprof_reset, union_reset
+        from mlx_streaming.core.profiling import rerank_reset
+        tprof_reset()
+        union_reset()
+        rerank_reset()
+        _prefetch_audits_reset(store)
+        from mlx_streaming.core.prefetch.cross_layer import progressive_reuse_reset
+        progressive_reuse_reset()
+        if _cfg.prefetch_rerank_data_out():
+            os.environ["PREFETCH_RERANK_DATA_ACTIVE"] = "1"
+
+    try:
+        ids, stats = mtp_generate(model, drafter, tok,
+                                  mx.array([tok.encode(PROMPT)]),
+                                  n, K=k, ids_mode=True, profile=True,
+                                  on_prefill_complete=reset_decode_stats)
+    finally:
+        if split_after_prefill:
+            if saved_demand_async is None:
+                os.environ.pop("DEMAND_ASYNC", None)
+            else:
+                os.environ["DEMAND_ASYNC"] = saved_demand_async
+        if progressive_after_prefill:
+            if saved_progressive is None:
+                os.environ.pop("PREFETCH_PROGRESSIVE", None)
+            else:
+                os.environ["PREFETCH_PROGRESSIVE"] = saved_progressive
+        if oracle_decode_only:
+            if saved_oracle_disable is None:
+                os.environ.pop("PREFETCH_ORACLE_DISABLE", None)
+            else:
+                os.environ["PREFETCH_ORACLE_DISABLE"] = saved_oracle_disable
+        if decode_only_stats:
+            for name, value in saved_profilers.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
     tps = round(stats["tokens"] / stats["wall_s"], 2)
     return ids, stats, tps
 
 
-def _baseline_greedy(model, tok, prompt, n):
+def _baseline_greedy(model, tok, prompt, n, on_prefill_complete=None):
     cache = model.make_cache()
     ids = mx.array([tok.encode(prompt)])
-    t0 = time.perf_counter()
+    split_after_prefill = os.environ.get("SPEC_SPLIT_DEMAND_AFTER_PREFILL") == "1"
+    saved_demand_async = os.environ.get("DEMAND_ASYNC")
+    progressive_after_prefill = (
+        os.environ.get("PREFETCH_PROGRESSIVE_AFTER_PREFILL") == "1"
+    )
+    saved_progressive = os.environ.get("PREFETCH_PROGRESSIVE")
+    decode_only_stats = os.environ.get("DECODE_ONLY_STATS") == "1"
+    profiler_names = (
+        "PREFETCH_AUDIT_PROF",
+        "PREFETCH_DEADLINE_PROF",
+        "PREFETCH_RERANK_PROF",
+    )
+    saved_profilers = {name: os.environ.get(name) for name in profiler_names}
+    if split_after_prefill:
+        # Use the same safe boundary as speculative generation: large prompt
+        # chunks stay on synchronous demand, while token decode uses the
+        # callback-driven split hit/miss path.  Previously only MTP crossed
+        # this boundary, so the reported baseline paid a per-layer sync even
+        # when cross-layer rerank had the next layer almost fully resident.
+        os.environ["DEMAND_ASYNC"] = "0"
+    if progressive_after_prefill:
+        os.environ["PREFETCH_PROGRESSIVE"] = "0"
+    if decode_only_stats:
+        for name in profiler_names:
+            os.environ[name] = "0"
     # prefill 分块:把整段 prompt 的激活峰值压到与 decode 同稳态(见 config.prefill_chunk)。
-    logits, _ = prefill_chunked(model, ids, cache)
+    try:
+        logits, _ = prefill_chunked(model, ids, cache)
+    finally:
+        if progressive_after_prefill:
+            if saved_progressive is None:
+                os.environ.pop("PREFETCH_PROGRESSIVE", None)
+            else:
+                os.environ["PREFETCH_PROGRESSIVE"] = saved_progressive
+        if decode_only_stats:
+            for name, value in saved_profilers.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+    if split_after_prefill:
+        os.environ["DEMAND_ASYNC"] = "1"
+    if on_prefill_complete is not None:
+        on_prefill_complete()
+    # 与 mtp_generate 的 wall_s 保持同一口径：只统计 decode，不把 prompt
+    # prefill 混入 tok/s。否则 prompt 越长，baseline 数字越低，MTP speedup
+    # 会被人为放大；交互界面也是从首 token（prefill 完成）后开始计时。
+    t0 = time.perf_counter()
     _dump_margin = bool(os.environ.get("DUMP_MARGIN"))
     out = []
-    for _ in range(n):
-        lg = logits[:, -1, :]
-        nxt = int(mx.argmax(lg))
-        out.append(nxt)
-        if _dump_margin:
-            # 诊断:每步 top-2 logit 与差值,用于判定路径间发散是「FP 近平局」还是「真错」。
-            v = lg.reshape(-1)
-            top2 = mx.argpartition(-v, 2)[:2]
-            t2 = [int(x) for x in top2.tolist()]
-            vv = {t: float(v[t]) for t in t2}
-            st = sorted(t2, key=lambda t: -vv[t])
-            print(f"MARGIN step={len(out)-1} top1={st[0]}({vv[st[0]]:.5f}) "
-                  f"top2={st[1]}({vv[st[1]]:.5f}) gap={vv[st[0]]-vv[st[1]]:.6f}", flush=True)
-        cur = mx.array([[nxt]])
-        mx.eval(cur)
-        if len(out) >= n:
-            break
-        logits, _ = forward_with_hidden(model, cur, cache)
+    try:
+        for _ in range(n):
+            lg = logits[:, -1, :]
+            nxt = int(mx.argmax(lg))
+            out.append(nxt)
+            if _dump_margin:
+                # 诊断:每步 top-2 logit 与差值,用于判定路径间发散是「FP 近平局」还是「真错」。
+                v = lg.reshape(-1)
+                top2 = mx.argpartition(-v, 2)[:2]
+                t2 = [int(x) for x in top2.tolist()]
+                vv = {t: float(v[t]) for t in t2}
+                st = sorted(t2, key=lambda t: -vv[t])
+                print(f"MARGIN step={len(out)-1} top1={st[0]}({vv[st[0]]:.5f}) "
+                      f"top2={st[1]}({vv[st[1]]:.5f}) gap={vv[st[0]]-vv[st[1]]:.6f}", flush=True)
+            cur = mx.array([[nxt]])
+            mx.eval(cur)
+            if len(out) >= n:
+                break
+            logits, _ = forward_with_hidden(model, cur, cache)
+    finally:
+        if split_after_prefill:
+            if saved_demand_async is None:
+                os.environ.pop("DEMAND_ASYNC", None)
+            else:
+                os.environ["DEMAND_ASYNC"] = saved_demand_async
     return out, round(n / (time.perf_counter() - t0), 2)
 
 
+def _resident_ready_hit_rate(deadline):
+    """Return true main-pool readiness, excluding unscheduled layer 0.
+
+    This deliberately does not count completed staging rows: the current
+    unified-pool consumer copies those rows into resident slots at demand.
+    """
+    if not deadline:
+        return None
+    rows = [
+        row for layer, row in deadline.get("per_layer", {}).items()
+        if int(layer) > 0
+    ]
+    actual = sum(int(row.get("actual_unique", 0)) for row in rows)
+    resident = sum(int(row.get("real_resident", 0)) for row in rows)
+    return round(resident / max(actual, 1), 6) if rows else None
+
+
+def _read_complete_ceiling(deadline):
+    """Resident plus fully read staging rows; not a zero-copy hit rate."""
+    if not deadline:
+        return None
+    rows = [
+        row for layer, row in deadline.get("per_layer", {}).items()
+        if int(layer) > 0
+    ]
+    actual = sum(int(row.get("actual_unique", 0)) for row in rows)
+    resident = sum(int(row.get("real_resident", 0)) for row in rows)
+    staged = sum(
+        int(row.get("staging_complete", row.get("side_prefetch_complete", 0)))
+        for row in rows
+    )
+    return round((resident + staged) / max(actual, 1), 6) if rows else None
+
+
+def _direct_ready_hit_rate(deadline):
+    """Rows directly addressable by MoE at target entry.
+
+    In direct-slot mode both the real rows and completely published side rows
+    belong to the stable GPU pool allocation.  Unlike global staging, a side
+    hit needs no demand-time promotion or memcpy before gather.
+    """
+    return _read_complete_ceiling(deadline)
+
+
+def _unified_pool_occupancy(store):
+    """Diagnostic snapshot of verified vs speculative rows after the run."""
+    if not _cfg.zerocopy_dual_source():
+        return None
+    try:
+        from mlx_streaming import native_moe_ext as native
+        rows = {}
+        for layer in range(48):
+            total = int(native.real_region_count(layer))
+            verified = len(native.real_verified_contents(layer)) // 2
+            cap = int(store.cap_for(layer))
+            rows[str(layer)] = {
+                "total": total,
+                "verified": verified,
+                "speculative": total - verified,
+                "free": cap - total,
+                "cap": cap,
+            }
+        return rows
+    except Exception:
+        return None
+
+
 def main():
+    if (
+        _cfg.prefetch_progressive()
+        and K >= 3
+        and _cfg.prefetch_progressive_mode() != "k3"
+    ):
+        raise ValueError(
+            "K>=3 requires PREFETCH_PROGRESSIVE_MODE=k3; refusing to "
+            "silently benchmark the 15-expert K1 rerank width",
+        )
     reset_peak()
+    route_trace_out = os.environ.get("ROUTE_TRACE_OUT", "").strip()
+    if route_trace_out:
+        from mlx_streaming.core import route_trace
+        route_trace.enable()
     model, tok, store = build_streaming_model()
     with open(QN_CONFIG) as f:
         args = ModelArgs.from_dict(json.load(f))
-    mtp = load_mtp(args, MTP_OUT, quantize=True)
+    mtp = load_mtp(
+        args, MTP_OUT, quantize=True, bits=_cfg.mtp_bits(),
+        group_size=_cfg.mtp_group_size(),
+        stream_experts=_cfg.mtp_stream_experts(),
+        expert_dir=_cfg.mtp_expert_dir(),
+        expert_slots=_cfg.mtp_expert_slots(),
+    )
     mtp.embed_tokens = model.model.embed_tokens          # 共享主模型 embedding
     drafter = MTPDrafter(mtp, model.lm_head)
 
     # warmup:同时跑 baseline + spec 两条路径,编译 Metal kernel(含 multistate/batch verify)
     # 并把专家常驻池/预取热起来,确保后续测的是稳态而非冷启动。默认 warmup=MAXTOK 跑满全长。
     if WARMUP_TOK > 0:
-        _baseline_greedy(model, tok, PROMPT, WARMUP_TOK)
-        _spec_once(model, drafter, tok, WARMUP_TOK, K)
+        with _canonical_baseline_config():
+            _baseline_greedy(model, tok, PROMPT, WARMUP_TOK)
+        if os.environ.get("BASELINE_ONLY") != "1":
+            _spec_once(model, drafter, tok, WARMUP_TOK, K, store)
+
+    # Diagnostic upper bound: warm the exact deterministic route safely, then
+    # let measured MTP verify use miss-detecting handler-free remaps.  This is
+    # deliberately applied only after warmup, never to prompt ingestion.
+    if os.environ.get("PREFETCH_OPTIMISTIC_AFTER_WARMUP") == "1":
+        os.environ["PREFETCH_OPTIMISTIC_VERIFY"] = "1"
 
     # ---- baseline 稳态:重复 REPEAT 次取中位数;最后一次清零统计供命中率口径 ----
     base = None
     base_tps_runs = []
+    def reset_baseline_decode_stats():
+        """Use the same post-prefill accounting boundary as speculative decode."""
+        store.reset_stats()
+        if _cfg.demand_async():
+            from mlx_streaming import native_moe_ext as _async_native
+            _async_native.demand_async_stats_reset()
+        from mlx_streaming.core.profiling import tprof_reset, union_reset
+        from mlx_streaming.core.profiling import rerank_reset
+        tprof_reset()
+        union_reset()
+        rerank_reset()
+        _prefetch_audits_reset(store)
+
     for r in range(REPEAT):
-        if r == REPEAT - 1:
-            store.reset_stats()
-        base, bt = _baseline_greedy(model, tok, PROMPT, MAXTOK)
+        with _canonical_baseline_config():
+            base, bt = _baseline_greedy(
+                model,
+                tok,
+                PROMPT,
+                MAXTOK,
+                on_prefill_complete=(
+                    reset_baseline_decode_stats if r == REPEAT - 1 else None
+                ),
+            )
         base_tps_runs.append(bt)
+    base_async = None
+    base_async_miss_hist = None
+    if (_cfg.demand_async()
+            or os.environ.get("SPEC_SPLIT_DEMAND_AFTER_PREFILL") == "1"):
+        from mlx_streaming import native_moe_ext as _async_native
+        _async_native.demand_async_check()
+        base_async = list(_async_native.demand_async_stats())
+        base_async_miss_hist = list(
+            _async_native.demand_async_miss_histogram()
+        )
     base_tps = statistics.median(base_tps_runs)
     base_miss, base_hit = store.misses, store.hits
+    if base_async is not None:
+        base_miss = int(base_async[3])
+        base_hit = int(base_async[4])
     base_prefetch_loads = store._resident.prefetch_loads
     base_prefetch_hits = store._resident.prefetch_hits
+    base_prefetch_audit = _prefetch_audit_prof(primary_seq=1)
+    base_prefetch_deadline = _prefetch_deadline_prof()
+    base_rerank = _rerank_prof()
+
+    if os.environ.get("BASELINE_ONLY") == "1":
+        baseline_mem = snapshot()
+        print(json.dumps({
+            "max_tokens": MAXTOK,
+            "baseline_tok_per_s": base_tps,
+            "baseline_tps_runs": base_tps_runs,
+            "baseline_disk_loads": base_miss,
+            "baseline_async_stats": base_async,
+            "baseline_async_miss_histogram": base_async_miss_hist,
+            "baseline_prefetch_deadline": base_prefetch_deadline,
+            "expert_slots": int(os.environ.get("EXPERT_SLOTS", "0")),
+            "expert_pool_rows": sum(store.cap_for(layer) for layer in range(48)),
+            "mlx_active_gb": round(baseline_mem.mlx_active_bytes / 1e9, 2),
+            "mlx_peak_gb": round(baseline_mem.mlx_peak_bytes / 1e9, 2),
+        }, indent=2))
+        return
 
     # 可选:baseline 之后、spec 之前校准每层热专家，并预取/钉入 resident pool。
     # 这样 disk_load_ratio 的分母仍是未 pin baseline，能直接衡量 pin 是否压低 spec miss。
@@ -117,31 +457,140 @@ def main():
     for r in range(REPEAT):
         if r == REPEAT - 1:
             store.reset_stats()
+            if (_cfg.demand_async()
+                    or os.environ.get("SPEC_SPLIT_DEMAND_AFTER_PREFILL") == "1"):
+                from mlx_streaming import native_moe_ext as _async_native
+                _async_native.demand_async_stats_reset()
             reset_peak()
             from mlx_streaming.core.profiling import tprof_reset, union_reset
             tprof_reset()                     # 探针只统计最终测量轮(与命中率/内存口径一致)
             union_reset()                     # 并集专家数也只统计最终轮
-        ids, stats, st = _spec_once(model, drafter, tok, MAXTOK, K)
+            from mlx_streaming.core.profiling import rerank_reset
+            rerank_reset()
+            _prefetch_audits_reset(store)
+            if os.environ.get("SIDEREGION_STATS") == "1":
+                # Keep the final-repeat counters occurrence-local.  Draining
+                # happens before the timed generate call, so old warmup fills
+                # cannot be charged to this measurement.
+                import mlx_streaming.native_moe_ext as _side_native
+                _side_native.prefetch_staging_drain()
+                _side_native.sideregion_prefetch_stats_reset()
+        ids, stats, st = _spec_once(model, drafter, tok, MAXTOK, K, store)
         spec_tps_runs.append(st)
+    spec_async = None
+    spec_async_miss_hist = None
+    spec_async_seq_miss_hist = None
+    spec_async_layers = None
+    # _spec_once restores DEMAND_ASYNC after every measured request, so the
+    # post-run config value is false in split mode even though decode used the
+    # async primitive. Read its counters explicitly.
+    if (_cfg.demand_async()
+            or os.environ.get("SPEC_SPLIT_DEMAND_AFTER_PREFILL") == "1"):
+        from mlx_streaming import native_moe_ext as _async_native
+        _async_native.demand_async_check()
+        spec_async = list(_async_native.demand_async_stats())
+        spec_async_miss_hist = list(
+            _async_native.demand_async_miss_histogram()
+        )
+        flat_seq_hist = list(
+            _async_native.demand_async_seq_miss_histogram()
+        )
+        spec_async_seq_miss_hist = {
+            str(sequence_length): {
+                str(misses): int(calls)
+                for misses, calls in enumerate(
+                    flat_seq_hist[sequence_length * 31:(sequence_length + 1) * 31]
+                )
+                if calls
+            }
+            for sequence_length in range(1, 4)
+        }
+        layer_values = list(_async_native.demand_async_layer_stats())
+        names = (
+            "calls", "fallback_layers", "loads", "entry_misses",
+            "max_entry_misses", "fallback_wait_us", "pending_wait_us",
+        )
+        spec_async_layers = {
+            str(layer): dict(zip(
+                names, layer_values[layer * 7:layer * 7 + 7], strict=True,
+            ))
+            for layer in range(64)
+            if any(layer_values[layer * 7:layer * 7 + 7])
+        }
     spec_tps = statistics.median(spec_tps_runs)
     spec_miss, spec_hit = store.misses, store.hits
+    if spec_async is not None:
+        spec_miss = int(spec_async[3])
+        spec_hit = int(spec_async[4])
     spec_prefetch_loads = store._resident.prefetch_loads
     spec_prefetch_hits = store._resident.prefetch_hits
     after = snapshot()
     proj = stats.get("proj_no_replay_tps", 0.0)
+    spec_deadline = _prefetch_deadline_prof()
+    spec_prejoin = _prefetch_prejoin_prof()
+    spec_acceptance = _progressive_acceptance_prof(store)
+    rerank_training_data = _export_rerank_training_data(store)
+    from mlx_streaming.core.prefetch.cross_layer import PROGRESSIVE_REUSE
+    progressive_reuse = dict(PROGRESSIVE_REUSE)
+    legacy_base_pool_hit = round(base_hit / max(base_hit + base_miss, 1), 3)
+    legacy_spec_pool_hit = round(spec_hit / max(spec_hit + spec_miss, 1), 3)
+    # Global staging is not GPU-addressable until demand-time promotion, while
+    # direct side rows are part of the stable pool allocation and are true
+    # ready hits as soon as native publishes them complete.
+    strict_base_hit = _resident_ready_hit_rate(base_prefetch_deadline)
+    direct_slots = _cfg.prefetch_direct_slots()
+    strict_spec_hit = (
+        _direct_ready_hit_rate(spec_deadline)
+        if direct_slots
+        else _resident_ready_hit_rate(spec_prejoin)
+    )
+    mismatch_positions = [
+        i for i, (spec_id, base_id) in enumerate(zip(ids, base))
+        if spec_id != base_id
+    ]
     result = {
         "K": K,
         "max_tokens": MAXTOK,
         "warmup_tok": WARMUP_TOK,
         "repeat": REPEAT,
         "exact_match": ids == base,
-        "n_mismatch": sum(1 for a, b in zip(ids, base) if a != b),
+        "n_mismatch": len(mismatch_positions),
+        "first_mismatch": (
+            mismatch_positions[0] if mismatch_positions else None
+        ),
+        "first_mismatch_tokens": (
+            {
+                "spec": ids[mismatch_positions[0]],
+                "baseline": base[mismatch_positions[0]],
+            }
+            if mismatch_positions else None
+        ),
         "avg_accept_len": stats["avg_accept_len"],
+        "accept_hist": stats.get("accept_hist"),
         "steps": stats["steps"],
         "verify_mode": stats.get("verify_mode"),
         "direct_commits": stats.get("direct_commits"),
         "fallback_replays": stats.get("fallback_replays"),
         "replayed_tokens": stats.get("replayed_tokens"),
+        "optimistic_attempts": stats.get("optimistic_attempts"),
+        "optimistic_replays": stats.get("optimistic_replays"),
+        "optimistic_fast_layers": stats.get("optimistic_fast_layers"),
+        "optimistic_layer_misses": stats.get("optimistic_layer_misses"),
+        "sparse_attempts": stats.get("sparse_attempts"),
+        "sparse_overflow_replays": stats.get("sparse_overflow_replays"),
+        "sparse_overflow_layers": stats.get("sparse_overflow_layers"),
+        "sparse_layer_flags": stats.get("sparse_layer_flags"),
+        "sparse_true_layer_flags": stats.get("sparse_true_layer_flags"),
+        "sparse_miss_budget": _cfg.demand_sparse_miss_budget(),
+        "sparse_miss_budget_overrides": (
+            _cfg.demand_sparse_miss_budget_overrides()
+        ),
+        "prefetch_low_workers": int(
+            os.environ.get("PREFETCH_LOW_WORKERS", "0")
+        ),
+        "prefetch_refinement_wait_all": (
+            os.environ.get("PREFETCH_REFINEMENT_WAIT_ALL", "0") == "1"
+        ),
         "spec_tok_per_s": spec_tps,
         "baseline_tok_per_s": base_tps,
         "speedup": round(spec_tps / max(base_tps, 1e-6), 2),
@@ -161,16 +610,71 @@ def main():
         "baseline_disk_loads": base_miss,
         "baseline_prefetch_loads": base_prefetch_loads,
         "baseline_prefetch_hits": base_prefetch_hits,
-        "baseline_hit_rate": round(base_hit / max(base_hit + base_miss, 1), 3),
+        "baseline_hit_rate": strict_base_hit,
+        "baseline_pool_access_hit_rate": legacy_base_pool_hit,
         "spec_disk_loads": spec_miss,
         "spec_prefetch_loads": spec_prefetch_loads,
         "spec_prefetch_hits": spec_prefetch_hits,
-        "spec_hit_rate": round(spec_hit / max(spec_hit + spec_miss, 1), 3),
+        "spec_hit_rate": strict_spec_hit,
+        "spec_hit_rate_definition": (
+            "scheduled layers only: actual route experts already directly "
+            "addressable in GPU real+side pool rows at target entry"
+            if direct_slots else
+            "scheduled layers only: actual route experts already resident in "
+            "the GPU-addressable main pool before target demand promotion"
+        ),
+        "spec_pool_access_hit_rate": legacy_spec_pool_hit,
+        "spec_ssd_read_complete_ceiling": (
+            strict_spec_hit if direct_slots
+            else _read_complete_ceiling(spec_prejoin)
+        ),
         "disk_load_ratio": round(spec_miss / max(base_miss, 1), 2),
         # 双源 acquire 分路计数:n_miss==0 走全 GPU 快路径;任一路由 miss 则整层落 host 慢路径
         # (.tolist 全批同步 + demand 读盘)。fallback 占比高 → 即使 hit 高,慢路径仍按"层"频繁触发。
-        "gpu_fastpath": getattr(store._resident, "gpu_fastpath", None),
-        "gpu_fallback": getattr(store._resident, "gpu_fallback", None),
+        "gpu_fastpath": (
+            int(spec_async[1]) if spec_async is not None
+            else getattr(store._resident, "gpu_fastpath", None)
+        ),
+        "gpu_fallback": (
+            int(spec_async[2]) if spec_async is not None
+            else getattr(store._resident, "gpu_fallback", None)
+        ),
+        "async_demand_stats": (
+            {
+                "calls": int(spec_async[0]),
+                "all_hit_layers": int(spec_async[1]),
+                "fallback_layers": int(spec_async[2]),
+                "unique_disk_loads": int(spec_async[3]),
+                "hit_positions": int(spec_async[4]),
+                "route_positions": int(spec_async[5]),
+                "true_fallback_layers": int(spec_async[6]),
+                "pending_rescued_positions": int(spec_async[7]),
+                "pending_wait_ms": round(int(spec_async[8]) / 1000.0, 3),
+                "true_fallback_wait_ms": round(int(spec_async[9]) / 1000.0, 3),
+                # Position coverage alone is not a latency metric.  One miss
+                # among a layer's whole route union still gates that layer on
+                # the CPU fallback/SSD event.  Report both denominators so a
+                # 98% expert-position figure cannot be mistaken for 98% of
+                # layer invocations taking the zero-wait path.
+                "position_hit_rate": round(
+                    int(spec_async[4]) / max(int(spec_async[5]), 1), 6,
+                ),
+                "all_hit_layer_rate": round(
+                    int(spec_async[1]) / max(int(spec_async[0]), 1), 6,
+                ),
+            }
+            if spec_async is not None else None
+        ),
+        "async_entry_miss_histogram": (
+            {
+                str(misses): int(calls)
+                for misses, calls in enumerate(spec_async_miss_hist)
+                if calls
+            }
+            if spec_async_miss_hist is not None else None
+        ),
+        "async_entry_miss_histogram_by_sequence": spec_async_seq_miss_hist,
+        "async_demand_per_layer": spec_async_layers,
         "pin_hot": PIN_HOT,
         "pin_cal_tok": PIN_CAL_TOK,
         "pinned_experts": store.pinned_count(),
@@ -183,12 +687,33 @@ def main():
         "prefill_chunk": _cfg.prefill_chunk(),
         "native_stage_cache": native_moe.stage_cache_stats(),
         "bg_stats": (store._bg.stats() if getattr(store, "_bg", None) is not None else None),
+        "staging_stats": _staging_stats(store),
         "window_prof": _window_prof(),
         "predict_recall": _predict_recall(),
+        "baseline_prefetch_rerank": base_rerank,
+        "prefetch_rerank": _rerank_prof(),
+        "baseline_prefetch_deadline": base_prefetch_deadline,
+        "prefetch_deadline": spec_deadline,
+        "prefetch_prejoin_deadline": spec_prejoin,
+        "prefetch_join": _prefetch_join_prof(),
+        # 逐 occurrence 的逻辑 rerank 验收：selected 不超过真实并集 150%，
+        # 且每层 selected recall 至少保留 raw top64 recall 的 95%。
+        "progressive_acceptance": spec_acceptance,
+        "rerank_training_data": rerank_training_data,
+        "progressive_reuse": progressive_reuse,
+        "rerank_physical_alignment": _rerank_physical_alignment(
+            spec_acceptance, spec_deadline,
+        ),
+        "baseline_prefetch_audit": base_prefetch_audit,
+        "prefetch_audit": _prefetch_audit_prof(primary_seq=K),
         "miss_attrib": _miss_attrib(),
         "prefetch_tprof": _prefetch_tprof(stats.get("wall_s")),
         "union_experts": _union_prof(),
+        "sideregion_prefetch": _sideregion_prefetch_prof(),
+        "unified_pool_occupancy": _unified_pool_occupancy(store),
     }
+    if route_trace_out:
+        result["route_trace_events"] = route_trace.dump_jsonl(route_trace_out)
     # 噪声地板测量口径:DUMP_IDS=1 时把 baseline greedy 与 spec 的完整 token 序列打进日志,
     # 供跨进程 run-to-run 逐位对比(默认关闭,不污染常规输出)。
     if os.environ.get("DUMP_IDS"):
@@ -205,7 +730,15 @@ def main():
             "STG_VERIFY.virtual(_verify_native_bytes)": dict(_vp_mod._stg_verify_state),
         }
         print("VERIFY_SUMMARY " + json.dumps(_vsum, ensure_ascii=False))
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    serialized = json.dumps(result, ensure_ascii=False, indent=2)
+    result_out = os.environ.get("RESULT_OUT")
+    if result_out:
+        os.makedirs(os.path.dirname(result_out) or ".", exist_ok=True)
+        with open(result_out, "w", encoding="utf-8") as file:
+            file.write(serialized + "\n")
+        print(f"[result] wrote {result_out}")
+    if os.environ.get("RESULT_STDOUT", "1") == "1":
+        print(serialized)
     if _hprof:
         # dump (gen, layer, t_fire) 原始日志,供离线分析回调触发时刻分布。
         _flat = _Nhp.staging_hprof_get()    # 扁平 [gen,layer,t, ...]
@@ -361,12 +894,597 @@ def _predict_recall():
             "avg_routed": round(P["routed"] / P["n"], 2), "n": P["n"]}
 
 
+def _rerank_prof():
+    """汇总动态候选宽度与保留概率质量。"""
+    from mlx_streaming.core.profiling import RERANK_PROF as R
+    if not R["n"]:
+        return None
+
+    def percentile(values, q):
+        ordered = sorted(float(v) for v in values)
+        pos = (len(ordered) - 1) * q
+        lo = int(pos)
+        hi = min(len(ordered) - 1, lo + 1)
+        return ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo)
+
+    n = R["n"]
+    widths = R["effective_width_samples"]
+    return {
+        "avg_candidate_width": round(R["candidate_width"] / n, 2),
+        "avg_effective_width": round(R["effective_width"] / n, 2),
+        "p50_effective_width": round(percentile(widths, 0.5), 2),
+        "p95_effective_width": round(percentile(widths, 0.95), 2),
+        "avg_resident_count": round(R["resident_count"] / n, 2),
+        "avg_retained_mass": round(R["retained_mass_sum"] / n, 4),
+        "n": n,
+    }
+
+
+def _sideregion_prefetch_prof():
+    """Return native side-cache work counters when explicitly requested."""
+    if os.environ.get("SIDEREGION_STATS") != "1":
+        return None
+    import mlx_streaming.native_moe_ext as native
+    values = native.sideregion_prefetch_stats()
+    names = (
+        "input_ids", "candidates", "side_hits", "reserved_reads",
+        "evictions", "pread_ok", "pread_fail", "unique_layer_expert_reads",
+    )
+    result = {name: int(value) for name, value in zip(names, values, strict=True)}
+    if hasattr(native, "sideregion_prefetch_reads_by_layer"):
+        result["reads_by_layer"] = {
+            str(layer): int(value)
+            for layer, value in enumerate(native.sideregion_prefetch_reads_by_layer())
+            if value
+        }
+    return result
+
+
+def _prefetch_audits_reset(store=None):
+    """在测量轮边界排空旧 fill，再开启独立的 deadline/audit 统计。"""
+    if not (
+        _cfg.prefetch_deadline_prof()
+        or _cfg.prefetch_audit_prof()
+        or _cfg.prefetch_rerank_data_out()
+    ):
+        return
+    from mlx_streaming import native_moe_ext as N
+    # reset 时若旧 callback 仍在途，它会污染新一轮 key；先排空才有严格边界。
+    # Drain either backend before resetting counters so the next measurement
+    # cannot inherit completion publications from the preceding warm-up.
+    N.prefetch_staging_drain()
+    N.sideregion_drain()
+    if _cfg.prefetch_deadline_prof():
+        N.demand_deadline_stats_reset()
+        N.demand_prejoin_stats_reset()
+        N.prefetch_staging_wait_stats_reset()
+    if (
+        _cfg.prefetch_audit_prof()
+        or _cfg.prefetch_acceptance_prof()
+        or _cfg.prefetch_rerank_data_out()
+    ):
+        if _cfg.prefetch_audit_prof():
+            N.prefetch_audit_stats_reset()
+        from mlx_streaming.core.prefetch import progressive_acceptance
+        progressive_acceptance.reset()
+        vpool = getattr(store, "_vpool", None)
+        if vpool is not None:
+            vpool.reset_progressive_acceptance_pending()
+
+
+def _progressive_acceptance_prof(store=None):
+    """Return the requested per-layer top64-retention/150%-width contract."""
+    if not (
+        _cfg.prefetch_audit_prof() or _cfg.prefetch_acceptance_prof()
+    ):
+        return None
+    vpool = getattr(store, "_vpool", None)
+    if vpool is not None:
+        vpool.flush_progressive_acceptance()
+    from mlx_streaming.core.prefetch import progressive_acceptance
+    return progressive_acceptance.report(threshold=0.95)
+
+
+def _export_rerank_training_data(store=None):
+    path = _cfg.prefetch_rerank_data_out()
+    if not path:
+        return None
+    vpool = getattr(store, "_vpool", None)
+    if vpool is not None:
+        vpool.flush_progressive_acceptance()
+    from mlx_streaming.core.prefetch import progressive_acceptance
+    return progressive_acceptance.export_training_data(path)
+
+
+def _rerank_physical_alignment(acceptance, deadline):
+    """Reconcile logical selected hits with post-join physical availability.
+
+    Layer 0 has no cross-layer prediction and must not be mixed into this
+    denominator.  Exact integer equality per scheduled layer is stronger than
+    comparing two rounded aggregate rates and prevents the legacy mixed-unit
+    hit rate from masquerading as this contract.
+    """
+    if acceptance is None or deadline is None:
+        return None
+    logical = acceptance.get("per_layer", {})
+    physical = deadline.get("per_layer", {})
+    per_layer = {}
+    logical_actual = logical_hits = 0
+    physical_actual = physical_hits = 0
+    mismatches = []
+    for layer, selected in sorted(logical.items(), key=lambda item: int(item[0])):
+        available = physical.get(str(layer))
+        if available is None:
+            mismatches.append({"layer": int(layer), "reason": "missing_physical"})
+            continue
+        la = int(selected["actual_routes"])
+        lh = int(selected["selected_hits"])
+        pa = int(available["actual_unique"])
+        ph = int(available["real_resident"]) + int(
+            available["side_prefetch_complete"]
+        )
+        exact = la == pa and lh == ph
+        per_layer[str(layer)] = {
+            "logical_actual": la,
+            "logical_selected_hits": lh,
+            "physical_actual": pa,
+            "physical_available_after_join": ph,
+            "exact_integer_match": exact,
+        }
+        logical_actual += la
+        logical_hits += lh
+        physical_actual += pa
+        physical_hits += ph
+        if not exact:
+            mismatches.append({
+                "layer": int(layer), "logical": [lh, la],
+                "physical": [ph, pa],
+            })
+    return {
+        "scope": "scheduled_rerank_layers_only",
+        "excludes_unscheduled_layer0": True,
+        "logical_selected_coverage": round(
+            logical_hits / max(logical_actual, 1), 9,
+        ),
+        "physical_available_after_join_coverage": round(
+            physical_hits / max(physical_actual, 1), 9,
+        ),
+        "logical_counts": [logical_hits, logical_actual],
+        "physical_counts": [physical_hits, physical_actual],
+        "all_layers_exact_integer_match": not mismatches,
+        "mismatches": mismatches,
+        "per_layer": per_layer,
+    }
+
+
+def _prefetch_audit_prof(primary_seq: int):
+    """逐次 source-time rerank、I/O 与目标 demand 的严格配对审计。"""
+    if not _cfg.prefetch_audit_prof():
+        return None
+    from mlx_streaming import native_moe_ext as N
+    # demand 判定已固定，不会因这里等待而改善；排空只为收齐晚到 callback/publish
+    # 的时间戳，区分“预测正确但字节迟到”和“根本没预测到”。
+    N.prefetch_staging_drain()
+    columns = (
+        "forward_id", "source_layer", "target_layer", "physical_gen",
+        "sequence_length", "submit_eval_us", "callback_us", "pread_start_us",
+        "publish_end_us", "demand_us", "candidate_width",
+        "source_resident_count", "actual_unique", "candidate_hits",
+        "source_resident_hits", "system_prediction_hits",
+        "candidate_complete_hits", "system_complete_hits", "deadline_real",
+        "deadline_side", "fallback", "pread_requested", "pread_completed",
+        "submission_count", "demand_count", "callback_before_demand",
+    )
+    flat = [int(value) for value in N.prefetch_audit_stats()]
+    width = len(columns)
+    if len(flat) % width:
+        raise RuntimeError(
+            f"prefetch audit 不是 {width} 列: values={len(flat)}",
+        )
+    records = [
+        dict(zip(columns, flat[offset:offset + width], strict=True))
+        for offset in range(0, len(flat), width)
+    ]
+
+    def percentile(values, q):
+        if not values:
+            return None
+        ordered = sorted(values)
+        index = int(round((len(ordered) - 1) * q))
+        return round(ordered[index], 3)
+
+    def summarize(rows):
+        expected_submissions = 2 if _cfg.prefetch_progressive() else 1
+        per_layer = {}
+        failures = []
+        for row in rows:
+            layer = row["target_layer"]
+            rec = per_layer.setdefault(layer, {
+                "calls": 0,
+                "submissions": 0,
+                "actual_unique": 0,
+                "candidate_width": 0,
+                "max_candidate_width": 0,
+                "candidate_hits": 0,
+                "system_prediction_hits": 0,
+                "candidate_complete_hits": 0,
+                "system_complete_hits": 0,
+                "deadline_real": 0,
+                "deadline_side": 0,
+                "fallback": 0,
+                "width_violations": 0,
+                "over_top64": 0,
+                "missing_submissions": 0,
+                "duplicate_submissions": 0,
+                "duplicate_demands": 0,
+                "schedule_mismatches": 0,
+                "callback_late": 0,
+                "publish_late": 0,
+                "pread_requested": 0,
+                "pread_completed": 0,
+                "submit_to_demand_ms": [],
+                "callback_to_demand_ms": [],
+                "publish_slack_ms": [],
+            })
+            actual = row["actual_unique"]
+            limit = (actual * 3) // 2
+            candidate_width = row["candidate_width"]
+            submission_count = row["submission_count"]
+            demand_count = row["demand_count"]
+            rec["calls"] += demand_count
+            rec["submissions"] += submission_count
+            rec["actual_unique"] += actual
+            rec["candidate_width"] += candidate_width
+            rec["max_candidate_width"] = max(
+                rec["max_candidate_width"], candidate_width,
+            )
+            for key in (
+                "candidate_hits", "system_prediction_hits",
+                "candidate_complete_hits", "system_complete_hits",
+                "deadline_real", "deadline_side", "fallback",
+                "pread_requested", "pread_completed",
+            ):
+                rec[key] += row[key]
+            violation = submission_count > 0 and candidate_width > limit
+            over_top64 = candidate_width > 64
+            # Progressive mode deliberately has two submissions for one
+            # target/generation: the unchanged original-source early core and
+            # a T-1 exact fill.  Fewer means one stage is absent; more means a
+            # real duplicate.  Legacy mode keeps the original exactly-one
+            # contract.
+            missing = (
+                demand_count > 0
+                and layer > 0
+                and submission_count < expected_submissions
+            )
+            duplicate_submission = submission_count > expected_submissions
+            duplicate_demand = demand_count > 1
+            ahead_profile = _cfg.cross_layer_ahead_profile()
+            expected_ahead = ahead_profile.get(
+                layer,
+                _cfg.cross_layer_ahead_lo()
+                if layer <= _cfg.cross_layer_cutoff()
+                else _cfg.cross_layer_ahead_hi(),
+            )
+            schedule_mismatch = (
+                submission_count > 0
+                and layer > 0
+                and layer - row["source_layer"] != expected_ahead
+            )
+            callback_late = (
+                demand_count > 0
+                and (row["callback_us"] < 0
+                     or row["callback_us"] > row["demand_us"])
+            )
+            publish_late = (
+                row["pread_requested"] > 0
+                and demand_count > 0
+                and (row["publish_end_us"] < 0
+                     or row["publish_end_us"] > row["demand_us"])
+            )
+            rec["width_violations"] += int(violation)
+            rec["over_top64"] += int(over_top64)
+            rec["missing_submissions"] += int(missing)
+            rec["duplicate_submissions"] += int(duplicate_submission)
+            rec["duplicate_demands"] += int(duplicate_demand)
+            rec["schedule_mismatches"] += int(schedule_mismatch)
+            rec["callback_late"] += int(callback_late)
+            rec["publish_late"] += int(publish_late)
+            if row["submit_eval_us"] >= 0 and row["demand_us"] >= 0:
+                rec["submit_to_demand_ms"].append(
+                    (row["demand_us"] - row["submit_eval_us"]) / 1000,
+                )
+            if row["callback_us"] >= 0 and row["demand_us"] >= 0:
+                rec["callback_to_demand_ms"].append(
+                    (row["demand_us"] - row["callback_us"]) / 1000,
+                )
+            if row["publish_end_us"] >= 0 and row["demand_us"] >= 0:
+                rec["publish_slack_ms"].append(
+                    (row["demand_us"] - row["publish_end_us"]) / 1000,
+                )
+            reasons = [
+                name for name, failed in (
+                    ("width>1.5x", violation),
+                    ("width>top64", over_top64),
+                    (f"submissions<{expected_submissions}", missing),
+                    ("duplicate_submission", duplicate_submission),
+                    ("duplicate_demand", duplicate_demand),
+                    ("schedule_mismatch", schedule_mismatch),
+                    ("callback_after_demand", callback_late),
+                    ("publish_after_demand", publish_late),
+                ) if failed
+            ]
+            if reasons and len(failures) < 64:
+                failures.append({
+                    "forward_id": row["forward_id"],
+                    "source_layer": row["source_layer"],
+                    "target_layer": layer,
+                    "actual_unique": actual,
+                    "candidate_width": candidate_width,
+                    "width_limit": limit,
+                    "reasons": reasons,
+                })
+
+        output_layers = {}
+        for layer in sorted(per_layer):
+            rec = per_layer[layer]
+            actual = max(rec["actual_unique"], 1)
+            calls = max(rec["calls"], 1)
+            rec["avg_actual_unique"] = round(rec["actual_unique"] / calls, 4)
+            rec["avg_candidate_width"] = round(rec["candidate_width"] / calls, 4)
+            rec["candidate_recall"] = round(rec["candidate_hits"] / actual, 6)
+            rec["system_prediction_recall"] = round(
+                rec["system_prediction_hits"] / actual, 6,
+            )
+            rec["candidate_complete_recall"] = round(
+                rec["candidate_complete_hits"] / actual, 6,
+            )
+            rec["system_complete_recall"] = round(
+                rec["system_complete_hits"] / actual, 6,
+            )
+            rec["deadline_byte_coverage"] = round(
+                (rec["deadline_real"] + rec["deadline_side"]) / actual, 6,
+            )
+            submit_values = rec.pop("submit_to_demand_ms")
+            rec["submit_to_demand_p50_ms"] = percentile(submit_values, 0.50)
+            # 最小侧更接近最危险窗口；P05 比单次极值更稳。
+            rec["submit_to_demand_p05_ms"] = percentile(submit_values, 0.05)
+            callback_values = rec.pop("callback_to_demand_ms")
+            publish_values = rec.pop("publish_slack_ms")
+            rec["callback_to_demand_p50_ms"] = percentile(callback_values, 0.50)
+            rec["callback_to_demand_p05_ms"] = percentile(callback_values, 0.05)
+            rec["publish_slack_p50_ms"] = percentile(publish_values, 0.50)
+            rec["publish_slack_p05_ms"] = percentile(publish_values, 0.05)
+            rec["strict_pass"] = (
+                layer > 0
+                and rec["system_prediction_recall"] >= 0.98
+                and rec["system_complete_recall"] >= 0.98
+                and rec["deadline_byte_coverage"] >= 0.98
+                and rec["width_violations"] == 0
+                and rec["over_top64"] == 0
+                and rec["missing_submissions"] == 0
+                and rec["duplicate_submissions"] == 0
+                and rec["duplicate_demands"] == 0
+                and rec["schedule_mismatches"] == 0
+            )
+            output_layers[str(layer)] = rec
+
+        scheduled = [rec for layer, rec in output_layers.items() if int(layer) > 0]
+        all_layers = list(output_layers.values())
+        total_actual = sum(rec["actual_unique"] for rec in all_layers)
+        overall = {
+            "expected_submissions_per_demand": expected_submissions,
+            "calls": sum(rec["calls"] for rec in all_layers),
+            "actual_unique": total_actual,
+            "candidate_width": sum(rec["candidate_width"] for rec in all_layers),
+            "system_prediction_recall": round(
+                sum(rec["system_prediction_hits"] for rec in all_layers)
+                / max(total_actual, 1), 6,
+            ),
+            "system_complete_recall": round(
+                sum(rec["system_complete_hits"] for rec in all_layers)
+                / max(total_actual, 1), 6,
+            ),
+            "deadline_byte_coverage": round(
+                sum(rec["deadline_real"] + rec["deadline_side"] for rec in all_layers)
+                / max(total_actual, 1), 6,
+            ),
+            "width_violations": sum(rec["width_violations"] for rec in all_layers),
+            "over_top64": sum(rec["over_top64"] for rec in all_layers),
+            "missing_submissions": sum(
+                rec["missing_submissions"] for rec in all_layers
+            ),
+            "schedule_mismatches": sum(
+                rec["schedule_mismatches"] for rec in all_layers
+            ),
+            "callback_late": sum(rec["callback_late"] for rec in all_layers),
+            "publish_late": sum(rec["publish_late"] for rec in all_layers),
+            "strict_pass_layers": sum(rec["strict_pass"] for rec in scheduled),
+            "scheduled_layers": len(scheduled),
+        }
+        return {
+            "records": len(rows),
+            "overall": overall,
+            "per_layer": output_layers,
+            "scheduled_layers_all_strict_pass": bool(scheduled) and all(
+                rec["strict_pass"] for rec in scheduled
+            ),
+            "all_observed_layers_strict_pass": bool(all_layers) and all(
+                rec["strict_pass"] for rec in all_layers
+            ),
+            "failing_layers": [
+                int(layer) for layer, rec in output_layers.items()
+                if not rec["strict_pass"]
+            ],
+            "failure_examples": failures,
+        }
+
+    by_seq = {}
+    for seq in sorted({row["sequence_length"] for row in records}):
+        by_seq[str(seq)] = summarize([
+            row for row in records if row["sequence_length"] == seq
+        ])
+    return {
+        "schema": "prefetch-audit-v1",
+        "columns": list(columns),
+        "record_count": len(records),
+        "primary_seq": int(primary_seq),
+        "primary": by_seq.get(str(int(primary_seq))),
+        "by_seq": by_seq,
+    }
+
+
+def _prefetch_deadline_prof():
+    """目标 MoE 消费边界的逐层完整字节覆盖率（需显式开启）。"""
+    if not _cfg.prefetch_deadline_prof():
+        return None
+    from mlx_streaming import native_moe_ext as N
+    flat = list(N.demand_deadline_stats())
+    if len(flat) % 6:
+        raise RuntimeError("demand deadline stats 不是 6 列")
+    per_layer = {}
+    totals = {
+        "calls": 0,
+        "actual_unique": 0,
+        "real_resident": 0,
+        "side_prefetch_complete": 0,
+        "demand_fallback": 0,
+    }
+    for offset in range(0, len(flat), 6):
+        layer, calls, actual, resident, prefetched, fallback = map(
+            int, flat[offset:offset + 6],
+        )
+        if resident + prefetched + fallback != actual:
+            raise RuntimeError(
+                f"layer {layer} deadline 分类不闭合: "
+                f"{resident}+{prefetched}+{fallback}!={actual}",
+            )
+        per_layer[str(layer)] = {
+            "calls": calls,
+            "actual_unique": actual,
+            "real_resident": resident,
+            "side_prefetch_complete": prefetched,
+            "demand_fallback": fallback,
+            "resident_coverage": round(resident / max(actual, 1), 6),
+            "prefetch_coverage": round(prefetched / max(actual, 1), 6),
+            "deadline_byte_coverage": round(
+                (resident + prefetched) / max(actual, 1), 6,
+            ),
+        }
+        for key, value in zip(
+            ("calls", "actual_unique", "real_resident",
+             "side_prefetch_complete", "demand_fallback"),
+            (calls, actual, resident, prefetched, fallback),
+            strict=True,
+        ):
+            totals[key] += value
+    totals["resident_coverage"] = round(
+        totals["real_resident"] / max(totals["actual_unique"], 1), 6,
+    )
+    totals["prefetch_coverage"] = round(
+        totals["side_prefetch_complete"] / max(totals["actual_unique"], 1), 6,
+    )
+    totals["deadline_byte_coverage"] = round(
+        (totals["real_resident"] + totals["side_prefetch_complete"])
+        / max(totals["actual_unique"], 1),
+        6,
+    )
+    return {"overall": totals, "per_layer": per_layer}
+
+
+def _prefetch_prejoin_prof():
+    """Blocking join 前的真实 target deadline；可直接与全驻比较。"""
+    if not _cfg.prefetch_deadline_prof():
+        return None
+    from mlx_streaming import native_moe_ext as N
+    flat = list(N.demand_prejoin_stats())
+    if len(flat) % 6:
+        raise RuntimeError("demand prejoin stats 不是 6 列")
+    per_layer = {}
+    totals = {
+        "calls": 0, "actual_unique": 0, "real_resident": 0,
+        "staging_complete": 0, "not_ready": 0,
+    }
+    for offset in range(0, len(flat), 6):
+        layer, calls, actual, resident, complete, not_ready = map(
+            int, flat[offset:offset + 6],
+        )
+        if resident + complete + not_ready != actual:
+            raise RuntimeError(
+                f"layer {layer} prejoin 分类不闭合: "
+                f"{resident}+{complete}+{not_ready}!={actual}",
+            )
+        per_layer[str(layer)] = {
+            "calls": calls,
+            "actual_unique": actual,
+            "real_resident": resident,
+            "staging_complete": complete,
+            "not_ready": not_ready,
+            "prejoin_byte_coverage": round(
+                (resident + complete) / max(actual, 1), 6,
+            ),
+        }
+        for key, value in zip(totals, (calls, actual, resident, complete, not_ready), strict=True):
+            totals[key] += value
+    totals["prejoin_byte_coverage"] = round(
+        (totals["real_resident"] + totals["staging_complete"])
+        / max(totals["actual_unique"], 1), 6,
+    )
+    return {"overall": totals, "per_layer": per_layer}
+
+
+def _prefetch_join_prof():
+    """逐专家 join 的阻塞成本；不把等待完成后的行伪装成 deadline hit。"""
+    if not _cfg.prefetch_deadline_prof():
+        return None
+    from mlx_streaming import native_moe_ext as N
+    flat = list(N.prefetch_staging_wait_stats())
+    if len(flat) % 6:
+        raise RuntimeError("staging wait stats 不是 6 列")
+    per_layer = {}
+    totals = {
+        "calls": 0, "actual_unique": 0, "staging_complete_at_entry": 0,
+        "pending_at_entry": 0, "wait_us": 0,
+    }
+    for offset in range(0, len(flat), 6):
+        layer, calls, actual, complete, pending, wait_us = map(
+            int, flat[offset:offset + 6],
+        )
+        per_layer[str(layer)] = {
+            "calls": calls,
+            "actual_unique": actual,
+            "staging_complete_at_entry": complete,
+            "pending_at_entry": pending,
+            "total_wait_ms": round(wait_us / 1000, 3),
+            "avg_wait_ms": round(wait_us / max(calls, 1) / 1000, 6),
+        }
+        for key, value in zip(totals, (calls, actual, complete, pending, wait_us), strict=True):
+            totals[key] += value
+    totals["total_wait_ms"] = round(totals.pop("wait_us") / 1000, 3)
+    totals["avg_wait_ms"] = round(
+        totals["total_wait_ms"] / max(totals["calls"], 1), 6,
+    )
+    return {"overall": totals, "per_layer": per_layer}
+
+
 def _window_prof():
     from mlx_streaming.core.profiling import WINDOW_PROF
     if not WINDOW_PROF["n"]:
         return None
     return {"avg_ms": round(WINDOW_PROF["sum_s"] / WINDOW_PROF["n"] * 1000, 4),
             "n": WINDOW_PROF["n"]}
+
+
+def _staging_stats(store):
+    staging = getattr(store, "_staging", None)
+    if staging is None:
+        return None
+    return {
+        "submitted": int(getattr(staging, "submitted", 0)),
+        "skipped_no_bank": int(getattr(staging, "skipped_no_bank", 0)),
+        "max_busy_banks": int(getattr(staging, "max_busy_banks", 0)),
+        "bank_count": int(getattr(staging, "ring", 0)),
+    }
 
 
 def _prefetch_tprof(wall_s=None):

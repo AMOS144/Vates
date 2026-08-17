@@ -16,6 +16,7 @@
     /help            打印帮助
 """
 import argparse
+import os
 import sys
 import time
 
@@ -91,7 +92,13 @@ def _build_engine(args, on_status=None):
     _emit("正在加载 MTP drafter...")
     with open(args.qn_config) as f:
         margs = ModelArgs.from_dict(json.load(f))
-    mtp = load_mtp(margs, args.mtp_out, quantize=True)
+    mtp = load_mtp(
+        margs, args.mtp_out, quantize=True, bits=config.mtp_bits(),
+        group_size=config.mtp_group_size(),
+        stream_experts=config.mtp_stream_experts(),
+        expert_dir=config.mtp_expert_dir(),
+        expert_slots=config.mtp_expert_slots(),
+    )
     mtp.embed_tokens = model.model.embed_tokens          # 共享主模型 embedding
     drafter = MTPDrafter(mtp, model.lm_head)
     return model, tok, drafter
@@ -115,8 +122,34 @@ def _warmup(model, tok, drafter, args):
         n = min(64, vocab)                       # 预热 prompt 长度(兼顾覆盖与耗时)
         step = max(1, vocab // n)                 # 在词表内均匀取样,最大化专家覆盖
         ids = [(1 + i * step) % vocab for i in range(n)]
-        mtp_generate(model, drafter, tok, mx.array([ids]), 8,
-                     K=args.k, ids_mode=True)
+        # The measured 37 tok/s profile used a 64-token warmup.  Eight tokens
+        # compile kernels but do not stabilize the expert pool, and previously
+        # ran entirely with synchronous demand even though interactive decode
+        # switches to async demand at the prefill boundary.
+        warmup_tokens = max(1, int(os.environ.get("CLI_WARMUP_TOK", "64")))
+        split_demand = os.environ.get(
+            "SPEC_SPLIT_DEMAND_AFTER_PREFILL",
+        ) == "1"
+        saved_demand_async = os.environ.get("DEMAND_ASYNC")
+        if split_demand:
+            os.environ["DEMAND_ASYNC"] = "0"
+
+        def on_prefill_complete():
+            if split_demand:
+                os.environ["DEMAND_ASYNC"] = "1"
+
+        try:
+            mtp_generate(
+                model, drafter, tok, mx.array([ids]), warmup_tokens,
+                K=args.k, ids_mode=True,
+                on_prefill_complete=on_prefill_complete,
+            )
+        finally:
+            if split_demand:
+                if saved_demand_async is None:
+                    os.environ.pop("DEMAND_ASYNC", None)
+                else:
+                    os.environ["DEMAND_ASYNC"] = saved_demand_async
     except Exception:  # noqa: BLE001  预热仅为压首轮延迟,失败不应中断启动
         pass
 
@@ -238,10 +271,33 @@ def _chat_repl(args):
             return len(truncated) < len(produced_all)
 
         t0 = time.perf_counter()
-        produced, stats = mtp_generate(
-            model, drafter, tok, mx.array([ids]),
-            args.max_tokens, K=args.k, ids_mode=True, profile=args.stats,
-            on_tokens=_on_tokens, main_cache=cur_cache, cached_len=cached_len)
+        split_demand = os.environ.get(
+            "SPEC_SPLIT_DEMAND_AFTER_PREFILL",
+        ) == "1"
+        saved_demand_async = os.environ.get("DEMAND_ASYNC")
+        if split_demand:
+            os.environ["DEMAND_ASYNC"] = "0"
+
+        def _on_prefill_complete():
+            if split_demand:
+                os.environ["DEMAND_ASYNC"] = "1"
+            if args.stats and split_demand:
+                from mlx_streaming import native_moe_ext as native
+                native.demand_async_stats_reset()
+
+        try:
+            produced, stats = mtp_generate(
+                model, drafter, tok, mx.array([ids]),
+                args.max_tokens, K=args.k, ids_mode=True, profile=args.stats,
+                on_tokens=_on_tokens,
+                on_prefill_complete=_on_prefill_complete,
+                main_cache=cur_cache, cached_len=cached_len)
+        finally:
+            if split_demand:
+                if saved_demand_async is None:
+                    os.environ.pop("DEMAND_ASYNC", None)
+                else:
+                    os.environ["DEMAND_ASYNC"] = saved_demand_async
         dt = time.perf_counter() - t0
 
         # offset 对账:仅无 over-commit 时记录 cache 供下轮复用(见 MLXBackend.generate)。
@@ -257,9 +313,51 @@ def _chat_repl(args):
         messages.append({"role": "assistant", "content": text})
 
         if args.stats:
-            tps = len(out_ids) / dt if dt > 0 else 0.0
-            print(f"[{len(out_ids)} tok, {tps:.1f} tok/s, "
-                  f"accept_len={stats.get('avg_accept_len')}]", file=sys.stderr)
+            # ``dt`` starts before prompt prefill, while mtp_generate's
+            # ``wall_s`` starts at the exact prefill/decode boundary.  A
+            # single undifferentiated tok/s number made short replies look
+            # much slower than long replies and was not comparable with the
+            # decode-only benchmark.  Report both clocks explicitly.
+            e2e_tps = len(out_ids) / dt if dt > 0 else 0.0
+            decode_s = float(stats.get("wall_s") or 0.0)
+            decode_tps = len(out_ids) / decode_s if decode_s > 0 else 0.0
+            prefill_s = max(0.0, dt - decode_s)
+            print(
+                f"[{len(out_ids)} tok, decode={decode_tps:.1f} tok/s, "
+                f"e2e={e2e_tps:.1f} tok/s, prefill={prefill_s:.2f}s, "
+                f"accept_len={stats.get('avg_accept_len')}]",
+                file=sys.stderr,
+            )
+            if split_demand:
+                from mlx_streaming import native_moe_ext as native
+                values = list(native.demand_async_stats())
+                if len(values) >= 10:
+                    positions = max(int(values[5]), 1)
+                    waits_ms = (int(values[8]) + int(values[9])) / 1000.0
+                    print(
+                        f"[entry_hit={int(values[4]) / positions:.2%}, "
+                        f"disk_loads={int(values[3])}, "
+                        f"ssd_wait={waits_ms:.1f}ms]",
+                        file=sys.stderr,
+                    )
+                    layer_values = list(native.demand_async_layer_stats())
+                    layer_rows = []
+                    for layer in range(len(layer_values) // 7):
+                        row = layer_values[layer * 7:layer * 7 + 7]
+                        calls, _, loads, misses, _, fallback_us, pending_us = row
+                        wait_ms = (int(fallback_us) + int(pending_us)) / 1000.0
+                        if calls and (wait_ms > 0.0 or misses or loads):
+                            layer_rows.append(
+                                (wait_ms, layer, int(misses), int(loads)),
+                            )
+                    layer_rows.sort(reverse=True)
+                    slow = ", ".join(
+                        f"L{layer}:{wait_ms:.1f}ms/"
+                        f"miss={misses}/load={loads}"
+                        for wait_ms, layer, misses, loads in layer_rows[:8]
+                    )
+                    if slow:
+                        print(f"[slow_layers={slow}]", file=sys.stderr)
 
     print("再见。", file=sys.stderr)
     return 0

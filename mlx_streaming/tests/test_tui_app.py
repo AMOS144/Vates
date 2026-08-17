@@ -3,7 +3,9 @@ import types
 
 import pytest
 
-from mlx_streaming.tui.app import ChatMessage, VatesApp
+from mlx_streaming.tui.app import (
+    ChatMessage, PromptInput, VatesApp, _single_line_paste,
+)
 from mlx_streaming.tui.backend import FakeBackend
 
 
@@ -23,6 +25,59 @@ async def test_loads_and_becomes_ready():
         assert app.query_one("#prompt", Input).disabled is False
         # textual 8.x 用 Static.content 取代旧的 .renderable
         assert "就绪" in str(app.query_one("#status").content)
+
+
+def test_multiline_clipboard_keeps_all_content():
+    assert _single_line_paste("第一段\r\n第二段\n  code()") == (
+        "第一段 第二段   code()"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prompt_native_paste_inserts_system_clipboard(monkeypatch):
+    monkeypatch.setattr(
+        "mlx_streaming.tui.app._system_clipboard_text",
+        lambda: "第一行\n第二行",
+    )
+    app = VatesApp(FakeBackend(), _args())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        inp = app.query_one("#prompt", PromptInput)
+        inp.value = "前"
+        inp.cursor_position = len(inp.value)
+        inp.focus()
+        await pilot.press("super+v")
+        assert inp.value == "前第一行 第二行"
+
+
+@pytest.mark.asyncio
+async def test_prompt_deduplicates_macos_dual_paste():
+    app = VatesApp(FakeBackend(), _args())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        inp = app.query_one("#prompt", PromptInput)
+        inp._insert_paste("同一内容")
+        inp._insert_paste("同一内容")
+        assert inp.value == "同一内容"
+        inp._last_paste_at -= 1.0
+        inp._insert_paste("同一内容")
+        assert inp.value == "同一内容同一内容"
+
+
+@pytest.mark.asyncio
+async def test_mouse_text_selection_auto_copies(monkeypatch):
+    copied = []
+    app = VatesApp(FakeBackend(), _args())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        monkeypatch.setattr(app.screen, "get_selected_text", lambda: "回答内容")
+        monkeypatch.setattr(app, "copy_to_clipboard", copied.append)
+        from textual import events
+        app.on_text_selected(events.TextSelected())
+        assert copied == ["回答内容"]
 
 
 @pytest.mark.asyncio
@@ -189,12 +244,9 @@ async def test_stream_status_shows_tokens_then_windowed_speed():
         await app.workers.wait_for_complete()
         await pilot.pause()
         app._cur = app._add("assistant", "", final=False)
-        app._gen_t0 = 0.0
-        app._n0 = 0
         app._samples.clear()
-        # 首次回调:只记基准,尚无法算窗口速度
+        # 首次回调只有一个采样点，尚无法算窗口速度。
         app._on_stream("你好世界呀", 5)
-        assert app._gen_t0 != 0.0 and app._n0 == 5
         s1 = str(app.query_one("#status").content)
         assert "5 tok" in s1
         assert "tok/s" not in s1
@@ -207,24 +259,49 @@ async def test_stream_status_shows_tokens_then_windowed_speed():
 
 
 @pytest.mark.asyncio
-async def test_final_status_uses_cumulative_decode_average():
-    """结束时的最终数字用累计解码平均(排除 prefill),而非后端上报值或瞬时窗口。"""
-    import time
+async def test_status_keeps_prefill_and_decode_speeds():
+    """Prefill 完成后立即显示，流式生成和最终状态都不丢失。"""
+    from mlx_streaming.tui.backend import GenResult
+
+    app = VatesApp(FakeBackend(), _args())
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        app._cur = app._add("assistant", "", final=False)
+        app._on_prefill(256, 0.5, 512.0)
+        prefill_status = str(app.query_one("#status").content)
+        assert "prefill 512.0 tok/s (256 tok)" in prefill_status
+
+        app._on_stream("你好", 2)
+        stream_status = str(app.query_one("#status").content)
+        assert "prefill 512.0 tok/s (256 tok)" in stream_status
+        assert "decode 2 tok" in stream_status
+
+        app._on_done(GenResult(
+            text="你好",
+            n_tokens=2,
+            tok_per_s=30.0,
+            stopped=False,
+            prefill_tokens=256,
+            prefill_s=0.5,
+            prefill_tok_per_s=512.0,
+        ))
+        done_status = str(app.query_one("#status").content)
+        assert "prefill 512.0 tok/s (256 tok)" in done_status
+        assert "decode 30.0 tok/s (2 tok)" in done_status
+
+
+@pytest.mark.asyncio
+async def test_final_status_uses_backend_decode_clock():
+    """结束数字使用引擎 decode-only wall_s，不混入 UI 重绘时间。"""
     from mlx_streaming.tui.backend import GenResult
     app = VatesApp(FakeBackend(), _args())
     async with app.run_test() as pilot:
         await app.workers.wait_for_complete()
         await pilot.pause()
         app._cur = app._add("assistant", "", final=False)
-        # 首 token 在 ~2 秒前到达,基准 2 token;本轮共产出 22 token
-        app._gen_t0 = time.monotonic() - 2.0
-        app._n0 = 2
-        app._on_done(GenResult(text="回答", n_tokens=22, tok_per_s=999.0, stopped=False))
+        app._on_done(GenResult(text="回答", n_tokens=22, tok_per_s=10.0, stopped=False))
         status = str(app.query_one("#status").content)
         assert "就绪" in status
         assert "22 tok" in status
-        assert "999" not in status  # 不用后端上报值
-        # (22-2)/≈2s ≈ 10 tok/s(考虑真实墙钟略大于 2s,给个范围)
-        import re
-        m = re.search(r"([\d.]+) tok/s", status)
-        assert m is not None and 9.0 <= float(m.group(1)) <= 10.0
+        assert "decode 10.0 tok/s" in status

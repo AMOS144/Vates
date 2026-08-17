@@ -104,6 +104,23 @@ def test_snapshot_restore_empty_kvcache():
     assert c.offset == 0
 
 
+def test_progressive_cache_refs_are_rebound_at_each_forward(monkeypatch):
+    from mlx_streaming.mtp.generate import _bind_progressive_cache_refs
+    from mlx_streaming import config
+
+    monkeypatch.setenv("PREFETCH_PROGRESSIVE", "1")
+    layers = [object.__new__(type("Layer", (), {})) for _ in range(2)]
+    old = [object(), object()]
+    current = [object(), object()]
+    for layer, layer_cache in zip(layers, old):
+        object.__setattr__(layer, "_target_cache_ref", layer_cache)
+
+    assert config.prefetch_progressive()
+    _bind_progressive_cache_refs(layers, current)
+
+    assert [layer._target_cache_ref for layer in layers] == current
+
+
 def test_snapshot_restore_arrayscache_idempotent():
     from mlx_streaming.mtp.kv_cache import _snapshot, _restore
     c = kvcache.ArraysCache(size=2)
@@ -112,6 +129,82 @@ def test_snapshot_restore_arrayscache_idempotent():
     c.cache = [mx.zeros((1, 3, 4)), mx.zeros((1, 5))]
     _restore([c], snap)
     assert float(c.cache[0].sum()) == 12.0 and float(c.cache[1].sum()) == 5.0
+
+
+def test_shallow_rollback_restores_qwen_style_cache_updates():
+    from mlx_streaming.mtp.kv_cache import (
+        _shallow_rollback_checkpoint, _restore_shallow_rollback,
+    )
+
+    kv = kvcache.KVCache()
+    k0 = mx.random.normal((1, 2, 3, 8))
+    kv.update_and_fetch(k0, k0)
+    recurrent = kvcache.ArraysCache(size=2)
+    old_conv = mx.ones((1, 3, 4))
+    old_ssm = mx.ones((1, 2, 4, 4))
+    recurrent.cache = [old_conv, old_ssm]
+
+    checkpoint = _shallow_rollback_checkpoint([kv, recurrent])
+    k1 = mx.random.normal((1, 2, 2, 8))
+    kv.update_and_fetch(k1, k1)
+    # The patched Qwen verify writes through __setitem__, replacing entries in
+    # the existing list.  The checkpoint must retain the old array references.
+    recurrent[0] = mx.zeros_like(old_conv)
+    recurrent[1] = mx.zeros_like(old_ssm)
+
+    _restore_shallow_rollback([kv, recurrent], checkpoint)
+    assert kv.offset == 3
+    assert recurrent[0] is old_conv
+    assert recurrent[1] is old_ssm
+
+    # A second forward must not mutate the checkpoint's Python list either.
+    recurrent[0] = mx.zeros_like(old_conv)
+    _restore_shallow_rollback([kv, recurrent], checkpoint)
+    assert recurrent[0] is old_conv
+
+
+def test_shallow_rollback_supports_asymmetric_quantized_cache():
+    from mlx_streaming.core.cache.quant_kv import AsymmetricQuantizedKVCache
+    from mlx_streaming.mtp.kv_cache import (
+        _restore_shallow_rollback, _shallow_rollback_checkpoint,
+    )
+
+    cache = AsymmetricQuantizedKVCache(group_size=32, k_bits=4, v_bits=4)
+    initial = mx.random.normal((1, 1, 3, 32))
+    cache.update_and_fetch(initial, initial)
+    checkpoint = _shallow_rollback_checkpoint([cache])
+    appended = mx.random.normal((1, 1, 2, 32))
+    cache.update_and_fetch(appended, appended)
+
+    _restore_shallow_rollback([cache], checkpoint)
+    assert cache.offset == 3
+
+
+def test_deep_snapshot_restores_asymmetric_quantized_cache():
+    """MTP_VERIFY_MODE=step must support the production K4/V3 cache."""
+    from mlx_streaming.core.cache.quant_kv import AsymmetricQuantizedKVCache
+    from mlx_streaming.mtp.kv_cache import _restore, _snapshot
+
+    cache = AsymmetricQuantizedKVCache(group_size=32, k_bits=4, v_bits=3)
+    initial = mx.random.normal((1, 1, 3, 32))
+    cache.update_and_fetch(initial, initial)
+    snap = _snapshot([cache])
+    before_keys = [mx.array(x) for x in cache.keys]
+    before_values = [mx.array(x) for x in cache.values]
+    mx.eval(before_keys, before_values)
+
+    appended = mx.random.normal((1, 1, 2, 32))
+    cache.update_and_fetch(appended, appended)
+    assert cache.offset == 5
+
+    _restore([cache], snap)
+    assert cache.offset == 3
+    assert cache.group_size == 32
+    assert cache.k_bits == 4 and cache.v_bits == 3
+    for restored, expected in zip(cache.keys, before_keys):
+        assert mx.array_equal(restored, expected[..., :3, :]).item()
+    for restored, expected in zip(cache.values, before_values):
+        assert mx.array_equal(restored, expected[..., :3, :]).item()
 
 
 # ---------------------------------------------------------------- Task 3
@@ -128,6 +221,53 @@ def test_accept_prefix_first_miss():
 def test_accept_prefix_all_match():
     from mlx_streaming.mtp.generate import accept_prefix
     assert accept_prefix([11, 22, 33], [11, 22, 33]) == 3
+
+
+def test_take_optimistic_miss_flag_combines_distinct_pools():
+    from mlx_streaming.mtp.generate import _take_optimistic_miss_flags
+
+    class Pool:
+        def __init__(self, miss):
+            self.miss = miss
+            self.calls = 0
+
+        def take_optimistic_layer_miss_flags(self):
+            self.calls += 1
+            return [(self.calls, mx.array(self.miss))]
+
+    class MLP:
+        def __init__(self, pool):
+            self._vpool = pool
+
+    class Layer:
+        def __init__(self, pool):
+            self.mlp = MLP(pool)
+
+    shared = Pool(False)
+    missing = Pool(True)
+    model = type("Model", (), {})()
+    model.model = type("Inner", (), {})()
+    model.model.layers = [Layer(shared), Layer(shared), Layer(missing)]
+
+    flag, layer_flags = _take_optimistic_miss_flags(model)
+    mx.eval(flag, *[value for _, value in layer_flags])
+    assert bool(flag.item()) is True
+    assert shared.calls == 1
+    assert missing.calls == 1
+
+
+def test_optimistic_layers_are_limited_to_progressive_targets(monkeypatch):
+    from mlx_streaming.mtp.generate import _initial_optimistic_layers
+
+    monkeypatch.setenv("PREFETCH_PROGRESSIVE", "1")
+    monkeypatch.setenv("PREFETCH_PROGRESSIVE_SIGNAL", "target_cache")
+    monkeypatch.setenv("PREFETCH_PROGRESSIVE_REFINE_AHEAD", "1")
+    monkeypatch.setenv("PREFETCH_PROGRESSIVE_TARGET_LAYERS", "2-4,7")
+    model = type("Model", (), {})()
+    model.model = type("Inner", (), {})()
+    model.model.layers = [object() for _ in range(10)]
+
+    assert _initial_optimistic_layers(model) == {2, 3, 4, 7}
 
 
 # ---------------------------------------------------------------- Task 4/5 共用玩具模型
@@ -289,6 +429,26 @@ def test_mtp_generate_greedy_equiv_kv():
     got, stats = mtp_generate(model, _SelfDraft(model), tok=None, prompt=prompt,
                               max_tokens=12, K=1, ids_mode=True)
     assert got == ref
+
+
+def test_mtp_generate_calls_prefill_complete_once():
+    from mlx_streaming.mtp.generate import mtp_generate
+    mx.random.seed(0)
+    model = _ToyModel(nl=2)
+    model.make_cache = lambda: [kvcache.KVCache() for _ in model.layers]
+    mx.eval(model.parameters())
+    calls = []
+    mtp_generate(
+        model,
+        _SelfDraft(model),
+        tok=None,
+        prompt=mx.array([[1, 5, 9]]),
+        max_tokens=6,
+        K=1,
+        ids_mode=True,
+        on_prefill_complete=lambda: calls.append("prefill"),
+    )
+    assert calls == ["prefill"]
 
 
 def test_mtp_generate_greedy_equiv_arrayscache():

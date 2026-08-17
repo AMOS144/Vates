@@ -33,6 +33,41 @@ PREFETCH_TPROF = {
     "take_s": 0.0, "route_s": 0.0, "place_s": 0.0, "place_experts": 0,
 }
 TPROF_ON = config.prefetch_tprof()
+# rerank 诊断默认关闭；开启时会把小型候选向量同步到 host，仅用于基准采集。
+RERANK_PROF = {
+    "candidate_width": 0,
+    "effective_width": 0,
+    "effective_width_samples": [],
+    "resident_count": 0,
+    "retained_mass_sum": 0.0,
+    "n": 0,
+}
+
+
+def note_rerank(scores: mx.array, keep: mx.array, resident_count: int) -> None:
+    """累计动态 width 与保留概率质量；调用方负责仅在诊断开关开启时调用。"""
+    mx.eval(scores, keep)
+    score_values = [float(v) for v in scores.tolist()]
+    keep_values = [bool(v) for v in keep.tolist()]
+    total = sum(score_values)
+    retained = sum(v for v, selected in zip(score_values, keep_values) if selected)
+    effective_width = sum(keep_values)
+    RERANK_PROF["candidate_width"] += len(score_values)
+    RERANK_PROF["effective_width"] += effective_width
+    RERANK_PROF["effective_width_samples"].append(effective_width)
+    RERANK_PROF["resident_count"] += int(resident_count)
+    RERANK_PROF["retained_mass_sum"] = round(
+        RERANK_PROF["retained_mass_sum"] + retained / max(total, 1e-12), 6)
+    RERANK_PROF["n"] += 1
+
+
+def rerank_reset() -> None:
+    """清空 rerank 诊断累计值。"""
+    for key in RERANK_PROF:
+        if key == "effective_width_samples":
+            RERANK_PROF[key] = []
+        else:
+            RERANK_PROF[key] = 0.0 if key == "retained_mass_sum" else 0
 
 
 def note_tprof(seg: str, dt: float, *, count_key: "str | None" = None, count: int = 1) -> None:

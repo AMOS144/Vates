@@ -136,6 +136,56 @@ class AsymmetricQuantizedKVCache:
             tree_map(lambda x: x[..., :self.offset, :], self.values),
         )
 
+    def fork(self):
+        """Return an isolated append-only view for speculative attention.
+
+        The committed prefix may be shared because it is immutable from the
+        fork's point of view.  Trimming the visible capacity to ``offset``
+        forces the next ``update_and_fetch`` to allocate through concatenate,
+        so its slice assignments cannot mutate the live cache arrays.
+        """
+        clone = type(self)(self.group_size, self.k_bits, self.v_bits)
+        clone.offset = self.offset
+        if self.keys is not None:
+            clone.keys = tree_map(
+                lambda x: x[..., :self.offset, :], self.keys,
+            )
+            clone.values = tree_map(
+                lambda x: x[..., :self.offset, :], self.values,
+            )
+        return clone
+
+    @property
+    def state(self):
+        """Return the committed prefix using the mlx-lm cache protocol.
+
+        Speculative ``step`` verification snapshots caches through their
+        ``state``/``meta_state`` interface.  Keeping unused capacity out of the
+        snapshot also prevents a checkpoint from retaining stale appended
+        tokens after rollback.
+        """
+        if self.keys is None:
+            return None, None
+        if self.offset == self.keys[0].shape[-2]:
+            return self.keys, self.values
+        return tree_map(
+            lambda x: x[..., :self.offset, :], (self.keys, self.values)
+        )
+
+    @state.setter
+    def state(self, value):
+        self.keys, self.values = value
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (
+            self.offset, self.group_size, self.k_bits, self.v_bits,
+        )))
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.offset, self.group_size, self.k_bits, self.v_bits = map(int, value)
+
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 

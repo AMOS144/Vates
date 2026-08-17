@@ -17,8 +17,14 @@ class _FakeSrc:
 def _patch_native(monkeypatch, captured):
     fake = types.SimpleNamespace()
 
-    def _prefetch_into_staging(buf, ids, layer, gen, path, stride, res, cap, parallel):
+    def _prefetch_into_staging(
+        buf, ids, layer, gen, path, stride, res, cap, parallel,
+        source_layer, forward_id, priority,
+    ):
         captured["parallel"] = parallel
+        captured["source_layer"] = source_layer
+        captured["forward_id"] = forward_id
+        captured["priority"] = priority
         return mx.zeros((1,), dtype=mx.uint8)
 
     fake.prefetch_into_staging = _prefetch_into_staging

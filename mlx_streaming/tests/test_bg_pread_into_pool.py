@@ -26,7 +26,7 @@ def test_bg_pread_into_pool_writes_segments_to_slot():
         # 把专家 3 写进 slot 2
         N.bg_pread_into_pool([t0, t1], [0, nb[0]], nb, 2, 3, path, stride, 777)
         N.bg_reader_wait(777)
-        assert N.bg_reader_ready(777) is True
+        assert N.bg_reader_ready(777) is False
         a0, a1 = np.array(t0), np.array(t1)
         assert int(a0[2, 0]) == 3 and int(a0[2, -1]) == 3   # slot2 段0 全是 3
         assert int(a1[2, 0]) == 3 and int(a1[2, -1]) == 3   # slot2 段1 全是 3

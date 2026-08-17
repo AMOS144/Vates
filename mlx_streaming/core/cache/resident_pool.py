@@ -70,8 +70,10 @@ class ResidentExpertPool:
         # 在 batch_loader 基础上再把 6N 次碎 mx.array 物化折成每段一次，写池时直接整批 scatter，
         # 既省 frombuffer/mx.array 构造又省 _write_slots_batch 里的 mx.stack。优先级最高。
         self.stacked_batch_loader = stacked_batch_loader
-        self.spec_slots = int(spec_slots)   # >0：侧区模式（预分配 cap+spec、禁 grow）
-        self.spec_gens = max(1, int(spec_gens))   # 侧区代数：双缓冲=2，物理行=cap+spec_gens*spec_slots
+        # The former side-slot count is now a speculative-admission quota.
+        # Physical rows belong to the single merged main pool in every mode.
+        self.spec_slots = int(spec_slots)
+        self.spec_gens = max(1, int(spec_gens))
         # cap_for(layer) 是该层物理行数的「天花板」：profile 指定则用之，否则=全局 capacity。
         # 池按需增长(grow-on-demand)：起步小、随工作集扩大增至天花板才开始 LRU 淘汰。
         # 因此默认(无 profile)即自动右尺寸——内存≈实际工作集,对任意 prompt 自适应,
@@ -114,7 +116,10 @@ class ResidentExpertPool:
             # 复刻基线 8-worker 并行读：demand miss 的 pread 派给 BgReader 并行执行（高优队列）。
             import mlx_streaming.native_moe_ext as _N
             try:
-                _N.bg_reader_start(int(os.environ.get("DEMAND_WORKERS", "8")), 0)
+                _N.bg_reader_start(
+                    int(os.environ.get("DEMAND_WORKERS", "8")),
+                    int(os.environ.get("PREFETCH_LOW_WORKERS", "0")),
+                )
             except Exception:
                 pass
         if self._native_demand and os.environ.get("DEMAND_TIMING") == "1":
@@ -129,6 +134,13 @@ class ResidentExpertPool:
         """该层池容量：profile 指定则用之(上限 capacity)，否则用全局 capacity。"""
         return min(self.layer_caps.get(layer, self.capacity), self.capacity)
 
+    def native_real_cap_for(self, layer: int) -> int:
+        """Return the demand-owned prefix of the physical allocation."""
+        cap = self.cap_for(layer)
+        if config.prefetch_isolated_side_for(layer) and int(layer) > 0:
+            return max(1, cap - self.spec_gens * self.spec_slots)
+        return cap
+
     def _ensure_layer(self, layer: int):
         if layer not in self._slot_of:
             self._slot_of[layer] = OrderedDict()
@@ -142,8 +154,8 @@ class ResidentExpertPool:
     def _alloc_pool(self, layer: int, sample: Dict[str, mx.array]):
         """首次为某层分配池张量,起步 _POOL_INIT_SLOTS 行(不超过该层天花板)。"""
         if self.spec_slots > 0:
-            n = self.cap_for(layer) + self.spec_gens * self.spec_slots   # 预分配满（含 spec_gens 代侧区）
-            # spec/dual 模式：池由 C++ 拥有，侧区异步直写落此 buffer（Route 3 底座）。
+            n = self.cap_for(layer)
+            # Direct prefetch reserves rows inside this same allocation.
             if _POOL_OWNED:
                 self._pools[layer] = _owned_pool(sample, n)
             else:
@@ -157,7 +169,7 @@ class ResidentExpertPool:
             }
         self._alloc[layer] = n
         real = self.cap_for(layer) if self.spec_slots > 0 else n
-        self._free[layer].extend(range(real))    # 原地 mutate,不重新绑定；侧区行不进 free，永不被 LRU 分配/驱逐
+        self._free[layer].extend(range(real))
 
     def _grow_pool(self, layer: int, new_n: int):
         """把某层池物理行数扩到 new_n(封顶 cap_for),拼接保留已驻行的数据与 slot 索引。"""
@@ -248,12 +260,16 @@ class ResidentExpertPool:
         """返回该层 resident pool 里当前已有的专家 id 集合（trace/probe + 侧区预取过滤用）。"""
         if self._native_demand:                      # 方案B：查 C++ g_real，保预取过滤一致
             import mlx_streaming.native_moe_ext as N
-            flat = N.real_region_contents(int(layer))
+            flat = (
+                N.real_verified_contents(int(layer))
+                if config.prefetch_direct_slots()
+                else N.real_region_contents(int(layer))
+            )
             return {int(flat[i]) for i in range(0, len(flat), 2)}
         return set(self._slot_of.get(layer, {}).keys())
 
     def _bootstrap_dual_pool(self, layer: int) -> None:
-        """方案B：首次为该层预分配满(cap+spec_gens*spec)池、eval 固定 data 指针 + C++ real_init。幂等。
+        """首次为该层只预分配统一主池 cap 行，并初始化 C++ 权威映射。幂等。
 
         池结构(per-key typed 数组)由 Python 从一个样本专家的 shape 建；字节后续由 C++ demand pread 写入。
         Python 侧 _slot_of/_free 在方案B dual 路径不再使用（真实区状态归 C++ g_real）。
@@ -262,7 +278,7 @@ class ResidentExpertPool:
         if layer not in self._pools:
             sample = self.loader(layer, 0)           # 仅取 shape/dtype，不写入池
             cap = self.cap_for(layer)
-            n = cap + self.spec_gens * self.spec_slots
+            n = cap
             if _POOL_OWNED:
                 self._pools[layer] = _owned_pool(sample, n)   # C++ 拥有，地址恒定供直写
             else:
@@ -272,7 +288,7 @@ class ResidentExpertPool:
             mx.eval(list(self._pools[layer].values()))   # 固定 data 指针，供 C++ memcpy
             self._alloc[layer] = n
             import mlx_streaming.native_moe_ext as N
-            N.real_init(int(layer), int(cap))
+            N.real_init(int(layer), int(self.native_real_cap_for(layer)))
 
     def resident_lru_scores(self, layer: int) -> dict[int, float]:
         """返回 resident 专家的 LRU 新近度分数：0=最久未用，1=最近使用。"""
@@ -422,13 +438,24 @@ class ResidentExpertPool:
 
         pin 是显式预取，不计入 hit/miss 统计；后续 acquire/acquire_gpu 命中才计 hit。
         """
-        # dual 模式(demand_dual 唯一权威)已弃用 PIN_HOT:真实区归 C++ g_real,Python pinned 不再生效。
-        # 明确报错而非静默无效——请设 PIN_HOT=0。
-        if self._native_demand and list(expert_ids):
-            raise RuntimeError(
-                "PIN_HOT 在 demand_dual(dual 模式)下已弃用:真实区由 C++ g_real 权威、不支持 pin。"
-                "请设 PIN_HOT=0。")
-        loaded = {int(e): self.loader(layer, int(e)) for e in expert_ids}
+        uniq = list(dict.fromkeys(int(e) for e in expert_ids))
+        if not uniq:
+            return
+        loaded = {e: self.loader(layer, e) for e in uniq}
+        if self._native_demand:
+            # dual 热路径的槽账本归 C++ g_real 权威：由它分配并登记不可驱逐
+            # pin，再复用 owned-pool 批量写把完整专家字节同步落入对应真实区槽。
+            self._bootstrap_dual_pool(layer)
+            import mlx_streaming.native_moe_ext as N
+            slots = list(N.real_pin(
+                int(layer), uniq, int(self.native_real_cap_for(layer)),
+            ))
+            if len(slots) != len(uniq):
+                raise RuntimeError("native real_pin 返回槽数与专家数不一致")
+            self._write_slots_batch(
+                layer, slots, [loaded[expert] for expert in uniq],
+            )
+            return
         self.pin_loaded(layer, loaded)
 
     def pin_loaded(self, layer: int, experts: "Dict[int, Dict[str, mx.array]]") -> None:

@@ -168,6 +168,57 @@ def _restore(caches, snaps):
         c.meta_state = meta
 
 
+def _shallow_rollback_checkpoint(caches):
+    """Capture a cheap pre-forward rollback point for Qwen batch verify.
+
+    This deliberately differs from :func:`_snapshot`: it does not copy or
+    evaluate any MLX array.  Qwen's patched gated-delta verify replaces the
+    two ArraysCache entries instead of mutating the old arrays, so retaining
+    their references is sufficient.  KVCache appends in place, but rollback
+    only needs its old logical offset; bytes beyond that offset are dead and
+    will be overwritten by the next update.
+
+    The helper is intentionally private and only used on the model-checked
+    direct-commit path in ``mtp.generate``.  Generic replay fallbacks continue
+    to use the conservative deep snapshot above.
+    """
+    checkpoints = []
+    for c in caches:
+        if c.is_trimmable():
+            # mlx-lm's KVCache exposes size(), while the asymmetric quantized
+            # cache used by the real CLI tracks the same logical length in
+            # ``offset``.  The benchmark happened to exercise only the former
+            # and therefore hid this API mismatch.
+            size = c.size() if hasattr(c, "size") else c.offset
+            checkpoints.append((
+                "trim", int(size), getattr(c, "meta_state", None),
+            ))
+        else:
+            # Copy the Python container, not its arrays.  ArraysCache.__setitem__
+            # mutates the container during forward, while the arrays themselves
+            # are replaced by the Qwen checkpoint patch.
+            checkpoints.append((
+                "refs", list(c.state), getattr(c, "meta_state", None),
+            ))
+    return checkpoints
+
+
+def _restore_shallow_rollback(caches, checkpoints):
+    """Restore a checkpoint produced by ``_shallow_rollback_checkpoint``."""
+    for c, (kind, state, meta) in zip(caches, checkpoints):
+        if kind == "trim":
+            size = c.size() if hasattr(c, "size") else c.offset
+            c.trim(max(0, int(size) - state))
+        else:
+            # Install a fresh list because the next forward mutates its entries.
+            c.state = list(state)
+        c.meta_state = meta
+        if hasattr(c, "_spec_checkpoints"):
+            c._spec_checkpoints = None
+        if hasattr(c, "_capture_spec_checkpoints"):
+            c._capture_spec_checkpoints = False
+
+
 def commit_verified_prefix(caches, verified_len: int, accepted_len: int) -> bool:
     """把验证前向产生的 cache 直接提交到 accepted prefix。
 

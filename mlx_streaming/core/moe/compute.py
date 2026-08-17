@@ -136,33 +136,74 @@ class PersistentSubGLU:
         self._glu = glu
         self._n = n
 
+    def release_bound(self) -> None:
+        """Drop transient expert arrays after a long expert-major layer."""
+        self._glu = None
+        self._n = None
+        self._bound_signature = None
+
     def forward(self, fetched: dict, n: int, x: mx.array, local: mx.array) -> mx.array:
-        self._ensure(n)
-        _update_qsl(self._glu.gate_proj, "gate_proj", fetched)
-        _update_qsl(self._glu.up_proj, "up_proj", fetched)
-        _update_qsl(self._glu.down_proj, "down_proj", fetched)
+        self._bind(fetched, n)
         if self.swiglu_limit > 0:
-            # DeepSeek 路径：手动 gate/up/clip/silu/down，不能用 SwiGLU 融合激活
-            # （镜像 deepseek_v4.Experts：up 双侧 clip、gate 上侧 minimum）。
-            x_exp = mx.expand_dims(x, (-2, -3))            # (..., 1, 1, D)
+            # DeepSeek path below retains its special clipping semantics.
+            x_exp = mx.expand_dims(x, (-2, -3))
             gate = self._glu.gate_proj(x_exp, local)
             up = self._glu.up_proj(x_exp, local)
             up = mx.clip(up, -self.swiglu_limit, self.swiglu_limit)
             gate = mx.minimum(gate, self.swiglu_limit)
             h = nn.silu(gate) * up
-            y = self._glu.down_proj(h, local)
-            return y.squeeze(-2)
+            return self._glu.down_proj(h, local).squeeze(-2)
         max_fused_seq = config.custom_fused_moe_max_seq()
         if (x.shape[1] <= max_fused_seq
-                and _custom_fused_moe_enabled(self.layer_idx or -1, self.proj_bits)):
+                and _custom_fused_moe_enabled(
+                    -1 if self.layer_idx is None else self.layer_idx,
+                    self.proj_bits,
+                )):
             return self._custom_fused_forward(x, local)
         max_seq = config.custom_qproj_max_seq()
         if (x.shape[1] <= max_seq
-                and _custom_qproj_enabled(self.layer_idx or -1, self.proj_bits["gate_proj"])):
+                and _custom_qproj_enabled(
+                    -1 if self.layer_idx is None else self.layer_idx,
+                    self.proj_bits["gate_proj"],
+                )):
             return self._custom_gate_up_forward(x, local)
         return self._glu(x, local)
 
-    def _custom_fused_forward(self, x: mx.array, local: mx.array) -> mx.array:
+    def _bind(self, fetched: dict, n: int) -> None:
+        self._ensure(n)
+        signature = (
+            int(n),
+            *((key, id(value)) for key, value in sorted(fetched.items())),
+        )
+        if getattr(self, "_bound_signature", None) != signature:
+            _update_qsl(self._glu.gate_proj, "gate_proj", fetched)
+            _update_qsl(self._glu.up_proj, "up_proj", fetched)
+            _update_qsl(self._glu.down_proj, "down_proj", fetched)
+            self._bound_signature = signature
+
+    def forward_gate_up(
+        self, fetched: dict, n: int, x: mx.array, local: mx.array,
+    ) -> mx.array:
+        """Consume only the six gate/up arrays of a partially-ready row."""
+        self._bind(fetched, n)
+        x_exp = mx.expand_dims(x, (-2, -3))
+        gate = self._glu.gate_proj(x_exp, local)
+        up = self._glu.up_proj(x_exp, local)
+        return self._glu.activation(up, gate)
+
+    def forward_down(
+        self, fetched: dict, n: int, hidden: mx.array, local: mx.array,
+    ) -> mx.array:
+        """Consume the down arrays after their second readiness event."""
+        self._bind(fetched, n)
+        return self._glu.down_proj(hidden, local).squeeze(-2)
+
+    def _custom_fused_forward(
+        self,
+        x: mx.array,
+        local: mx.array,
+        active_mask: "mx.array | None" = None,
+    ) -> mx.array:
         """完整替换 gate/up/SwiGLU/down，保持 SwitchGLU 的 [B,S,K,H] 输出契约。"""
         shape = local.shape
         k = int(shape[-1])
@@ -175,8 +216,31 @@ class PersistentSubGLU:
             self._glu.up_proj["weight"], self._glu.up_proj["scales"], self._glu.up_proj["biases"],
             self._glu.down_proj["weight"], self._glu.down_proj["scales"], self._glu.down_proj["biases"],
             self.hidden, self.moe_inter, self.group_size, self.proj_bits["gate_proj"],
+            active_mask=active_mask,
         )
         return y.reshape(shape + (self.hidden,))
+
+    def forward_masked(
+        self,
+        fetched: dict,
+        n: int,
+        x: mx.array,
+        local: mx.array,
+        active_mask: mx.array,
+    ) -> mx.array:
+        """Fused expert pass that performs no matmul for inactive routes."""
+        self._ensure(n)
+        _update_qsl(self._glu.gate_proj, "gate_proj", fetched)
+        _update_qsl(self._glu.up_proj, "up_proj", fetched)
+        _update_qsl(self._glu.down_proj, "down_proj", fetched)
+        if not _custom_fused_moe_enabled(
+            -1 if self.layer_idx is None else self.layer_idx,
+            self.proj_bits,
+        ):
+            raise RuntimeError("masked split compute requires CUSTOM_FUSED_MOE")
+        return self._custom_fused_forward(
+            x, local, active_mask=active_mask,
+        )
 
     def _custom_gate_up_forward(self, x: mx.array, local: mx.array) -> mx.array:
         """只替换 gate/up projection；down 仍走 MLX QuantizedSwitchLinear。"""

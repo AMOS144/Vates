@@ -105,7 +105,7 @@ def main():
     t1 = time.perf_counter()
     after_patch = snapshot()
 
-    # 分块 prefill:把 mlx_lm.generate 内部 prefill 步长压到 config.prefill_chunk()(默认 2),
+    # 分块 prefill:使用固定的 32K Expert-major superblock，
     # 整段 prefill 的激活峰值 ∝prompt 长度 → ∝chunk,使 prefill 与 decode 同稳态。
     # PREFILL_CHUNK=0 时不传,回退 mlx_lm 默认 2048。
     _ps = config.prefill_chunk()

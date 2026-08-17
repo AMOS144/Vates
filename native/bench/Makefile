@@ -2,7 +2,8 @@
 # 按类别分级：io/（blob/array 读写）、compute/（量化线性、compute buffer）、metal/（Metal 内核）。
 CXX ?= c++
 CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra
-PY_SITE := $(abspath ../../.venv/lib/python3.12/site-packages)
+PYTHON ?= python3
+PY_SITE := $(shell $(PYTHON) -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
 MLX_INC := $(PY_SITE)/mlx/include
 MLX_LIB := $(PY_SITE)/mlx/lib
 
