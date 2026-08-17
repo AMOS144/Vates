@@ -42,10 +42,9 @@ def _mem_suffix(peak: bool = False) -> str:
 
 # 生成中状态栏用滑动窗口算「瞬时」tok/s 的时间窗(秒);越小越灵敏、越大越平滑。
 _TPS_WINDOW = 1.0
-# Textual's call_from_thread is synchronous. Rebuilding and laying out the
-# growing message on every speculative step puts UI work directly on the
-# decode critical path. Five visual updates per second remain fluid while
-# keeping rendering out of the model throughput measurement.
+# UI 线程定时拉取 worker 发布的最新文本。不能在 decode worker
+# 中用 call_from_thread 做流式重绘：它是同步的，会把 Textual 布局时间
+# 直接计入 mtp_generate.wall_s。
 _STREAM_UPDATE_INTERVAL = 0.2
 
 _HELP = (
@@ -123,6 +122,11 @@ class VatesApp(App):
         # (排除 prefill)。_gen_t0 为 0.0 表示本轮尚未收到首 token。
         self._gen_t0 = 0.0
         self._n0 = 0
+        self._prefill_tokens = 0
+        self._prefill_tps = 0.0
+        # worker 只原子替换这个引用；UI timer 以固定频率取最新帧。
+        # 中间帧可以丢弃，_on_done 始终提交完整最终文本。
+        self._pending_stream: Optional[tuple[str, int]] = None
         # 生成中「瞬时」tok/s 的滑动窗口采样:每项为 (时刻, 累计 token 数)。
         self._tps_window = _TPS_WINDOW
         self._samples: deque[tuple[float, int]] = deque()
@@ -142,6 +146,14 @@ class VatesApp(App):
         # 加载完成前禁用输入框,避免用户在模型就绪前发消息
         inp.disabled = True
         self._set_status("加载模型中…")
+        interval = max(
+            0.05,
+            float(os.environ.get(
+                "TUI_STREAM_UPDATE_INTERVAL",
+                str(_STREAM_UPDATE_INTERVAL),
+            )),
+        )
+        self.set_interval(interval, self._flush_pending_stream)
         self._load()
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -157,8 +169,9 @@ class VatesApp(App):
         return t
 
     def _set_status(self, text: str) -> None:
-        self.query_one("#status", Static).update(
-            f" {_short_model(self.args.model)} · {text}")
+        # 模型名已在顶栏展示。状态栏宽度宝贵，优先留给
+        # decode/prefill 速度，避免窄终端把最重要的数字截断。
+        self.query_one("#status", Static).update(f" {text}")
 
     @work(thread=True, exclusive=True, group="load")
     def _load(self) -> None:
@@ -233,6 +246,9 @@ class VatesApp(App):
         # 置 0 表示还没收到首 token;真正的计时起点推迟到第一次 _on_stream。
         self._gen_t0 = 0.0
         self._n0 = 0
+        self._prefill_tokens = 0
+        self._prefill_tps = 0.0
+        self._pending_stream = None
         self._samples.clear()
         self.query_one("#prompt", Input).disabled = True
         self._set_status("思考中…")
@@ -241,41 +257,41 @@ class VatesApp(App):
     @work(thread=True, exclusive=True, group="gen")
     def _generate(self, messages: list[dict]) -> None:
         # 生成在 worker 线程运行;on_text 返回 self._stop 让后端可提前中断
-        last_update = 0.0
-        update_interval = max(
-            0.0,
-            float(os.environ.get(
-                "TUI_STREAM_UPDATE_INTERVAL",
-                str(_STREAM_UPDATE_INTERVAL),
-            )),
-        )
-
         def on_text(full: str, n_tokens: int) -> bool:
-            nonlocal last_update
-            # 应用已退出时,call_from_thread 会抛错;此时直接请求停止,避免 worker 线程未捕获异常。
             if not self.is_running:
                 return True
-            # Poll interruption on every model callback, but only cross into
-            # the UI thread at the display cadence. _on_done always publishes
-            # the complete final text, so skipped intermediate frames are safe.
-            now = time.monotonic()
-            if last_update and now - last_update < update_interval:
-                return self._stop
-            try:
-                self.call_from_thread(self._on_stream, full, n_tokens)
-            except Exception:  # noqa: BLE001
-                return True
-            last_update = time.monotonic()
+            # 不跨线程等待 UI；只发布最新帧，让 timer 稍后渲染。
+            self._pending_stream = (full, n_tokens)
             return self._stop
 
+        def on_prefill(n_tokens: int, seconds: float, tok_per_s: float) -> None:
+            if not self.is_running:
+                return
+            try:
+                self.call_from_thread(
+                    self._on_prefill, n_tokens, seconds, tok_per_s,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
         try:
-            result = self.backend.generate(messages, on_text)
+            result = self.backend.generate(
+                messages, on_text, on_prefill=on_prefill,
+            )
         except Exception as e:  # noqa: BLE001
             if self.is_running:
                 self.call_from_thread(self._on_error, str(e))
             return
         if self.is_running:
             self.call_from_thread(self._on_done, result)
+
+    def _flush_pending_stream(self) -> None:
+        """UI 线程定时渲染最新帧，不阻塞模型 worker。"""
+        pending = self._pending_stream
+        if pending is None or not self._busy:
+            return
+        self._pending_stream = None
+        self._on_stream(*pending)
 
     def _record_sample(self, now: float, n_tokens: int) -> None:
         """记录一次采样,并丢弃早于滑动窗口的旧点(保留跨越窗口边界的那一个)。"""
@@ -296,6 +312,26 @@ class VatesApp(App):
             return None
         return (self._samples[-1][1] - n0) / dt
 
+    def _on_prefill(
+        self, n_tokens: int, seconds: float, tok_per_s: float,
+    ) -> None:
+        """Prompt ingestion 完成；在首个 decode token 前就公布速度。"""
+        del seconds  # 当前状态栏只展示吞吐，结果中仍保留耗时。
+        self._prefill_tokens = n_tokens
+        self._prefill_tps = tok_per_s
+        self._set_status(
+            f"解码中 · prefill {tok_per_s:.1f} tok/s ({n_tokens} tok)"
+            f"{_mem_suffix()}"
+        )
+
+    def _prefill_status(self) -> str:
+        if self._prefill_tokens <= 0 or self._prefill_tps <= 0:
+            return ""
+        return (
+            f"prefill {self._prefill_tps:.1f} tok/s "
+            f"({self._prefill_tokens} tok)"
+        )
+
     def _on_stream(self, full: str, n_tokens: int) -> None:
         if self._cur is not None:
             self._cur.stream(full)
@@ -309,33 +345,44 @@ class VatesApp(App):
         self._record_sample(now, n_tokens)
         tps = self._window_tps(now)
         mem = _mem_suffix()
+        prefill = self._prefill_status()
         if tps is None:
-            self._set_status(f"思考中 · {n_tokens} tok{mem}")
+            suffix = f" · {prefill}" if prefill else ""
+            self._set_status(f"思考中 · decode {n_tokens} tok{suffix}{mem}")
         else:
-            self._set_status(f"思考中 · {n_tokens} tok · {tps:.1f} tok/s{mem}")
+            suffix = f" · {prefill}" if prefill else ""
+            self._set_status(
+                f"思考中 · decode {tps:.1f} tok/s ({n_tokens} tok)"
+                f"{suffix}{mem}"
+            )
 
     def _on_done(self, result: GenResult) -> None:
         if self._cur is not None:
             self._cur.finalize(result.text)
         self._messages.append({"role": "assistant", "content": result.text})
         self._busy = False
+        self._pending_stream = None
         self._cur = None
         suffix = " · 已中断" if result.stopped else ""
-        # 与流式状态栏同口径:从首 token 起、按解码 token 数算,避免结束瞬间数字回落。
-        # 若本轮没触发过流式(_gen_t0 仍为 0),退回后端上报的 tok/s。
-        dt = time.monotonic() - self._gen_t0
-        if self._gen_t0 > 0.0 and dt > 0:
-            tps = (result.n_tokens - self._n0) / dt
-        else:
-            tps = result.tok_per_s
+        # 最终数字使用引擎的 decode-only wall_s。UI timer 只决定显示
+        # 帧率，不应该参与模型吞吐的计时。
+        tps = result.tok_per_s
+        if result.prefill_tokens > 0 and result.prefill_tok_per_s > 0:
+            self._prefill_tokens = result.prefill_tokens
+            self._prefill_tps = result.prefill_tok_per_s
+        prefill = self._prefill_status()
+        prefill_suffix = f" · {prefill}" if prefill else ""
         self._set_status(
-            f"就绪 · {result.n_tokens} tok · {tps:.1f} tok/s{_mem_suffix(peak=True)}{suffix}")
+            f"就绪 · decode {tps:.1f} tok/s ({result.n_tokens} tok)"
+            f"{prefill_suffix}{_mem_suffix(peak=True)}{suffix}"
+        )
         self._enable_input()
 
     def _on_error(self, err: str) -> None:
         if self._cur is not None:
             self._cur.finalize(f"生成出错:{err}")
         self._busy = False
+        self._pending_stream = None
         self._cur = None
         self._set_status("就绪(上一轮出错)")
         self._enable_input()

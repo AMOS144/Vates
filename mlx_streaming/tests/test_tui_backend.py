@@ -155,7 +155,10 @@ def test_mlx_backend_splits_sync_prefill_and_async_decode(monkeypatch):
         seen.append(("decode", os.environ["DEMAND_ASYNC"]))
         if on_tokens is not None:
             on_tokens([10])
-        return [10], {"resident_tokens": prompt.shape[1]}
+        return [10], {
+            "resident_tokens": prompt.shape[1],
+            "wall_s": 0.25,
+        }
 
     monkeypatch.setattr(gen_mod, "mtp_generate", fake_mtp_generate)
     args = types.SimpleNamespace(model="m", k=3, max_tokens=8, system=None)
@@ -164,10 +167,25 @@ def test_mlx_backend_splits_sync_prefill_and_async_decode(monkeypatch):
     backend._model = types.SimpleNamespace(make_cache=lambda: object())
     backend._drafter = object()
 
-    backend.generate([{"role": "user", "content": "hi"}], lambda full, n: False)
+    prefill = []
+    result = backend.generate(
+        [{"role": "user", "content": "hi"}],
+        lambda full, n: False,
+        on_prefill=lambda tokens, seconds, tps: prefill.append(
+            (tokens, seconds, tps)
+        ),
+    )
 
     assert seen == [("prefill", "0"), ("decode", "1")]
     assert os.environ["DEMAND_ASYNC"] == "0"
+    assert len(prefill) == 1
+    assert prefill[0][0] == 3
+    assert prefill[0][1] > 0
+    assert prefill[0][2] > 0
+    assert result.prefill_tokens == 3
+    assert result.prefill_s > 0
+    assert result.prefill_tok_per_s > 0
+    assert result.tok_per_s == 4.0
 
 
 def test_common_prefix_len():

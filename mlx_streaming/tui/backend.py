@@ -17,6 +17,9 @@ class GenResult:
     n_tokens: int  # 新生成 token 数
     tok_per_s: float  # 吞吐
     stopped: bool  # 是否被用户中断
+    prefill_tokens: int = 0  # 本轮实际 prefill token 数（扣除已复用前缀）
+    prefill_s: float = 0.0
+    prefill_tok_per_s: float = 0.0
 
 
 class ChatBackend(Protocol):
@@ -30,8 +33,9 @@ class ChatBackend(Protocol):
         self,
         messages: list[dict],
         on_text: Callable[[str, int], bool],
+        on_prefill: Callable[[int, float, float], None] | None = None,
     ) -> GenResult:
-        """跑一轮生成。每步把「累计完整文本, 已生成 token 数」传给 on_text;返回 True 表示请求中断。"""
+        """跑一轮生成。on_prefill 在 prompt ingestion 完成时上报 token/耗时/速度。"""
         ...
 
 
@@ -51,7 +55,7 @@ class FakeBackend:
         for m in self.status_msgs:
             on_status(m)
 
-    def generate(self, messages, on_text) -> GenResult:
+    def generate(self, messages, on_text, on_prefill=None) -> GenResult:
         import time
 
         self.seen_messages.append([dict(m) for m in messages])
@@ -111,7 +115,7 @@ class MLXBackend:
         on_status("预热中(编译 kernel + 填专家池)…")
         _warmup(self._model, self._tok, self._drafter, self.args)
 
-    def generate(self, messages, on_text) -> GenResult:
+    def generate(self, messages, on_text, on_prefill=None) -> GenResult:
         import os
         import time
 
@@ -158,9 +162,19 @@ class MLXBackend:
         if split_demand:
             os.environ["DEMAND_ASYNC"] = "0"
 
+        prefill_tokens = max(0, len(ids) - cached_len)
+        prefill_s = 0.0
+
         def on_prefill_complete():
+            nonlocal prefill_s
+            prefill_s = max(0.0, time.perf_counter() - t0)
             if split_demand:
                 os.environ["DEMAND_ASYNC"] = "1"
+            if on_prefill is not None:
+                prefill_tps = (
+                    prefill_tokens / prefill_s if prefill_s > 0 else 0.0
+                )
+                on_prefill(prefill_tokens, prefill_s, prefill_tps)
 
         t0 = time.perf_counter()
         try:
@@ -203,5 +217,19 @@ class MLXBackend:
 
         out_ids = _truncate_eos(produced, eos)
         text = tok.decode(out_ids)
-        tps = len(out_ids) / dt if dt > 0 else 0.0
-        return GenResult(text, len(out_ids), tps, stopped=stopped["v"])
+        # mtp_generate.wall_s 从 prefill/decode 边界开始，是引擎权威的
+        # decode-only 时钟。dt 包含 prompt ingestion，不能用来标 decode 吞吐。
+        decode_s = float(stats.get("wall_s") or 0.0)
+        if decode_s <= 0:
+            decode_s = max(0.0, dt - prefill_s)
+        tps = len(out_ids) / decode_s if decode_s > 0 else 0.0
+        prefill_tps = prefill_tokens / prefill_s if prefill_s > 0 else 0.0
+        return GenResult(
+            text,
+            len(out_ids),
+            tps,
+            stopped=stopped["v"],
+            prefill_tokens=prefill_tokens,
+            prefill_s=prefill_s,
+            prefill_tok_per_s=prefill_tps,
+        )
