@@ -116,12 +116,6 @@ class BlobExpertSource:
         for f in futs:
             f.result()
 
-    def release_prefetched(self, layer: int, expert_ids) -> None:
-        """Release consumed raw-byte lookahead without disturbing other layers."""
-        with self._lock:
-            for expert in expert_ids:
-                self._pf_cache.pop((int(layer), int(expert)), None)
-
     def read_raw(self, layer: int, expert_ids) -> "list[bytes]":
         """取原始字节：优先用预取缓存/在途结果，未命中的并行 pread（仅 IO）。"""
         ids = [int(e) for e in expert_ids]
@@ -187,8 +181,6 @@ class BlobExpertSource:
                 arr = arr.view(mx.bfloat16)
             out[f"{proj}.{tensor}"] = arr
             off += nb
-        if config.expert_major_double_buffer():
-            self.release_prefetched(layer, ids)
         return out
 
     def load_experts_native(self, layer: int, expert_ids, view_bf16: bool = False) -> dict:

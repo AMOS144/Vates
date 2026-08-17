@@ -21,8 +21,10 @@ def _tiny_model():
         num_attention_heads=4,
         linear_num_value_heads=2,
         linear_num_key_heads=2,
-        linear_key_head_dim=32,
-        linear_value_head_dim=32,
+        # Match the production blocked-GDN ABI; this clean branch deliberately
+        # does not carry the generic-shape fallback from the experiment branch.
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
         linear_conv_kernel_dim=4,
         num_experts=0,
         num_experts_per_tok=1,
@@ -41,6 +43,7 @@ def _tiny_model():
     )
     mx.random.seed(0)
     model = Model(args)
+    model.set_dtype(mx.bfloat16)
     mx.eval(model.parameters())
     return model
 
@@ -93,7 +96,6 @@ def test_short_prompt_single_chunk():
 
 def test_expert_major_prefill_projects_only_last_token(monkeypatch):
     """Prefill never materialises unused prompt-wide vocab logits."""
-    monkeypatch.setenv("EXPERT_MAJOR_LAYER_BARRIER", "1")
     model = _tiny_model()
     ids = mx.array([[1, 5, 9, 2, 7, 3, 8]])
     cache = model.make_cache()
@@ -111,7 +113,6 @@ def test_expert_major_last_token_matches_full_attention(monkeypatch):
     reference, _ = forward_with_hidden(model, ids, reference_cache)
     mx.eval(reference)
 
-    monkeypatch.setenv("EXPERT_MAJOR_ATTENTION_TILE", "3")
     major_cache = model.make_cache()
     actual, _ = prefill_chunked(model, ids, major_cache, chunk=0)
     mx.eval(actual)

@@ -10,32 +10,8 @@ FINAL_DEFAULTS = {
     # prompt.  Do not disguise that I/O with tens of GB of macOS page cache or
     # let the cache inflate machine-wide memory outside MLX accounting.
     "STREAM_BLOB_NOCACHE": "1",
-    # A 32K superblock is still layer-major Expert-major (not the legacy tiny
-    # token chunk).  At 256K it bounds activations while the compact K4/V3 KV
-    # cache carries exact context across eight blocks.  Re-reading experts is
-    # negligible beside exact long-context attention and avoids a >10 GB peak.
-    "PREFILL_CHUNK": "32768",
-    "EXPERT_MAJOR_GROUP_EXPERTS": "128",
-    "EXPERT_MAJOR_MAX_ASSIGNMENTS": "32768",
-    "EXPERT_MAJOR_TRANSIENT_BANK": "1",
-    "EXPERT_MAJOR_LAYER_BARRIER": "1",
-    "EXPERT_MAJOR_CLEAR_CACHE": "1",
-    "EXPERT_MAJOR_ATTENTION_TILE": "2048",
-    "EXPERT_MAJOR_GDN_TILE": "512",
-    # Register-resident blocked recurrence removes the stock kernel's
-    # redundant q/k reads.  32K: 416.35 -> 464.44 tok/s at the same 5.14 GB
-    # peak; a 1024-token prefill + 32 greedy tokens matched exactly.
-    "EXPERT_MAJOR_FUSED_GDN": "1",
-    # These completed experimental kernels remain opt-in because real-model
-    # A/B did not meet the production speed/accuracy gate.
-    "EXPERT_MAJOR_FUSED_ATTENTION": "0",
-    "EXPERT_MAJOR_DENSE_STEEL_ATTENTION": "0",
-    "EXPERT_MAJOR_METAL_GEMM": "0",
-    "EXPERT_MAJOR_DOUBLE_BUFFER": "0",
-    # 16M score elements permits a 512-query tile at 32K and remains bounded
-    # at longer contexts.  On the 80B model this improved 32K prefill from
-    # 328.64 to 363.67 tok/s while peak memory moved only 4.80 -> 4.97 GB.
-    "EXPERT_MAJOR_ATTENTION_SCORE_BUDGET": "16777216",
+    # Expert-major implementation and its 32K/128-expert/16M-score constants
+    # are compiled into the clean production path rather than env-selectable.
     "KV_QUANT": "1",
     "KV_K_BITS": "4",
     "KV_V_BITS": "3",
@@ -73,6 +49,13 @@ FINAL_DEFAULTS = {
     "MTP_ADAPTIVE_DEPTH": "1",
     "MTP_CONF_TAU": "0.3",
     "MTP_DEPTH_MAX": "3",
+    "MTP_VERIFY_MODE": "batch",
+    "MTP_HIDDEN": "pre_norm",
+    "MTP_ADAPTIVE_RESCUE": "0",
+    "TREE_TOP2": "0",
+    "TREE_TOP2_P1": "0",
+    "TREE_VERIFY": "0",
+    "ACCEPT_TOPK": "0",
     "NATIVE_FUSED_PREFETCH": "1",
     "NATIVE_NO_SUBMIT": "0",
     # The logical rerank remains 15/26-wide for the recall audit, while only
@@ -88,6 +71,10 @@ FINAL_DEFAULTS = {
     "PREFETCH_ADAPTIVE_FILL": "0.85",
     "PREFETCH_ADAPTIVE_COOLDOWN": "32",
     "PREFETCH_PROGRESSIVE": "0",
+    "PREFETCH_PROGRESSIVE_AFTER_PREFILL": "0",
+    "PREFETCH_OPTIMISTIC_VERIFY": "0",
+    "PREFETCH_OPTIMISTIC_AFTER_WARMUP": "0",
+    "PREFETCH_ONLINE_TRANSITION": "0",
     "CROSS_LAYER_AHEAD_PROFILE": "5-6:2",
     "POOL_LAYER_CAP_OVERRIDES": "2:216,5:152",
     "PREFETCH_RERANK": "noisy_or",
@@ -118,7 +105,9 @@ FINAL_DEFAULTS = {
 
 def configure() -> None:
     for name, value in FINAL_DEFAULTS.items():
-        os.environ.setdefault(name, value)
+        # This branch represents one measured profile, not an experiment
+        # matrix. Prevent stale shell variables from silently changing it.
+        os.environ[name] = value
     # Worktrees do not duplicate the large model directory.  When the caller
     # supplies an absolute target MODEL, resolve the default MTP expert shard
     # beside it instead of relative to the worktree's current directory.
@@ -133,11 +122,23 @@ def configure() -> None:
 def _chat_argv(argv: list[str]) -> list[str] | None:
     if not argv or argv[0] not in ("chat", "--chat"):
         return None
+    rest = list(argv[1:])
+    for option, expected in (
+        ("--expert-slots", FINAL_DEFAULTS["EXPERT_SLOTS"]),
+        ("--spec-slots", FINAL_DEFAULTS["POOL_SPEC_SLOTS"]),
+    ):
+        while option in rest:
+            index = rest.index(option)
+            if index + 1 >= len(rest) or rest[index + 1] != expected:
+                raise ValueError(
+                    f"{option} is fixed at {expected} on the optimal branch",
+                )
+            del rest[index:index + 2]
     return [
         "chat",
         "--expert-slots", FINAL_DEFAULTS["EXPERT_SLOTS"],
         "--spec-slots", FINAL_DEFAULTS["POOL_SPEC_SLOTS"],
-        *argv[1:],
+        *rest,
     ]
 
 

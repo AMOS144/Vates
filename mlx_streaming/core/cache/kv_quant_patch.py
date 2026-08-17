@@ -82,7 +82,7 @@ def patch_kv_quant(model, *, group_size=64, k_bits=4, v_bits=3, rotate=True, see
     layers = inner.layers
 
     head_dim = None
-    for layer_idx, l in enumerate(layers):
+    for l in layers:
         if not l.is_linear:
             head_dim = l.self_attn.head_dim
             break
@@ -102,7 +102,6 @@ def patch_kv_quant(model, *, group_size=64, k_bits=4, v_bits=3, rotate=True, see
         object.__setattr__(attn, "_kvq_gs", group_size)
         object.__setattr__(attn, "_kvq_kb", k_bits)
         object.__setattr__(attn, "_kvq_vb", v_bits)
-        object.__setattr__(attn, "_kvq_layer_idx", layer_idx)
         attn.__class__ = _RotatedQuantAttn
 
     def make_cache():

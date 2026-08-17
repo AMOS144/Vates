@@ -119,7 +119,7 @@ class FileStreamingMoeBlock:
 
         ``inds`` and ``scores`` are flattened in token-major order.  A single
         GPU argsort makes every expert's assignments contiguous.  We then load
-        at most ``EXPERT_MAJOR_GROUP_EXPERTS`` expert rows, gather only their
+        at most 128 expert rows, gather only their
         routed tokens, and scatter their weighted results straight into the
         final [B*S,H] output.  In particular, this never creates the legacy
         [B,S,K,H] result (about 10 GiB at 256K for Qwen3-Next).
@@ -147,14 +147,11 @@ class FileStreamingMoeBlock:
 
         x_flat = x.reshape(tokens, hidden)
         output = mx.zeros((tokens, hidden), dtype=x.dtype)
-        max_group_experts = min(
-            int(layer_cap), config.expert_major_group_experts(),
-        )
-        if config.expert_major_double_buffer():
-            # Current materialized half-bank plus next raw-byte half-bank stays
-            # within the former single-bank expert budget.
-            max_group_experts = max(1, max_group_experts // 2)
-        max_assignments = config.expert_major_max_assignments()
+        # Fixed at the winning real-model A/B point.  The rejected Metal GEMM
+        # and equal-budget double-buffer variants live only on the experiment
+        # branch.
+        max_group_experts = min(int(layer_cap), 128)
+        max_assignments = 32768
         groups = []
         active_group = []
         assignment_count = 0
@@ -178,113 +175,43 @@ class FileStreamingMoeBlock:
         profile_upload_ms = 0.0
         profile_compute_ms = 0.0
         prefix = 0
-        for group_index, (active_experts, group_count) in enumerate(groups):
+        blob = getattr(self.store, "_blob_loader", None)
+        if blob is None:
+            raise RuntimeError(
+                "optimal Expert-major prefill requires STREAM_BLOB_LOADER=1",
+            )
+        for active_experts, group_count in groups:
             end = prefix + group_count
 
             assignment_pos = order[prefix:end]
             token_pos = assignment_pos // k
             group_routes = route_ids[assignment_pos]
             route_shape = (1, group_count, 1)
-            vpool = getattr(self, "_vpool", None)
-            blob = getattr(self.store, "_blob_loader", None)
-            transient_bank = bool(
-                config.expert_major_transient_bank() and blob is not None
+            # A single reusable transient bank keeps prefill independent of
+            # the 48 decode pools and bounds memory without page-cache tricks.
+            profile_started = time.perf_counter() if trace_major else 0.0
+            pool_arrays = blob.load_experts_stacked(
+                int(self.layer_idx), active_experts,
             )
-            native_authority = bool(
-                not transient_bank
-                and
-                vpool is not None
-                and getattr(self.store._resident, "_native_demand", False)
-            )
-            if transient_bank:
-                # A single reusable logical compute bank: do not populate the
-                # 48 per-layer decode pools just because a long prompt touches
-                # almost all 512 experts.  The stacked arrays die after this
-                # group and the next layer reuses the same memory budget.
-                profile_started = time.perf_counter() if trace_major else 0.0
-                pool_arrays = blob.load_experts_stacked(
-                    int(self.layer_idx), active_experts,
-                )
-                if (
-                    config.expert_major_double_buffer()
-                    and group_index + 1 < len(groups)
-                ):
-                    # CPU/NVMe fill of bank B overlaps bank A's Metal GEMM.
-                    blob.prefetch_async(
-                        int(self.layer_idx), groups[group_index + 1][0],
-                    )
-                if trace_major:
-                    profile_read_ms += (
-                        time.perf_counter() - profile_started
-                    ) * 1000.0
-                    profile_started = time.perf_counter()
-                    mx.eval(*pool_arrays.values())
-                    profile_upload_ms += (
-                        time.perf_counter() - profile_started
-                    ) * 1000.0
-                remap_host = [0] * int(num_experts)
-                for local_expert, expert in enumerate(active_experts):
-                    remap_host[expert] = local_expert
-                remap = mx.array(remap_host, dtype=inds.dtype)
-                local = remap[group_routes].reshape(route_shape)
-                n_experts = len(active_experts)
-            elif native_authority:
-                # Decode keeps the real expert->row table exclusively in C++;
-                # Python's _slot_of is intentionally stale.  Reuse the same
-                # native authority for each expert-major group so a second
-                # long request remains valid after arbitrary decode traffic.
-                pool_arrays, local, n_experts = vpool.acquire(
-                    self.layer_idx,
-                    group_routes.reshape(route_shape),
-                    int(num_experts),
-                    seq_len=group_count,
-                    layer_cap=int(layer_cap),
-                )
-            else:
-                pool_arrays, slots = self.store.acquire(
-                    self.layer_idx, active_experts,
-                )
-                slot_lut_host = [0] * int(num_experts)
-                for expert, slot in zip(active_experts, slots):
-                    slot_lut_host[expert] = int(slot)
-                slot_lut = mx.array(slot_lut_host, dtype=inds.dtype)
-                local = slot_lut[group_routes].reshape(route_shape)
-                n_experts = int(layer_cap)
+            if trace_major:
+                profile_read_ms += (
+                    time.perf_counter() - profile_started
+                ) * 1000.0
+                profile_started = time.perf_counter()
+                mx.eval(*pool_arrays.values())
+                profile_upload_ms += (
+                    time.perf_counter() - profile_started
+                ) * 1000.0
+            remap_host = [0] * int(num_experts)
+            for local_expert, expert in enumerate(active_experts):
+                remap_host[expert] = local_expert
+            remap = mx.array(remap_host, dtype=inds.dtype)
+            local = remap[group_routes].reshape(route_shape)
+            n_experts = len(active_experts)
             group_x = x_flat[token_pos].reshape(1, group_count, hidden)
-            if (
-                transient_bank
-                and config.expert_major_metal_gemm()
-                and self._sub.proj_bits == {
-                    "gate_proj": 4, "up_proj": 4, "down_proj": 4,
-                }
-                and self._sub.group_size == 64
-            ):
-                from mlx_streaming.core.moe.custom_kernel import (
-                    _expert_major_fused_moe,
-                )
-                offsets_host = [0]
-                for expert in active_experts:
-                    offsets_host.append(offsets_host[-1] + counts[expert])
-                offsets = mx.array(offsets_host, dtype=mx.uint32)
-                group_y = _expert_major_fused_moe(
-                    group_x.reshape(group_count, hidden).astype(mx.float32),
-                    offsets,
-                    pool_arrays["gate_proj.weight"],
-                    pool_arrays["gate_proj.scales"],
-                    pool_arrays["gate_proj.biases"],
-                    pool_arrays["up_proj.weight"],
-                    pool_arrays["up_proj.scales"],
-                    pool_arrays["up_proj.biases"],
-                    pool_arrays["down_proj.weight"],
-                    pool_arrays["down_proj.scales"],
-                    pool_arrays["down_proj.biases"],
-                    hidden, self._sub.moe_inter, 64, 4,
-                    shards_per_expert=config.expert_major_metal_shards(),
-                ).astype(x.dtype)
-            else:
-                group_y = self._sub.forward(
-                    pool_arrays, n_experts, group_x, local,
-                ).reshape(group_count, hidden)
+            group_y = self._sub.forward(
+                pool_arrays, n_experts, group_x, local,
+            ).reshape(group_count, hidden)
             weighted = group_y * route_scores[assignment_pos, None]
             output = output.at[token_pos].add(weighted)
 
@@ -297,13 +224,9 @@ class FileStreamingMoeBlock:
                     time.perf_counter() - profile_started
                 ) * 1000.0
             prefix = end
-        if (
-            config.expert_major_transient_bank()
-            and getattr(self.store, "_blob_loader", None) is not None
-        ):
-            # Each decoder layer owns its PersistentSubGLU.  Keeping the last
-            # transient group's weights bound would retain one bank per layer.
-            self._sub.release_bound()
+        # Each decoder layer owns its PersistentSubGLU.  Keeping the last
+        # transient group's weights bound would retain one bank per layer.
+        self._sub.release_bound()
         if trace_major:
             object.__setattr__(self, "_expert_major_last_profile", {
                 "groups": len(groups),

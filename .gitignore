@@ -23,7 +23,6 @@ benchmarks/reports/*.json
 benchmarks/reports/*.log
 # 由 `make -C native/ext native_moe_ext` 生成的 MLX 扩展(.so 不入库,需现场编译)
 mlx_streaming/native_moe_ext*.so
-mlx_streaming/*.metallib
 # 模型权重软链与 GPU trace 等大体积产物不入库
 /models
 *.gputrace/

@@ -1,4 +1,5 @@
 import os
+import pytest
 
 from mlx_streaming.runtime.run_qwen_k3_sub10 import (
     FINAL_DEFAULTS,
@@ -33,12 +34,16 @@ def test_final_profile_defaults(monkeypatch):
     assert FINAL_DEFAULTS["PREFETCH_PROGRESSIVE"] == "0"
     assert FINAL_DEFAULTS["PREFETCH_ADAPTIVE_COOLDOWN"] == "32"
     assert FINAL_DEFAULTS["PREFETCH_RERANK_RANKING_POLICY"] == "topk_union_fast"
+    assert FINAL_DEFAULTS["MTP_VERIFY_MODE"] == "batch"
+    assert FINAL_DEFAULTS["TREE_VERIFY"] == "0"
+    assert FINAL_DEFAULTS["PREFETCH_OPTIMISTIC_VERIFY"] == "0"
+    assert FINAL_DEFAULTS["PREFETCH_ONLINE_TRANSITION"] == "0"
 
 
-def test_final_profile_preserves_explicit_overrides(monkeypatch):
+def test_final_profile_overrides_stale_performance_environment(monkeypatch):
     monkeypatch.setattr(os, "environ", {"EXPERT_SLOTS": "999"})
     configure()
-    assert os.environ["EXPERT_SLOTS"] == "999"
+    assert os.environ["EXPERT_SLOTS"] == "152"
 
 
 def test_final_profile_short_chat_entry():
@@ -46,4 +51,11 @@ def test_final_profile_short_chat_entry():
         "chat", "--expert-slots", "152", "--spec-slots", "0",
         "--stats", "--plain",
     ]
+    assert _chat_argv([
+        "--chat", "--expert-slots", "152", "--stats",
+    ]) == [
+        "chat", "--expert-slots", "152", "--spec-slots", "0", "--stats",
+    ]
+    with pytest.raises(ValueError, match="fixed at 152"):
+        _chat_argv(["--chat", "--expert-slots", "64"])
     assert _chat_argv([]) is None

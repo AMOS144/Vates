@@ -9,13 +9,13 @@ class _ReusingStore:
     def __init__(self, capacity):
         self.capacity = capacity
         self.loads = []
+        self._blob_loader = self
 
-    def acquire(self, layer, experts):
+    def load_experts_stacked(self, layer, experts):
         del layer
         experts = [int(v) for v in experts]
         self.loads.append(tuple(experts))
-        slot_experts = experts + [0] * (self.capacity - len(experts))
-        return {"slot_experts": mx.array(slot_experts)}, list(range(len(experts)))
+        return {"slot_experts": mx.array(experts)}
 
 
 class _DeterministicSub:
@@ -25,9 +25,11 @@ class _DeterministicSub:
         expert = fetched["slot_experts"][local]
         return x[..., None, :] + (expert[..., None] + 1).astype(x.dtype)
 
+    def release_bound(self):
+        pass
 
-def test_expert_major_matches_token_major_weighted_sum(monkeypatch):
-    monkeypatch.setenv("EXPERT_MAJOR_GROUP_EXPERTS", "2")
+
+def test_expert_major_matches_token_major_weighted_sum():
     block = object.__new__(FileStreamingMoeBlock)
     block.layer_idx = 0
     block.store = _ReusingStore(capacity=2)
@@ -55,4 +57,3 @@ def test_expert_major_matches_token_major_weighted_sum(monkeypatch):
 
     assert bool(mx.allclose(actual, expected, rtol=1e-6, atol=1e-6))
     assert block.store.loads == [(0, 1), (2, 3)]
-

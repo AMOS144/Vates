@@ -148,22 +148,18 @@ def forward_with_hidden(
         if trace_major:
             mx.reset_peak_memory()
         h = layer(h, mask=mask, cache=c)
-        if (
-            major_prefill
-            and config.expert_major_layer_barrier()
-        ):
+        if major_prefill:
             # A 256K hidden state is ~1 GiB.  A layer boundary prevents MLX's
             # lazy graph from retaining several such states (and mutable expert
             # pool consumers) at once; the preceding buffer can be recycled.
             mx.eval(h)
             if layer.is_linear:
                 _detach_recurrent_cache(c)
-            if config.expert_major_clear_cache():
-                # Route-group lengths differ by layer.  MLX otherwise keeps
-                # their temporary command buffers in its allocation cache,
-                # causing active memory to climb monotonically with 48 layers.
-                # Expert weights live in C++-owned pool rows and are unaffected.
-                mx.clear_cache()
+            # Route-group lengths differ by layer. MLX otherwise keeps their
+            # temporary command buffers in its allocation cache, causing active
+            # memory to climb monotonically with 48 layers. Expert weights live
+            # in C++-owned pool rows and are unaffected.
+            mx.clear_cache()
             if trace_major:
                 layer_ms = (time.perf_counter() - layer_started) * 1000.0
                 moe_profile = getattr(
@@ -284,10 +280,6 @@ def prefill_chunked(model, ids, cache, chunk: "int | None" = None):
     the scope and therefore retain their latency-oriented token-major path.
     """
     with expert_major_prefill_scope():
-        if config.prefetch_online_transition():
-            from mlx_streaming.core.prefetch.online_transition import prefill_collection
-            with prefill_collection():
-                return _prefill_chunked_impl(model, ids, cache, chunk)
         return _prefill_chunked_impl(model, ids, cache, chunk)
 
 
