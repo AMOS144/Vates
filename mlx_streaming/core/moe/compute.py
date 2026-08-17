@@ -136,6 +136,12 @@ class PersistentSubGLU:
         self._glu = glu
         self._n = n
 
+    def release_bound(self) -> None:
+        """Drop transient expert arrays after a long expert-major layer."""
+        self._glu = None
+        self._n = None
+        self._bound_signature = None
+
     def forward(self, fetched: dict, n: int, x: mx.array, local: mx.array) -> mx.array:
         self._bind(fetched, n)
         if self.swiglu_limit > 0:

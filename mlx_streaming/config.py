@@ -69,6 +69,50 @@ def moe_topk_override() -> "str | None": return os.environ.get("MOE_TOPK_OVERRID
 def eager_expert_load() -> bool: return _b("EAGER_EXPERT_LOAD", "0")
 
 
+# ============================ Expert-major prefill ============================
+# Prompt ingestion has a fundamentally different route shape from decode:
+# almost every expert is used, but each expert receives thousands of tokens.  In
+# expert-major mode we sort the route assignments once, load a bounded group of
+# experts, run all of that group's tokens, and scatter-add directly into the
+# token output.  This avoids both stacking all 512 experts and materialising the
+# enormous [batch, sequence, top_k, hidden] tensor.
+def expert_major_group_experts() -> int:
+    return max(1, _i("EXPERT_MAJOR_GROUP_EXPERTS", 128))
+def expert_major_max_assignments() -> int:
+    return max(1, _i("EXPERT_MAJOR_MAX_ASSIGNMENTS", 32768))
+def expert_major_transient_bank() -> bool:
+    return _b("EXPERT_MAJOR_TRANSIENT_BANK", "1")
+def expert_major_layer_barrier() -> bool:
+    return _b("EXPERT_MAJOR_LAYER_BARRIER", "1")
+def expert_major_clear_cache() -> bool:
+    return _b("EXPERT_MAJOR_CLEAR_CACHE", "1")
+def expert_major_attention_tile() -> int:
+    return max(1, _i("EXPERT_MAJOR_ATTENTION_TILE", 2048))
+def expert_major_gdn_tile() -> int:
+    return max(1, _i("EXPERT_MAJOR_GDN_TILE", 512))
+def expert_major_attention_score_budget() -> int:
+    # query_tile * key_length, before the query-head multiplier.  The 16M
+    # setting remains below the 10 GB process budget in the 64K 80B benchmark
+    # and materially reduces query-tile dispatch overhead.
+    return max(1, _i("EXPERT_MAJOR_ATTENTION_SCORE_BUDGET", 16_777_216))
+def expert_major_fused_attention() -> bool:
+    return _b("EXPERT_MAJOR_FUSED_ATTENTION", "0")
+def expert_major_fused_attention_layers():
+    return parse_layers_env("EXPERT_MAJOR_FUSED_ATTENTION_LAYERS")
+def expert_major_dense_steel_attention() -> bool:
+    return _b("EXPERT_MAJOR_DENSE_STEEL_ATTENTION", "0")
+def expert_major_metal_gemm() -> bool:
+    return _b("EXPERT_MAJOR_METAL_GEMM", "0")
+def expert_major_metal_shards() -> int:
+    return max(1, _i("EXPERT_MAJOR_METAL_SHARDS", 8))
+def expert_major_double_buffer() -> bool:
+    return _b("EXPERT_MAJOR_DOUBLE_BUFFER", "0")
+def expert_major_fused_gdn() -> bool:
+    return _b("EXPERT_MAJOR_FUSED_GDN", "0")
+def expert_major_mem_trace() -> bool:
+    return _b("EXPERT_MAJOR_MEM_TRACE", "0")
+
+
 # ============================ 缓存 / 驱逐 ============================
 def evict_policy() -> str: return _s("EVICT_POLICY", "lfu")
 # 专家读盘是否绕过 OS page cache(F_NOCACHE):默认开,保证基准每次都是真实 NVMe 读、

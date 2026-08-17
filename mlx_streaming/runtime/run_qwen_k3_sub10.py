@@ -6,6 +6,41 @@ from pathlib import Path
 
 FINAL_DEFAULTS = {
     "STREAM_BLOB_LOADER": "1",
+    # Expert-major deliberately streams the 48-layer expert corpus once per
+    # prompt.  Do not disguise that I/O with tens of GB of macOS page cache or
+    # let the cache inflate machine-wide memory outside MLX accounting.
+    "STREAM_BLOB_NOCACHE": "1",
+    # A 32K superblock is still layer-major Expert-major (not the legacy tiny
+    # token chunk).  At 256K it bounds activations while the compact K4/V3 KV
+    # cache carries exact context across eight blocks.  Re-reading experts is
+    # negligible beside exact long-context attention and avoids a >10 GB peak.
+    "PREFILL_CHUNK": "32768",
+    "EXPERT_MAJOR_GROUP_EXPERTS": "128",
+    "EXPERT_MAJOR_MAX_ASSIGNMENTS": "32768",
+    "EXPERT_MAJOR_TRANSIENT_BANK": "1",
+    "EXPERT_MAJOR_LAYER_BARRIER": "1",
+    "EXPERT_MAJOR_CLEAR_CACHE": "1",
+    "EXPERT_MAJOR_ATTENTION_TILE": "2048",
+    "EXPERT_MAJOR_GDN_TILE": "512",
+    # Register-resident blocked recurrence removes the stock kernel's
+    # redundant q/k reads.  32K: 416.35 -> 464.44 tok/s at the same 5.14 GB
+    # peak; a 1024-token prefill + 32 greedy tokens matched exactly.
+    "EXPERT_MAJOR_FUSED_GDN": "1",
+    # These completed experimental kernels remain opt-in because real-model
+    # A/B did not meet the production speed/accuracy gate.
+    "EXPERT_MAJOR_FUSED_ATTENTION": "0",
+    "EXPERT_MAJOR_DENSE_STEEL_ATTENTION": "0",
+    "EXPERT_MAJOR_METAL_GEMM": "0",
+    "EXPERT_MAJOR_DOUBLE_BUFFER": "0",
+    # 16M score elements permits a 512-query tile at 32K and remains bounded
+    # at longer contexts.  On the 80B model this improved 32K prefill from
+    # 328.64 to 363.67 tok/s while peak memory moved only 4.80 -> 4.97 GB.
+    "EXPERT_MAJOR_ATTENTION_SCORE_BUDGET": "16777216",
+    "KV_QUANT": "1",
+    "KV_K_BITS": "4",
+    "KV_V_BITS": "3",
+    "KV_GROUP_SIZE": "64",
+    "KV_ROTATE": "1",
     "EXPERT_SLOTS": "152",
     "EXPERT_POOL_PROFILE": (
         "benchmarks/results/qwen_k3_prefetch_wait_rebalanced_same10g.json"

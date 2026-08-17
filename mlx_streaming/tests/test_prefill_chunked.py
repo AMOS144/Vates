@@ -1,6 +1,6 @@
 """分块 prefill 数值等价性测试(迷你 Qwen3-Next,不需 80B 权重)。
 
-验证 prefill_chunked(chunk=2/3)与整段 prefill:
+验证 Expert-major prefill_chunked(chunk=2/3)与整段参考前向:
 - 末位 logits cosine ≥ 0.99
 - 首 token argmax 完全一致
 - cache.offset 推进正确(= prompt 长度)
@@ -68,22 +68,70 @@ def test_chunked_prefill_matches_full():
 
 
 def test_chunk_zero_is_full_prefill():
-    """chunk<=0 退化为整段 prefill(逐位一致)。"""
+    """chunk<=0 整段执行，但只返回消费方需要的最后一位。"""
     model = _tiny_model()
     ids = mx.array([[1, 5, 9, 2, 7, 3, 8]])
     c1 = model.make_cache()
     l1, _ = forward_with_hidden(model, ids, c1)
     c2 = model.make_cache()
     l2, _ = prefill_chunked(model, ids, c2, chunk=0)
-    assert mx.allclose(l1, l2, atol=1e-5)
+    assert l2.shape == (1, 1, 64)
+    assert _cos(l1[:, -1, :], l2[:, -1, :]) > 0.99
+    assert int(mx.argmax(l1[:, -1, :])) == int(mx.argmax(l2[:, -1, :]))
 
 
 def test_short_prompt_single_chunk():
-    """prompt 不超过一块时直接整段,行为不变。"""
+    """短 prompt 也使用 Expert-major，并只投影最后一位。"""
     model = _tiny_model()
     ids = mx.array([[1, 5]])
     c = model.make_cache()
     logits, H = prefill_chunked(model, ids, c, chunk=4)
-    assert logits.shape[1] == 2
+    assert logits.shape == (1, 1, 64)
     fa = next(x for x, l in zip(c, model.layers) if not l.is_linear)
     assert fa.offset == 2
+
+
+def test_expert_major_prefill_projects_only_last_token(monkeypatch):
+    """Prefill never materialises unused prompt-wide vocab logits."""
+    monkeypatch.setenv("EXPERT_MAJOR_LAYER_BARRIER", "1")
+    model = _tiny_model()
+    ids = mx.array([[1, 5, 9, 2, 7, 3, 8]])
+    cache = model.make_cache()
+    logits, hidden = prefill_chunked(model, ids, cache, chunk=0)
+    assert logits.shape == (1, 1, 64)
+    assert hidden.shape == (1, 1, 128)
+    fa = next(x for x, l in zip(cache, model.layers) if not l.is_linear)
+    assert fa.offset == ids.shape[1]
+
+
+def test_expert_major_last_token_matches_full_attention(monkeypatch):
+    model = _tiny_model()
+    ids = mx.array([[1, 5, 9, 2, 7, 3, 8]])
+    reference_cache = model.make_cache()
+    reference, _ = forward_with_hidden(model, ids, reference_cache)
+    mx.eval(reference)
+
+    monkeypatch.setenv("EXPERT_MAJOR_ATTENTION_TILE", "3")
+    major_cache = model.make_cache()
+    actual, _ = prefill_chunked(model, ids, major_cache, chunk=0)
+    mx.eval(actual)
+    # Gated-delta recurrence is regrouped at tile boundaries, matching the
+    # project's established chunked-prefill numerical contract.
+    assert _cos(actual[:, -1, :], reference[:, -1, :]) > 0.99
+    assert int(mx.argmax(actual[:, -1, :])) == int(mx.argmax(reference[:, -1, :]))
+
+
+def test_prefill_scope_does_not_leak_into_decode():
+    """Public prefill is Expert-major; a later direct verify remains token-major."""
+    model = _tiny_model()
+    prefill_ids = mx.array([[1, 5]])
+    prefill_cache = model.make_cache()
+    prefill_logits, _ = prefill_chunked(
+        model, prefill_ids, prefill_cache, chunk=8,
+    )
+    assert prefill_logits.shape == (1, 1, 64)
+
+    verify_ids = mx.array([[1, 5, 9]])
+    verify_cache = model.make_cache()
+    verify_logits, _ = forward_with_hidden(model, verify_ids, verify_cache)
+    assert verify_logits.shape == (1, 3, 64)

@@ -14,6 +14,10 @@ import mlx.core as mx
 from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
 from mlx_streaming import config
+from mlx_streaming.core.attention.prefill_scope import (
+    expert_major_prefill_active,
+    expert_major_prefill_scope,
+)
 from mlx_streaming.mtp.kv_cache import (
     enable_qwen3next_speculative_checkpoints, begin_speculative_checkpoints,
     _snapshot, _restore, commit_verified_prefix, commit_verified_snapshot,
@@ -71,9 +75,32 @@ def _bind_progressive_cache_refs(layers, cache) -> None:
         object.__setattr__(layer, "_target_cache_ref", layer_cache)
 
 
+def _detach_recurrent_cache(cache) -> None:
+    """Rebase a small ArraysCache state onto leaf buffers after long prefill.
+
+    Qwen3-Next's recurrent state is only about 2 MiB per linear layer, but the
+    lazy arrays returned by gated_delta_update retain the prompt-wide Q/K/V
+    graph.  Copying these few state tensors cuts that graph without copying the
+    prompt hidden state or changing any value.
+    """
+    state = getattr(cache, "state", None)
+    if not isinstance(state, list):
+        return
+    detached = []
+    for value in state:
+        if value is None:
+            detached.append(None)
+            continue
+        leaf = mx.zeros(value.shape, dtype=value.dtype)
+        leaf[:] = value
+        mx.eval(leaf)
+        detached.append(leaf)
+    cache.state = detached
+
+
 def forward_with_hidden(
     model, ids, cache, compute_logits: bool = True,
-    capture_layer_inputs: bool = False,
+    capture_layer_inputs: bool = False, last_token_only: bool = False,
 ):
     """跑主模型层循环 + 最终 norm,返回 (logits(1,L,V), hidden(1,L,H))。
 
@@ -86,6 +113,10 @@ def forward_with_hidden(
     供分块 prefill 的中间块用(中间块不需要 logits,只需 cache 因果累积)。
     """
     inner = model.model
+    major_prefill = expert_major_prefill_active()
+    if major_prefill:
+        from mlx_streaming.core.attention.expert_major import install
+        install()
     h = inner.embed_tokens(ids)
     layers = inner.layers
     # Progressive T-1 movement needs the *current request's* target cache
@@ -103,14 +134,91 @@ def forward_with_hidden(
     fa_mask = create_attention_mask(h, cache[fa_idx]) if has_full else None
     ssm_mask = create_ssm_mask(h, cache[ssm_idx]) if has_linear else None
     layer_inputs = [] if capture_layer_inputs else None
-    for layer, c in zip(layers, cache):
+    trace_major = major_prefill and config.expert_major_mem_trace()
+    trace_linear_ms = 0.0
+    trace_full_ms = 0.0
+    trace_read_ms = 0.0
+    trace_upload_ms = 0.0
+    trace_moe_compute_ms = 0.0
+    for layer_index, (layer, c) in enumerate(zip(layers, cache)):
+        layer_started = time.perf_counter() if trace_major else 0.0
         if layer_inputs is not None:
             layer_inputs.append(h)
         mask = ssm_mask if layer.is_linear else fa_mask
+        if trace_major:
+            mx.reset_peak_memory()
         h = layer(h, mask=mask, cache=c)
-    H = inner.norm(h)
-    hidden = H if config.mtp_hidden() == "post_norm" else h
-    logits = model.lm_head(H) if compute_logits else None
+        if (
+            major_prefill
+            and config.expert_major_layer_barrier()
+        ):
+            # A 256K hidden state is ~1 GiB.  A layer boundary prevents MLX's
+            # lazy graph from retaining several such states (and mutable expert
+            # pool consumers) at once; the preceding buffer can be recycled.
+            mx.eval(h)
+            if layer.is_linear:
+                _detach_recurrent_cache(c)
+            if config.expert_major_clear_cache():
+                # Route-group lengths differ by layer.  MLX otherwise keeps
+                # their temporary command buffers in its allocation cache,
+                # causing active memory to climb monotonically with 48 layers.
+                # Expert weights live in C++-owned pool rows and are unaffected.
+                mx.clear_cache()
+            if trace_major:
+                layer_ms = (time.perf_counter() - layer_started) * 1000.0
+                moe_profile = getattr(
+                    getattr(layer, "mlp", None),
+                    "_expert_major_last_profile", {},
+                )
+                read_ms = float(moe_profile.get("read_ms", 0.0))
+                upload_ms = float(moe_profile.get("upload_ms", 0.0))
+                moe_compute_ms = float(moe_profile.get("compute_ms", 0.0))
+                trace_read_ms += read_ms
+                trace_upload_ms += upload_ms
+                trace_moe_compute_ms += moe_compute_ms
+                if layer.is_linear:
+                    trace_linear_ms += layer_ms
+                else:
+                    trace_full_ms += layer_ms
+                print(
+                    "[expert-major-mem] "
+                    f"layer={layer_index} linear={int(layer.is_linear)} "
+                    f"time_ms={layer_ms:.1f} "
+                    f"read_ms={read_ms:.1f} upload_ms={upload_ms:.1f} "
+                    f"moe_ms={moe_compute_ms:.1f} "
+                    f"active_gb={mx.get_active_memory() / 1e9:.3f} "
+                    f"peak_gb={mx.get_peak_memory() / 1e9:.3f}",
+                    flush=True,
+                )
+    if trace_major:
+        print(
+            "[expert-major-time] "
+            f"linear_ms={trace_linear_ms:.1f} full_ms={trace_full_ms:.1f} "
+            f"read_ms={trace_read_ms:.1f} upload_ms={trace_upload_ms:.1f} "
+            f"moe_ms={trace_moe_compute_ms:.1f} "
+            f"total_ms={trace_linear_ms + trace_full_ms:.1f}",
+            flush=True,
+        )
+    if last_token_only:
+        # Norm is position-wise and prompt ingestion consumes only the final
+        # position.  Copy that row into a real leaf before returning it: a
+        # plain slice can retain the entire prompt-sized hidden allocation and
+        # its final-layer graph even though its visible shape is [1,1,H].
+        last = mx.zeros(
+            (int(h.shape[0]), 1, int(h.shape[-1])), dtype=h.dtype,
+        )
+        last[:] = h[:, -1:, :]
+        mx.eval(last)
+        H_for_logits = inner.norm(last)
+        hidden = (
+            H_for_logits if config.mtp_hidden() == "post_norm" else last
+        )
+    else:
+        H_for_logits = inner.norm(h)
+        hidden = (
+            H_for_logits if config.mtp_hidden() == "post_norm" else h
+        )
+    logits = model.lm_head(H_for_logits) if compute_logits else None
     if layer_inputs is not None:
         return logits, hidden, layer_inputs
     return logits, hidden
@@ -169,11 +277,18 @@ def _initial_optimistic_layers(model) -> set[int]:
 
 
 def prefill_chunked(model, ids, cache, chunk: "int | None" = None):
-    if config.prefetch_online_transition():
-        from mlx_streaming.core.prefetch.online_transition import prefill_collection
-        with prefill_collection():
-            return _prefill_chunked_impl(model, ids, cache, chunk)
-    return _prefill_chunked_impl(model, ids, cache, chunk)
+    """Ingest a prompt through the sole production prefill implementation.
+
+    The explicit scope is intentionally independent of token count: even a
+    short prompt is Expert-major, while decode and MTP verify remain outside
+    the scope and therefore retain their latency-oriented token-major path.
+    """
+    with expert_major_prefill_scope():
+        if config.prefetch_online_transition():
+            from mlx_streaming.core.prefetch.online_transition import prefill_collection
+            with prefill_collection():
+                return _prefill_chunked_impl(model, ids, cache, chunk)
+        return _prefill_chunked_impl(model, ids, cache, chunk)
 
 
 def _prefill_chunked_impl(model, ids, cache, chunk: "int | None" = None):
@@ -190,12 +305,20 @@ def _prefill_chunked_impl(model, ids, cache, chunk: "int | None" = None):
         chunk = config.prefill_chunk()
     L = ids.shape[1]
     if chunk <= 0 or L <= chunk:
-        return forward_with_hidden(model, ids, cache)
+        return forward_with_hidden(
+            model, ids, cache, last_token_only=True,
+        )
     last_start = ((L - 1) // chunk) * chunk
     for s in range(0, last_start, chunk):
-        _, h = forward_with_hidden(model, ids[:, s:s + chunk], cache, compute_logits=False)
+        _, h = forward_with_hidden(
+            model, ids[:, s:s + chunk], cache,
+            compute_logits=False, last_token_only=True,
+        )
         mx.eval(h)                      # 物化本块、写 cache、释放上一块瞬时图
-    return forward_with_hidden(model, ids[:, last_start:], cache)
+    return forward_with_hidden(
+        model, ids[:, last_start:], cache,
+        last_token_only=True,
+    )
 
 
 def forward_with_hidden_stepwise(model, ids, cache, capture_snapshots: bool = False):

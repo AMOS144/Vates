@@ -1,4 +1,5 @@
 #include "compute/fused_moe.h"
+#include "compute/quant_attention.h"
 #include "io/blob_load.h"
 #include "io/bg_reader.h"
 #include "prefetch/prefetch.h"
@@ -10,6 +11,17 @@ using namespace nb::literals;
 NB_MODULE(native_moe_ext, m) {
   nb::module_::import_("mlx.core");
   m.doc() = "Native MLX MoE extension.";
+
+  m.def(
+      "k4v3_fused_causal_attention", &k4v3_fused_causal_attention,
+      "q"_a, "k_weight"_a, "k_scales"_a, "k_biases"_a,
+      "v_weight"_a, "v_scales"_a, "v_biases"_a, "scale"_a,
+      "q_block"_a = 32, "k_block"_a = 8, nb::kw_only(),
+      "stream"_a = nb::none());
+  m.def(
+      "dense_fused_causal_attention", &dense_fused_causal_attention,
+      "q"_a, "k"_a, "v"_a, "scale"_a, nb::kw_only(),
+      "stream"_a = nb::none());
 
   // ---- 融合 MoE 计算核（native_fused.cpp）----
   m.def(
