@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
 from collections import deque
 from typing import Optional
@@ -13,8 +15,9 @@ from typing import Optional
 from rich.console import Group
 from rich.markdown import Markdown as RichMarkdown
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.widgets import Input, Static
 
@@ -45,7 +48,67 @@ _TPS_WINDOW = 1.0
 # UI 线程定时拉取 worker 发布的最新文本。不能在 decode worker
 # 中用 call_from_thread 做流式重绘：它是同步的，会把 Textual 布局时间
 # 直接计入 mtp_generate.wall_s。
-_STREAM_UPDATE_INTERVAL = 0.2
+_STREAM_UPDATE_INTERVAL = 0.05
+
+
+def _system_clipboard_text() -> str | None:
+    """Read the native macOS clipboard without a shell."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["/usr/bin/pbpaste"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _single_line_paste(text: str) -> str:
+    """Keep every pasted line while remaining compatible with Input."""
+    text = text.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+    return " ".join(text.splitlines())
+
+
+class PromptInput(Input):
+    """Input with native macOS paste and lossless multi-line ingestion."""
+
+    BINDINGS = [
+        Binding("super+v,ctrl+shift+v", "paste", "粘贴", show=False),
+    ]
+
+    def _insert_paste(self, text: str) -> None:
+        text = _single_line_paste(text)
+        if not text:
+            return
+        # Some macOS terminals both inject a bracketed paste and expose the
+        # same Cmd+V through the enhanced keyboard protocol.  Treat that
+        # immediate identical pair as one paste.
+        now = time.monotonic()
+        if (
+            text == getattr(self, "_last_paste_text", None)
+            and now - getattr(self, "_last_paste_at", 0.0) < 0.5
+        ):
+            return
+        self._last_paste_text = text
+        self._last_paste_at = now
+        start, end = self.selection
+        self.replace(text, start, end)
+
+    def _on_paste(self, event: events.Paste) -> None:
+        # Textual Input's implementation silently keeps only splitlines()[0].
+        self._insert_paste(event.text)
+        event.stop()
+
+    def action_paste(self) -> None:
+        # ctrl/super+V may arrive as a key (enhanced keyboard protocol) rather
+        # than a terminal bracketed-paste event.  Prefer the native clipboard.
+        text = _system_clipboard_text()
+        self._insert_paste(self.app.clipboard if text is None else text)
 
 _HELP = (
     "可用命令:\n"
@@ -53,7 +116,8 @@ _HELP = (
     "  /reset   清空对话历史(保留 system)\n"
     "  /clear   清空对话区显示\n"
     "  /exit    退出\n\n"
-    "快捷键:Enter 发送 · Esc 中断生成 · Ctrl+C 退出"
+    "快捷键:Enter 发送 · Esc 中断生成 · Ctrl+C 退出\n"
+    "剪贴板:鼠标选中文本即复制 · Cmd/Ctrl+V 粘贴"
 )
 
 
@@ -118,10 +182,6 @@ class VatesApp(App):
         self._busy = False
         self._stop = False
         self._cur: Optional[ChatMessage] = None
-        # 首 token 到达时刻与基准 token 数,用于结束时计算「累计解码平均」tok/s
-        # (排除 prefill)。_gen_t0 为 0.0 表示本轮尚未收到首 token。
-        self._gen_t0 = 0.0
-        self._n0 = 0
         self._prefill_tokens = 0
         self._prefill_tps = 0.0
         # worker 只原子替换这个引用；UI timer 以固定频率取最新帧。
@@ -131,13 +191,29 @@ class VatesApp(App):
         self._tps_window = _TPS_WINDOW
         self._samples: deque[tuple[float, int]] = deque()
 
+    def copy_to_clipboard(self, text: str) -> None:
+        """Use Textual/OSC52 plus pbcopy for macOS Terminal compatibility."""
+        super().copy_to_clipboard(text)
+        if sys.platform != "darwin":
+            return
+        try:
+            subprocess.run(
+                ["/usr/bin/pbcopy"],
+                input=text,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
     def compose(self) -> ComposeResult:
         yield Static(self._top_text(), id="top")
         yield VerticalScroll(id="chat")
         # 提示放到边框标题里,不用文本区的 placeholder:
         # 长占位符在部分终端增量重绘时不会被擦除,打字后会残留「后面还有字」,
         # 直到全量重绘(Enter/截图/resize)才消失;边框标题在边框上,不受此影响。
-        yield Input(id="prompt")
+        yield PromptInput(id="prompt")
         yield Static("", id="status")
 
     def on_mount(self) -> None:
@@ -146,20 +222,20 @@ class VatesApp(App):
         # 加载完成前禁用输入框,避免用户在模型就绪前发消息
         inp.disabled = True
         self._set_status("加载模型中…")
-        interval = max(
-            0.05,
-            float(os.environ.get(
-                "TUI_STREAM_UPDATE_INTERVAL",
-                str(_STREAM_UPDATE_INTERVAL),
-            )),
-        )
-        self.set_interval(interval, self._flush_pending_stream)
+        self.set_interval(_STREAM_UPDATE_INTERVAL, self._flush_pending_stream)
         self._load()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         # 兜底:强制整屏重绘,清除个别终端增量重绘遗留的输入残影
         # (等价于截图/resize 触发的全量刷新)。
         self.refresh()
+
+    def on_text_selected(self, event: events.TextSelected) -> None:
+        """Auto-copy app-managed selections; Terminal.app lacks OSC52."""
+        del event
+        selected = self.screen.get_selected_text()
+        if selected:
+            self.copy_to_clipboard(selected)
 
     def _top_text(self) -> Text:
         t = Text()
@@ -243,9 +319,6 @@ class VatesApp(App):
         self._cur = self._add("assistant", "", final=False)
         self._busy = True
         self._stop = False
-        # 置 0 表示还没收到首 token;真正的计时起点推迟到第一次 _on_stream。
-        self._gen_t0 = 0.0
-        self._n0 = 0
         self._prefill_tokens = 0
         self._prefill_tps = 0.0
         self._pending_stream = None
@@ -276,7 +349,10 @@ class VatesApp(App):
 
         try:
             result = self.backend.generate(
-                messages, on_text, on_prefill=on_prefill,
+                messages,
+                on_text,
+                on_prefill=on_prefill,
+                should_stop=lambda: self._stop or not self.is_running,
             )
         except Exception as e:  # noqa: BLE001
             if self.is_running:
@@ -337,10 +413,6 @@ class VatesApp(App):
             self._cur.stream(full)
             self._scroll_end()
         now = time.monotonic()
-        # 首次回调:prefill 刚结束,记下计时起点与基准 token 数,供结束时算累计解码平均。
-        if self._gen_t0 == 0.0:
-            self._gen_t0 = now
-            self._n0 = n_tokens
         # 生成中显示滑动窗口「瞬时」速度:一直在动,能反映后期变慢,不被历史平均拖住。
         self._record_sample(now, n_tokens)
         tps = self._window_tps(now)
@@ -372,9 +444,13 @@ class VatesApp(App):
             self._prefill_tps = result.prefill_tok_per_s
         prefill = self._prefill_status()
         prefill_suffix = f" · {prefill}" if prefill else ""
+        accept_suffix = (
+            f" · accept {result.avg_accept_len:.2f}"
+            if result.avg_accept_len > 0 else ""
+        )
         self._set_status(
             f"就绪 · decode {tps:.1f} tok/s ({result.n_tokens} tok)"
-            f"{prefill_suffix}{_mem_suffix(peak=True)}{suffix}"
+            f"{accept_suffix}{prefill_suffix}{_mem_suffix(peak=True)}{suffix}"
         )
         self._enable_input()
 

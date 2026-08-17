@@ -879,7 +879,7 @@ def mtp_verify_mode() -> str: return _s("MTP_VERIFY_MODE", "batch")
 def mtp_hidden() -> str: return _s("MTP_HIDDEN", "pre_norm")
 # Fixed production Expert-major superblock. It is deliberately not an env
 # switch on the clean branch.
-def prefill_chunk() -> int: return 32768
+def prefill_chunk() -> int: return 32767
 
 
 # ============================ KV 量化(IsoQuant K4/V3)============================

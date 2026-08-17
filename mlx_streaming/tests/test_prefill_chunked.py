@@ -12,6 +12,12 @@ from mlx_lm.models.qwen3_next import Model, ModelArgs
 from mlx_streaming.mtp.generate import forward_with_hidden, prefill_chunked
 
 
+def test_production_chunk_stays_below_metal_scatter_32k_boundary():
+    from mlx_streaming import config
+
+    assert config.prefill_chunk() == 32767
+
+
 def _tiny_model():
     args = ModelArgs(
         model_type="qwen3_next",

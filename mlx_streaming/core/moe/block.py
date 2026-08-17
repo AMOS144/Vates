@@ -41,6 +41,7 @@ def _sparse_hit_stream():
 from mlx_streaming.core.moe.gate import _effective_top_k
 from mlx_streaming.core.moe.compute import (
     streaming_switch_glu_forward, PersistentSubGLU)
+from mlx_streaming.core.moe.custom_kernel import deterministic_route_reduce
 
 
 class StreamingMoeBlock:
@@ -213,7 +214,12 @@ class FileStreamingMoeBlock:
                 pool_arrays, n_experts, group_x, local,
             ).reshape(group_count, hidden)
             weighted = group_y * route_scores[assignment_pos, None]
-            output = output.at[token_pos].add(weighted)
+            # Reduce in canonical route-rank order on GPU.  Each output scalar
+            # has one owner thread: no floating atomics, no assignment tolist,
+            # and no k separate scatter kernels.
+            output = deterministic_route_reduce(
+                output, weighted, assignment_pos, k,
+            )
 
             # The resident pool is mutable.  Commit this group's reads and
             # release its gathered activations before acquire() reuses rows.

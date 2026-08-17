@@ -798,11 +798,11 @@ class VirtualPool:
             pool, slots = self._rp.acquire(layer, flat)
             local = mx.array(slots, dtype=inds_dtype).reshape(inds_shape)
             return pool, local, cap
-        uniq_sorted = sorted(uniq_set)
-        remap = {g: i for i, g in enumerate(uniq_sorted)}
-        local = mx.array([remap[i] for i in flat], dtype=inds_dtype).reshape(inds_shape)
-        fetched = self._rp.fetch(layer, uniq_sorted)
-        return fetched, local, len(uniq_sorted)
+        # ResidentExpertPool intentionally has no unbounded ``fetch`` API.
+        # Over-cap prompt batches must use the existing temporary loader path
+        # instead of trying to materialise them into the fixed resident pool.
+        inds = mx.array(flat, dtype=inds_dtype).reshape(inds_shape)
+        return self._temporary_fetch(layer, inds)
 
     def prefetch(
         self, layer, pred, resident, pool_list, *, source_layer=None,

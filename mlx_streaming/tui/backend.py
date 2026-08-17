@@ -5,6 +5,8 @@ load / generate 都是阻塞调用,由 UI 层放到 worker 线程执行。
 """
 from __future__ import annotations
 
+import threading
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
 
@@ -20,6 +22,7 @@ class GenResult:
     prefill_tokens: int = 0  # 本轮实际 prefill token 数（扣除已复用前缀）
     prefill_s: float = 0.0
     prefill_tok_per_s: float = 0.0
+    avg_accept_len: float = 0.0
 
 
 class ChatBackend(Protocol):
@@ -34,6 +37,7 @@ class ChatBackend(Protocol):
         messages: list[dict],
         on_text: Callable[[str, int], bool],
         on_prefill: Callable[[int, float, float], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> GenResult:
         """跑一轮生成。on_prefill 在 prompt ingestion 完成时上报 token/耗时/速度。"""
         ...
@@ -55,7 +59,9 @@ class FakeBackend:
         for m in self.status_msgs:
             on_status(m)
 
-    def generate(self, messages, on_text, on_prefill=None) -> GenResult:
+    def generate(
+        self, messages, on_text, on_prefill=None, should_stop=None,
+    ) -> GenResult:
         import time
 
         self.seen_messages.append([dict(m) for m in messages])
@@ -65,9 +71,126 @@ class FakeBackend:
             if self.delay:
                 time.sleep(self.delay)
             # 用字符数近似 token 数(假后端无真实分词)
-            if on_text(acc, len(acc)):
+            if on_text(acc, len(acc)) or (should_stop and should_stop()):
                 return GenResult(acc, len(acc), 0.0, stopped=True)
         return GenResult(acc, len(self.reply), 0.0, stopped=False)
+
+
+class _IncrementalDetokenizer:
+    """The one production streaming path: Rust's stateful O(n) decoder."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self._native_tokenizer = getattr(tokenizer, "backend_tokenizer", None)
+        if self._native_tokenizer is None:
+            wrapped = getattr(tokenizer, "_tokenizer", None)
+            self._native_tokenizer = getattr(
+                wrapped, "backend_tokenizer", wrapped,
+            )
+        if self._native_tokenizer is None:
+            self._native_tokenizer = tokenizer
+        from tokenizers.decoders import DecodeStream
+        self._native_stream = DecodeStream(skip_special_tokens=False)
+        self.text = ""
+
+    def push(self, token_ids: list[int]) -> str:
+        if not token_ids:
+            return self.text
+        chunks = []
+        for token in token_ids:
+            chunk = self._native_stream.step(
+                self._native_tokenizer, int(token),
+            )
+            if chunk:
+                chunks.append(chunk)
+        if chunks:
+            self.text += "".join(chunks)
+        return self.text
+
+    def finish(self) -> str:
+        return self.text
+
+
+class _AsyncTextPublisher:
+    """Bounded latest-progress queue between inference and detokenization.
+
+    The inference producer appends token ids to one authoritative list and
+    overwrites a capacity-one deque with the latest visible length.  The text
+    consumer can therefore skip redundant wakeups without losing token ids or
+    ever applying backpressure to inference.
+    """
+
+    def __init__(self, tokenizer, eos: set[int], on_text):
+        self.tokenizer = tokenizer
+        self.eos = eos
+        self.on_text = on_text
+        self.ids: list[int] = []
+        self._signals: deque[int] = deque(maxlen=1)
+        self._wake = threading.Event()
+        self._closing = threading.Event()
+        self.callback_stop = threading.Event()
+        self.hit_eos = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="vates-detokenizer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, new_ids) -> bool:
+        """Inference hot path: append ids, publish latest length, return stop."""
+        accepted = []
+        for value in new_ids:
+            token = int(value)
+            if token in self.eos:
+                self.hit_eos = True
+                break
+            accepted.append(token)
+        if accepted:
+            self.ids.extend(accepted)
+            should_wake = not self._signals
+            self._signals.append(len(self.ids))
+            if should_wake:
+                self._wake.set()
+        return self.hit_eos or self.callback_stop.is_set()
+
+    def close(self) -> None:
+        self._closing.set()
+        self._signals.append(len(self.ids))
+        self._wake.set()
+        self._thread.join()
+
+    def _publish(self, text: str, n_tokens: int, previous: str) -> str:
+        if text == previous:
+            return previous
+        try:
+            if self.on_text(text, n_tokens):
+                self.callback_stop.set()
+        except Exception:  # noqa: BLE001 - display failure must not kill decode
+            pass
+        return text
+
+    def _run(self) -> None:
+        decoder = _IncrementalDetokenizer(self.tokenizer)
+        consumed = 0
+        published = ""
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            if self._signals:
+                target = self._signals.pop()
+                self._signals.clear()
+            else:
+                target = len(self.ids)
+            if target > consumed:
+                # Slicing to the published length is safe: the producer only
+                # appends and never mutates earlier elements.
+                text = decoder.push(self.ids[consumed:target])
+                consumed = target
+                published = self._publish(text, consumed, published)
+            if self._closing.is_set() and consumed >= len(self.ids):
+                break
+        published = self._publish(decoder.finish(), consumed, published)
 
 
 def _common_prefix_len(a, b) -> int:
@@ -115,7 +238,9 @@ class MLXBackend:
         on_status("预热中(编译 kernel + 填专家池)…")
         _warmup(self._model, self._tok, self._drafter, self.args)
 
-    def generate(self, messages, on_text, on_prefill=None) -> GenResult:
+    def generate(
+        self, messages, on_text, on_prefill=None, should_stop=None,
+    ) -> GenResult:
         import os
         import time
 
@@ -134,21 +259,19 @@ class MLXBackend:
                       if self._main_cache is not None else 0)
         main_cache = self._main_cache if cached_len else self._model.make_cache()
 
-        produced_all: list[int] = []
         stopped = {"v": False}
+        publisher = _AsyncTextPublisher(
+            tok,
+            eos,
+            on_text,
+        )
 
         def on_tokens(new_ids):
-            produced_all.extend(new_ids)
-            truncated = _truncate_eos(produced_all, eos)
-            text = tok.decode(truncated)
-            if on_text(text, len(truncated)):   # 用户按 Esc 请求中断
+            callback_stop = publisher.submit(new_ids)
+            external_stop = should_stop is not None and should_stop()
+            if external_stop or (callback_stop and not publisher.hit_eos):
                 stopped["v"] = True
-                return True
-            # 命中 EOS(截断后短于累计产出):完整回答已生成,提前停止,
-            # 避免引擎空跑到 max_tokens 让界面长时间卡在「思考中」。EOS 属正常完成,不算中断。
-            if len(truncated) < len(produced_all):
-                return True
-            return False
+            return bool(callback_stop or external_stop)
 
         # The throughput profile keeps wide prompt ingestion synchronous, then
         # enables overlapped demand exactly at the prefill/decode boundary.
@@ -178,9 +301,6 @@ class MLXBackend:
 
         t0 = time.perf_counter()
         try:
-            generate_kwargs = {}
-            if split_demand:
-                generate_kwargs["on_prefill_complete"] = on_prefill_complete
             produced, stats = mtp_generate(
                 self._model,
                 self._drafter,
@@ -193,14 +313,19 @@ class MLXBackend:
                 on_tokens=on_tokens,
                 main_cache=main_cache,
                 cached_len=cached_len,
-                **generate_kwargs,
+                on_prefill_complete=on_prefill_complete,
             )
         finally:
+            # Flush and join outside mtp_generate's decode wall clock.  No
+            # detokenization or UI callback is on the inference hot path.
+            publisher.close()
             if split_demand:
                 if saved_demand_async is None:
                     os.environ.pop("DEMAND_ASYNC", None)
                 else:
                     os.environ["DEMAND_ASYNC"] = saved_demand_async
+        if publisher.callback_stop.is_set() and not publisher.hit_eos:
+            stopped["v"] = True
         dt = time.perf_counter() - t0
 
         # 持久化本轮 cache 供下轮复用。正常情况下 main_cache 恰好持有 `ids + produced[:-1]`
@@ -232,4 +357,5 @@ class MLXBackend:
             prefill_tokens=prefill_tokens,
             prefill_s=prefill_s,
             prefill_tok_per_s=prefill_tps,
+            avg_accept_len=float(stats.get("avg_accept_len") or 0.0),
         )

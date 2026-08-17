@@ -122,9 +122,34 @@ def _warmup(model, tok, drafter, args):
         n = min(64, vocab)                       # 预热 prompt 长度(兼顾覆盖与耗时)
         step = max(1, vocab // n)                 # 在词表内均匀取样,最大化专家覆盖
         ids = [(1 + i * step) % vocab for i in range(n)]
-        warmup_tokens = max(1, int(os.environ.get("CLI_WARMUP_TOK", "8")))
-        mtp_generate(model, drafter, tok, mx.array([ids]), warmup_tokens,
-                     K=args.k, ids_mode=True)
+        # The measured 37 tok/s profile used a 64-token warmup.  Eight tokens
+        # compile kernels but do not stabilize the expert pool, and previously
+        # ran entirely with synchronous demand even though interactive decode
+        # switches to async demand at the prefill boundary.
+        warmup_tokens = max(1, int(os.environ.get("CLI_WARMUP_TOK", "64")))
+        split_demand = os.environ.get(
+            "SPEC_SPLIT_DEMAND_AFTER_PREFILL",
+        ) == "1"
+        saved_demand_async = os.environ.get("DEMAND_ASYNC")
+        if split_demand:
+            os.environ["DEMAND_ASYNC"] = "0"
+
+        def on_prefill_complete():
+            if split_demand:
+                os.environ["DEMAND_ASYNC"] = "1"
+
+        try:
+            mtp_generate(
+                model, drafter, tok, mx.array([ids]), warmup_tokens,
+                K=args.k, ids_mode=True,
+                on_prefill_complete=on_prefill_complete,
+            )
+        finally:
+            if split_demand:
+                if saved_demand_async is None:
+                    os.environ.pop("DEMAND_ASYNC", None)
+                else:
+                    os.environ["DEMAND_ASYNC"] = saved_demand_async
     except Exception:  # noqa: BLE001  预热仅为压首轮延迟,失败不应中断启动
         pass
 

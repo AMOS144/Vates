@@ -26,7 +26,7 @@ FINAL_DEFAULTS = {
     "POOL_SPEC_SLOTS": "0",
     "POOL_ADMISSION_SLOTS": "32",
     "PREFETCH_DIRECT_SLOTS": "1",
-    "PREFETCH_ISOLATED_SIDE": "1",
+    "PREFETCH_ISOLATED_SIDE": "0",
     "SIDEREGION_ROW_LEASES": "1",
     "DEMAND_ASYNC": "0",
     # Prompt ingestion has much wider route unions and stays synchronous. The
@@ -65,6 +65,7 @@ FINAL_DEFAULTS = {
     "PREFETCH_PHYSICAL_READ_BUDGET_PROFILE": "2:1",
     "PREFETCH_PREDICT_GATE_BITS": "4",
     "PREFETCH_ASYNC_PREDICT": "1",
+    "SHARED_EXPERT_OVERLAP": "0",
     # Fixed layer selection is faster than rebuilding/skipping predictors via
     # the adaptive state machine (38.24 vs 37.98 tok/s before MTP tuning).
     "PREFETCH_ADAPTIVE": "0",

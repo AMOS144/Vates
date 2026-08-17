@@ -180,6 +180,33 @@ def test_shallow_rollback_supports_asymmetric_quantized_cache():
     assert cache.offset == 3
 
 
+def test_deep_snapshot_restores_asymmetric_quantized_cache():
+    """MTP_VERIFY_MODE=step must support the production K4/V3 cache."""
+    from mlx_streaming.core.cache.quant_kv import AsymmetricQuantizedKVCache
+    from mlx_streaming.mtp.kv_cache import _restore, _snapshot
+
+    cache = AsymmetricQuantizedKVCache(group_size=32, k_bits=4, v_bits=3)
+    initial = mx.random.normal((1, 1, 3, 32))
+    cache.update_and_fetch(initial, initial)
+    snap = _snapshot([cache])
+    before_keys = [mx.array(x) for x in cache.keys]
+    before_values = [mx.array(x) for x in cache.values]
+    mx.eval(before_keys, before_values)
+
+    appended = mx.random.normal((1, 1, 2, 32))
+    cache.update_and_fetch(appended, appended)
+    assert cache.offset == 5
+
+    _restore([cache], snap)
+    assert cache.offset == 3
+    assert cache.group_size == 32
+    assert cache.k_bits == 4 and cache.v_bits == 3
+    for restored, expected in zip(cache.keys, before_keys):
+        assert mx.array_equal(restored, expected[..., :3, :]).item()
+    for restored, expected in zip(cache.values, before_values):
+        assert mx.array_equal(restored, expected[..., :3, :]).item()
+
+
 # ---------------------------------------------------------------- Task 3
 def test_accept_prefix_partial():
     from mlx_streaming.mtp.generate import accept_prefix

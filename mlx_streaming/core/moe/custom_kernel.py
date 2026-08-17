@@ -14,6 +14,108 @@ from mlx_streaming.config import parse_layers_env as _parse_layers_env
 # kernel 编译缓存：按 (tile) / (hidden,moe_inter,...) 复用已编译 kernel。
 _CUSTOM_QKERNEL_CACHE = {}
 _CUSTOM_FUSED_MOE_CACHE = {}
+_DETERMINISTIC_ROUTE_REDUCE_CACHE = {}
+
+
+def deterministic_route_reduce(
+    output: mx.array,
+    weighted: mx.array,
+    assignment_pos: mx.array,
+    routes_per_token: int,
+) -> mx.array:
+    """Add one expert group's routes without host sync or float atomics.
+
+    ``assignment_pos`` contains unique positions in the original flattened
+    ``[tokens, routes_per_token]`` routing table.  A GPU sort turns them into
+    short per-token segments.  One segment-start thread then visits the route
+    ranks in canonical order and emits the sole non-zero update for that
+    destination.  This remains proportional to the routes in the current
+    expert group and never creates a dense ``[tokens,k,hidden]`` buffer.
+    """
+    tokens, hidden = (int(v) for v in output.shape)
+    routes_per_token = int(routes_per_token)
+    group_count = int(assignment_pos.size)
+    if group_count == 0:
+        return output
+
+    # Restore token-major / route-rank order entirely on GPU.  Equal tokens
+    # then form runs of at most ``routes_per_token`` rows.
+    token_order = mx.argsort(assignment_pos)
+    sorted_pos = assignment_pos[token_order].astype(mx.int32)
+    sorted_values = weighted[token_order]
+
+    key = (output.dtype, weighted.dtype, routes_per_token)
+    kernel = _DETERMINISTIC_ROUTE_REDUCE_CACHE.get(key)
+    if kernel is None:
+        source = r"""
+            uint linear = thread_position_in_grid.x;
+            constexpr uint elements = group_count * hidden;
+            if (linear >= elements) return;
+            uint row = linear / hidden;
+            uint column = linear - row * hidden;
+            uint token = uint(positions[row]) / routes_per_token;
+            bool segment_start = (
+                row == 0 ||
+                uint(positions[row - 1]) / routes_per_token != token
+            );
+            OutT update = OutT(0);
+            if (segment_start) {
+                OutT acc = previous[token * hidden + column];
+                #pragma clang loop unroll(full)
+                for (uint offset = 0; offset < routes_per_token; ++offset) {
+                    uint candidate = row + offset;
+                    if (candidate >= group_count ||
+                        uint(positions[candidate]) / routes_per_token != token) {
+                        break;
+                    }
+                    // Preserve the old scatter chain's rounding point after
+                    // each canonical route rank.
+                    acc = OutT(
+                        acc + OutT(values[candidate * hidden + column])
+                    );
+                }
+                update = acc;
+            }
+            updates[linear] = update;
+        """
+        kernel = mx.fast.metal_kernel(
+            name=(
+                "deterministic_route_reduce_"
+                f"k{routes_per_token}_{str(output.dtype).replace('.', '_')}"
+            ),
+            input_names=["previous", "values", "positions"],
+            output_names=["updates"],
+            source=source,
+        )
+        _DETERMINISTIC_ROUTE_REDUCE_CACHE[key] = kernel
+
+    threads = 256
+    elements = group_count * hidden
+    (updates,) = kernel(
+        inputs=[output, sorted_values, sorted_pos],
+        output_shapes=[sorted_values.shape],
+        output_dtypes=[output.dtype],
+        grid=((elements + threads - 1) // threads * threads, 1, 1),
+        threadgroup=(threads, 1, 1),
+        template=[
+            ("OutT", output.dtype),
+            ("group_count", group_count),
+            ("hidden", hidden),
+            ("routes_per_token", routes_per_token),
+        ],
+    )
+    # Every token has exactly one segment-start row.  Scatter its fully rounded
+    # replacement into a zero bank, then select touched rows.  This final
+    # selection (instead of adding a delta) preserves the former scatter
+    # chain's bits even for bfloat16 accumulators.
+    destinations = sorted_pos // routes_per_token
+    starts = mx.concatenate([
+        mx.ones((1,), dtype=mx.int32),
+        (destinations[1:] != destinations[:-1]).astype(mx.int32),
+    ])
+    replacements = mx.zeros_like(output).at[destinations].add(updates)
+    touched = mx.zeros((tokens,), dtype=mx.int32).at[destinations].add(starts)
+    return mx.where(touched[:, None] != 0, replacements, output)
 
 
 def _custom_qproj_enabled(layer_idx: int, bits: int) -> bool:

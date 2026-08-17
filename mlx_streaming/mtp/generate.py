@@ -821,7 +821,8 @@ def mtp_generate(model, drafter, tok, prompt, max_tokens, K=3, ids_mode=False,
         if verify_snaps is not None:
             # step 模式：逐 token 解码路径产生的快照可精确 direct commit。
             committed = commit_verified_snapshot(main_cache, verify_snaps,
-                                                 accepted_len, verified_len=K)
+                                                 accepted_len,
+                                                 verified_len=step_k)
         else:
             # batch 模式：一次并行验证后按接受长度直接提交，零 replay。
             # - 可裁剪 cache（KVCache）：trim 掉 rejected 后缀即精确。

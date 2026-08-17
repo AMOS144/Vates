@@ -39,10 +39,12 @@ def _canonical_baseline_config():
     Comparing speculative decoding against a greedy run that uses the same
     experimental prefetch path can hide a shared corruption: both token lists
     are wrong in the same way and ``exact_match`` still reports true.  The
-    opt-in canonical oracle retains synchronous exact demand while disabling
-    every predictor that can mutate speculative pool rows.
+    The default canonical oracle retains synchronous exact demand while
+    disabling every predictor that can mutate speculative pool rows.  The
+    old shared-path comparison remains available only through the explicit
+    ``BASELINE_ALLOW_PREFETCH=1`` diagnostic override.
     """
-    if os.environ.get("BASELINE_DISABLE_PREFETCH") != "1":
+    if os.environ.get("BASELINE_ALLOW_PREFETCH") == "1":
         yield
         return
     overrides = {
@@ -50,6 +52,7 @@ def _canonical_baseline_config():
         "NATIVE_FUSED_PREFETCH": "0",
         "CROSS_LAYER_PREFETCH": "0",
         "DEMAND_ASYNC": "0",
+        "SHARED_EXPERT_OVERLAP": "0",
         # The replay object is attached while the model is built, so changing
         # PREFETCH_ORACLE_ROUTE_DATA here cannot detach it.  Explicitly gate
         # oracle consumption or a 256-step greedy baseline exhausts a trace

@@ -48,7 +48,10 @@ def test_chat_repl_reuses_cache_across_turns(monkeypatch):
 
     def fake_mtp_generate(model, drafter, tok, prompt, max_tokens, K=3,
                           ids_mode=False, profile=False, on_tokens=None,
-                          main_cache=None, cached_len=0):
+                          main_cache=None, cached_len=0,
+                          on_prefill_complete=None):
+        if on_prefill_complete is not None:
+            on_prefill_complete()
         calls.append({"cached_len": cached_len, "cache": main_cache})
         produced = [10, 11]
         if on_tokens is not None:
@@ -92,6 +95,28 @@ def test_warmup_drives_long_diverse_prompt(monkeypatch):
     assert captured["max_tokens"] >= 4
 
 
+def test_warmup_matches_split_async_decode_path(monkeypatch):
+    """CLI warmup must compile/fill the same async path used after prefill."""
+    import os
+
+    states = []
+
+    def spy(*args, on_prefill_complete=None, **kwargs):
+        states.append(os.environ["DEMAND_ASYNC"])
+        assert on_prefill_complete is not None
+        on_prefill_complete()
+        states.append(os.environ["DEMAND_ASYNC"])
+        return [0], {"resident_tokens": 0}
+
+    monkeypatch.setattr(gen_mod, "mtp_generate", spy)
+    monkeypatch.setenv("SPEC_SPLIT_DEMAND_AFTER_PREFILL", "1")
+    monkeypatch.setenv("DEMAND_ASYNC", "0")
+    monkeypatch.setenv("CLI_WARMUP_TOK", "4")
+    cli_mod._warmup(_kv_toy_k3(), None, object(), types.SimpleNamespace(k=3))
+    assert states == ["0", "1"]
+    assert os.environ["DEMAND_ASYNC"] == "0"
+
+
 def test_warmup_end_to_end_on_toy_model():
     """不打桩:合成 prompt 走真实 mtp_generate 在玩具模型上应无异常跑通。"""
     from mlx_streaming.tests.test_mtp_generate import _RandDraft
@@ -122,7 +147,10 @@ def test_chat_repl_reset_drops_cache(monkeypatch):
 
     def fake_mtp_generate(model, drafter, tok, prompt, max_tokens, K=3,
                           ids_mode=False, profile=False, on_tokens=None,
-                          main_cache=None, cached_len=0):
+                          main_cache=None, cached_len=0,
+                          on_prefill_complete=None):
+        if on_prefill_complete is not None:
+            on_prefill_complete()
         calls.append({"cached_len": cached_len})
         produced = [10, 11]
         if on_tokens is not None:

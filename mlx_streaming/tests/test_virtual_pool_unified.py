@@ -47,6 +47,8 @@ class _RPRemap:
 
 class _RPHost:
     """host/fetch 路径 mock（cap=4）。"""
+    stacked_batch_loader = None
+
     def __init__(self):
         self.calls = []
 
@@ -57,9 +59,12 @@ class _RPHost:
         self.calls.append(("acquire", tuple(flat)))
         return ("POOL_HOST", [0, 1, 0])
 
-    def fetch(self, layer, uniq_sorted):
-        self.calls.append(("fetch", tuple(uniq_sorted)))
-        return "POOL_FETCH"
+    def batch_loader(self, layer, experts):
+        self.calls.append(("temporary", tuple(experts)))
+        return {
+            expert: {"weight": mx.array([expert], dtype=mx.int32)}
+            for expert in experts
+        }
 
 
 def test_acquire_dual_returns_n_experts(monkeypatch):
@@ -113,15 +118,16 @@ def test_acquire_host_under_cap_uses_acquire():
     assert rp.calls == [("acquire", (10, 11, 10))]
 
 
-def test_acquire_host_over_cap_uses_fetch():
-    # host：uniq(5) > cap(4) → fetch，local 为 remap 到 [0,5) 的连续索引
+def test_acquire_host_over_cap_uses_temporary_loader():
+    # host：uniq(5) > cap(4) → 不写固定池的 temporary load。
     rp = _RPHost()
     vp = VirtualPool(rp, staging=None, spec_slots=0)
     flat = [10, 11, 12, 13, 14]
     pool, local, n_exp = vp.acquire_host(0, flat, (1, 5), mx.uint32, layer_cap=4)
-    assert pool == "POOL_FETCH" and n_exp == 5
+    assert pool["weight"].tolist() == [[10], [11], [12], [13], [14]]
+    assert n_exp == 5
     assert sorted(set(int(v) for v in local.reshape(-1).tolist())) == [0, 1, 2, 3, 4]
-    assert rp.calls == [("fetch", (10, 11, 12, 13, 14))]
+    assert rp.calls == [("temporary", (10, 11, 12, 13, 14))]
 
 
 def test_dual_overcap_temporary_fetch_preserves_route_order():

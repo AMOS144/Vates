@@ -1,6 +1,7 @@
 import importlib
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import mlx.core as mx
@@ -72,7 +73,9 @@ def test_native_moe_slot_pool_reuses_pool_arrays(tmp_path, monkeypatch):
 
 
 def test_native_moe_ext_fused_moe_returns_mlx_array():
-    subprocess.run(["make", "native_moe_ext"], cwd=BENCH_DIR, check=True)
+    subprocess.run([
+        "make", f"PYTHON={sys.executable}", "native_moe_ext",
+    ], cwd=BENCH_DIR, check=True)
     mod = importlib.import_module("mlx_streaming.native_moe_ext")
     x = mx.ones((1, 64), dtype=mx.float32) * 0.1
     expert_ids = mx.array([0, 1, 2, 3], dtype=mx.uint32)
@@ -98,7 +101,9 @@ def test_native_moe_ext_fused_moe_returns_mlx_array():
 
 
 def test_native_moe_ext_fused_moe_staged_returns_mlx_array():
-    subprocess.run(["make", "native_moe_ext"], cwd=BENCH_DIR, check=True)
+    subprocess.run([
+        "make", f"PYTHON={sys.executable}", "native_moe_ext",
+    ], cwd=BENCH_DIR, check=True)
     mod = importlib.import_module("mlx_streaming.native_moe_ext")
     hidden = 64
     inter = 32
@@ -135,7 +140,9 @@ def test_native_moe_ext_fused_moe_staged_returns_mlx_array():
 
 
 def test_native_moe_ext_fused_moe_staged_reduces_all_scored_experts():
-    subprocess.run(["make", "native_moe_ext"], cwd=BENCH_DIR, check=True)
+    subprocess.run([
+        "make", f"PYTHON={sys.executable}", "native_moe_ext",
+    ], cwd=BENCH_DIR, check=True)
     mod = importlib.import_module("mlx_streaming.native_moe_ext")
     hidden = 64
     inter = 32
@@ -178,7 +185,9 @@ def test_native_moe_ext_fused_moe_staged_reduces_all_scored_experts():
 
 
 def test_native_moe_ext_fused_moe_slots_uses_local_slot_indices():
-    subprocess.run(["make", "native_moe_ext"], cwd=BENCH_DIR, check=True)
+    subprocess.run([
+        "make", f"PYTHON={sys.executable}", "native_moe_ext",
+    ], cwd=BENCH_DIR, check=True)
     mod = importlib.import_module("mlx_streaming.native_moe_ext")
     hidden = 64
     inter = 32

@@ -1,15 +1,18 @@
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 BENCH_DIR = ROOT / "native" / "bench"
-BENCH = BENCH_DIR / "qlinear_bench"
+BENCH = BENCH_DIR / "compute" / "qlinear_bench"
 
 
 def test_qlinear_bench_runs_6bit_smoke():
-    subprocess.run(["make", "qlinear_bench"], cwd=BENCH_DIR, check=True)
+    subprocess.run([
+        "make", f"PYTHON={sys.executable}", "compute/qlinear_bench",
+    ], cwd=BENCH_DIR, check=True)
     out = subprocess.check_output([
         str(BENCH),
         "--in", "128",
