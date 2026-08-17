@@ -3,12 +3,12 @@
 用法示例:
     vates                       # 直接进入交互式对话(默认子命令 chat)
     vates chat                  # 同上
-    vates -k 4 -n 800 --stats   # 调宽投机、加长生成、每轮打印吞吐
+    vates -n 800 --stats        # 加长生成、每轮分别打印 prefill/decode 吞吐
     vates --system "你是一个简洁的助手"
-    vates --model models/qwen3_next_80b_4bit --expert-slots 32
+    vates --model models/qwen3_next_80b_4bit
 
-只做「生成」一件事:走 MTP 自投机 + 零拷贝双源侧区快路径。关键参数做成命令行 flag,
-其余调优项仍从环境变量读取(见 mlx_streaming/config.py)。
+只做「生成」一件事。公开 vates 入口会在导入本模块前安装固定生产配置；
+模型路径、生成长度和交互方式仍作为命令行参数。
 
 交互期间可用命令:
     /exit 或 /quit   退出
@@ -370,13 +370,14 @@ def _add_chat_args(p):
     p.add_argument("--mtp-out", default=config.mtp_out(), help="MTP 权重文件")
     p.add_argument("--qn-config", default=config.qn_config(),
                    help="Qwen3-Next 配置 JSON")
-    p.add_argument("-k", "--k", type=int, default=3, help="MTP 投机宽度(默认 3)")
+    p.add_argument("-k", "--k", type=int, default=3,
+                   help="MTP 投机宽度(公开 vates 固定为 3)")
     p.add_argument("-n", "--max-tokens", type=int, default=4096,
                    help="每轮最多生成的新 token 数(默认 4096)")
     p.add_argument("--expert-slots", type=int, default=32,
-                   help="常驻专家池容量(默认 32,同时作为侧区行数默认)")
+                   help="主模型专家池容量(公开 vates 固定为 152)")
     p.add_argument("--spec-slots", type=int, default=None,
-                   help="侧区行数 POOL_SPEC_SLOTS(默认跟随 --expert-slots)")
+                   help="旧侧区行数(公开 vates 固定为 0)")
     p.add_argument("--system", default=None, help="可选 system 提示词")
     p.add_argument("--stats", action="store_true",
                    help="每轮结束在 stderr 打印 token 数 / tok·s / 接受长度")

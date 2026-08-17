@@ -59,4 +59,9 @@ def test_final_profile_short_chat_entry():
     ]
     with pytest.raises(ValueError, match="fixed at 152"):
         _chat_argv(["--chat", "--expert-slots", "64"])
+    with pytest.raises(ValueError, match="fixed at 152"):
+        _chat_argv(["--chat", "--expert-slots=64"])
+    with pytest.raises(ValueError, match="fixed at 3"):
+        _chat_argv(["--chat", "-k4"])
+    assert _chat_argv(["--chat", "--k=3", "--stats"])[-1] == "--stats"
     assert _chat_argv([]) is None

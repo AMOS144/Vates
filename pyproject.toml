@@ -13,7 +13,7 @@ dependencies = [
 
 # 命令行入口:vates chat 交互式对话(MTP 自投机快路径)
 [project.scripts]
-vates = "mlx_streaming.cli:main"
+vates = "mlx_streaming.entrypoint:main"
 
 [dependency-groups]
 dev = [
