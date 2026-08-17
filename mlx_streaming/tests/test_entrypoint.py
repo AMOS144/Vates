@@ -56,3 +56,28 @@ def test_public_cli_configures_profile_before_loading_chat(monkeypatch):
 def test_public_cli_reports_profile_override_cleanly(capsys):
     assert main(["--k=4"]) == 2
     assert "vates: error: --k is fixed at 3" in capsys.readouterr().err
+
+
+def test_public_help_lists_prepare_without_configuring_profile(monkeypatch, capsys):
+    monkeypatch.setattr(os, "environ", {})
+    assert main(["--help"]) == 0
+    assert "vates prepare --help" in capsys.readouterr().out
+    assert "EXPERT_SLOTS" not in os.environ
+
+
+def test_prepare_is_dispatched_before_chat_profile(monkeypatch):
+    monkeypatch.setattr(os, "environ", {})
+    seen = {}
+
+    def fake_prepare(argv):
+        seen["argv"] = argv
+        seen["configured"] = "EXPERT_SLOTS" in os.environ
+        return 7
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_streaming.prep.runtime_bundle",
+        SimpleNamespace(main=fake_prepare),
+    )
+    assert main(["prepare", "--help"]) == 7
+    assert seen == {"argv": ["--help"], "configured": False}

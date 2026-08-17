@@ -13,7 +13,7 @@ def test_final_profile_defaults(monkeypatch):
     configure()
     assert FINAL_DEFAULTS.items() <= os.environ.items()
     assert FINAL_DEFAULTS["MTP_BITS"] == "4"
-    assert FINAL_DEFAULTS["MTP_EXPERT_DIR"].endswith("_4bit_g64")
+    assert FINAL_DEFAULTS["MTP_EXPERT_DIR"].endswith("vates-runtime/mtp/experts")
     assert FINAL_DEFAULTS["NATIVE_NO_SUBMIT"] == "0"
     assert FINAL_DEFAULTS["PREFETCH_PHYSICAL_READ_BUDGET"] == "3"
     assert FINAL_DEFAULTS["MTP_CONF_TAU"] == "0.3"
@@ -39,6 +39,12 @@ def test_final_profile_defaults(monkeypatch):
     assert FINAL_DEFAULTS["TREE_VERIFY"] == "0"
     assert FINAL_DEFAULTS["PREFETCH_OPTIMISTIC_VERIFY"] == "0"
     assert FINAL_DEFAULTS["PREFETCH_ONLINE_TRANSITION"] == "0"
+
+
+def test_runtime_root_relocates_mtp_experts(monkeypatch, tmp_path):
+    monkeypatch.setattr(os, "environ", {"VATES_RUNTIME_DIR": str(tmp_path)})
+    configure()
+    assert os.environ["MTP_EXPERT_DIR"] == str(tmp_path / "mtp" / "experts")
 
 
 def test_final_profile_overrides_stale_performance_environment(monkeypatch):

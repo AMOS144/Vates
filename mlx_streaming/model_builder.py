@@ -14,10 +14,12 @@
 """
 import json
 import os
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm import load
+from mlx_lm.utils import load_model, load_tokenizer
 from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
 from mlx_streaming import config
@@ -162,7 +164,29 @@ def expanded_pin_caps(
 
 def build_streaming_model():
     """用文件后端流式 patch 加载主模型(32GB 机器装不下 41GB 非流式)。"""
-    model, tok = load(MODEL, lazy=True)
+    compact_marker = os.path.join(MODEL, "vates_compact_model.json")
+    if os.path.exists(compact_marker):
+        with open(compact_marker, encoding="utf-8") as file:
+            marker = json.load(file)
+        if marker.get("format") != "vates_compact_model_v1":
+            raise ValueError(f"不支持的 Vates 紧凑核心标记: {compact_marker}")
+        manifest_path = Path(MODEL).parent / "vates_manifest.json"
+        if not manifest_path.is_file():
+            raise ValueError(f"紧凑核心缺少运行目录 manifest: {manifest_path}")
+        with manifest_path.open(encoding="utf-8") as file:
+            manifest = json.load(file)
+        if (
+            manifest.get("format") != "vates_runtime_bundle_v1"
+            or manifest.get("status") != "verified"
+        ):
+            raise ValueError(f"紧凑核心尚未通过 prepare 验证: {manifest_path}")
+        # 只有 prepare 生成并标记的核心允许缺少 switch_mlp；随后必由文件专家替换。
+        model, _model_config = load_model(
+            Path(MODEL), lazy=True, strict=False,
+        )
+        tok = load_tokenizer(MODEL)
+    else:
+        model, tok = load(MODEL, lazy=True)
     # 取首个 MoE 维度
     dims = None
     for layer in model.layers:

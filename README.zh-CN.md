@@ -30,7 +30,7 @@
 项目面向 **Qwen3-Next-80B-A3B 4-bit MLX**：512 个专家、每个 token 激活 10 个专家、48 个 MoE 层和 12 个全注意力层。配合模型自带的 MTP 头，vates 通过自投机解码进一步提高生成吞吐。
 
 > [!NOTE]
-> 4-bit 主模型权重在磁盘上约占 41 GB。[PR #1](https://github.com/AMOS144/Vates/pull/1) 合入的固定配置实测 MLX 活跃内存约 10.96 GiB、MLX 峰值约 11.51 GiB。它们都不是进程 RSS 或系统总内存，也不代表同等容量的统一内存足以运行。macOS、映射文件、原生分配、文件系统缓存和其他应用仍需要额外余量。实际内存与速度会受到硬件、提示词长度、模型文件和缓存热度影响。仓库不包含主模型、专家 blob、MTP 权重或流式 MTP 专家文件。
+> 按当前源分片头精确估算，准备完成的运行目录约占 42.7 GiB（`du` 约显示 43 GB，低于约 44 GB 的目标），下载的 4-bit 主模型源权重本身约为 41.8 GiB。[PR #1](https://github.com/AMOS144/Vates/pull/1) 合入的固定配置实测 MLX 活跃内存约 10.96 GiB、MLX 峰值约 11.51 GiB。它们都不是进程 RSS 或系统总内存，也不代表同等容量的统一内存足以运行。macOS、映射文件、原生分配、文件系统缓存和其他应用仍需要额外余量。实际内存与速度会受到硬件、提示词长度、模型文件和缓存热度影响。仓库不包含模型权重。
 
 ## 演示
 
@@ -155,7 +155,7 @@ make -C native/ext PYTHON="$VATES_PYTHON" native_moe_ext
 vates --demo
 ```
 
-准备好下文列出的四类模型资产后，在项目根目录启动实测固定配置：
+准备好下文的紧凑运行目录后，在项目根目录启动实测固定配置：
 
 ```bash
 vates --stats
@@ -163,54 +163,53 @@ vates --stats
 
 公开 `vates` 命令会在导入模型运行时之前锁定完整配置。内部实验和 benchmark runner 仍供开发者使用，但不是支持的用户入口。
 
-> [!IMPORTANT]
-> 仓库不包含模型权重。真实推理前需要自行准备兼容的 Qwen3-Next-80B-A3B 4-bit MLX 主模型、专家数据和 MTP 权重；本项目当前未提供统一下载地址。
-
 ## 数据准备
 
-下面分别使用中间 per-expert 文件目录和最终运行时 blob 目录：
+现在推荐只运行一条命令。它会下载官方 4-bit MLX 主模型和 Qwen 原版 MTP 分片，直接完成转换，完整读取输出计算并复核 SHA-256，验证成功后再删除原始权重分片：
+
+```bash
+vates prepare --download
+```
+
+最终生成可直接运行的 `models/vates-runtime`：
 
 ```text
-models/
-├── qwen3_next_80b_4bit/                  # 4-bit MLX 主模型
-├── qwen3_next_expert_files_4bit_g64/     # 中间 per-expert 文件
-├── qwen3_next_experts_4bit_g64/          # CLI 默认专家目录
-│   └── blobs/                            # 最终运行时 blob
-├── qn_mtp_weights.safetensors            # MTP 源权重
-└── qn_mtp_experts_4bit_g64/               # 4-bit 流式 MTP 专家
+models/vates-runtime/
+├── model/                 # 删除路由专家后的紧凑主模型核心
+├── experts/blobs/         # 从原始分片直写的 48 层主专家 blob
+├── mtp/core.safetensors   # 紧凑 MTP 核心
+├── mtp/experts/           # 单个 4-bit MTP 专家 blob
+└── vates_manifest.json    # 文件大小与 SHA-256 完整性记录
 ```
 
-专家权重需要转换为每个专家对应一段连续字节的 blob，使运行时读取一个专家只需一次 `pread`：
+`vates prepare` 不会再生成原来的 24,576 个 per-expert 中间文件。它在保存非专家主模型核心的同时，将堆叠的 `switch_mlp` 张量直接写到最终 blob 的对应偏移；MTP 也直接拆成紧凑核心和 4-bit/group-64 专家 blob。按当前源分片头估算，最终目录约为 42.7 GiB（`du` 约显示 43 GB，少量差异取决于模型元数据）。
+
+如果希望自己先下载，使用以下 Hugging Face CLI 命令：
 
 ```bash
-# 将堆叠的 switch_mlp 权重拆分为 per-expert 文件
-.venv/bin/python -m mlx_streaming.prep.split_experts \
-  models/qwen3_next_80b_4bit \
-  models/qwen3_next_expert_files_4bit_g64
+hf download mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit \
+  --local-dir models/.vates-source/main
 
-# 将 per-expert 文件打包到 CLI 默认目录的 blobs 子目录，并生成 blob_index.json
-EXPERT_DIR=models/qwen3_next_expert_files_4bit_g64 \
-BLOB_DIR=models/qwen3_next_experts_4bit_g64/blobs \
-BITS=4 GROUP=64 LAYERS=all \
-.venv/bin/python -m mlx_streaming.prep.pack_blob_from_experts
+hf download Qwen/Qwen3-Next-80B-A3B-Instruct \
+  model-00041-of-00041.safetensors \
+  --local-dir models/.vates-source/mtp
 
-# 从原始模型分片提取并整理 MTP 权重
-.venv/bin/python -m mlx_streaming.prep.extract_mtp
+vates prepare
 ```
 
-为固定配置使用的有界 4-bit MTP 池拆分并量化 MTP 专家：
+也可以直接指定已有权重：
 
 ```bash
-.venv/bin/python -m mlx_streaming.tools.split_mtp_experts \
-  --bits 4 \
-  --group-size 64 \
-  --out models/qn_mtp_experts_4bit_g64
+vates prepare \
+  --main-source /path/to/Qwen3-Next-80B-A3B-Instruct-4bit \
+  --mtp-source /path/to/model-00041-of-00041.safetensors
 ```
 
-字节布局由 `mlx_streaming/prep/blob_layout.py` 统一定义，并与运行时 blob loader 保持一致。
+> [!CAUTION]
+> 默认会清理源权重，但只在结构检查和输出哈希复核全部成功后执行。需要保留原始分片时加 `--keep-source`。命令不会覆盖已经存在的输出目录。
 
-> [!WARNING]
-> 数据准备所需磁盘空间明显多于约 41 GB 的主模型目录：打包期间中间文件与最终 blob 会同时存在，MTP 源分片还会增加约 3.30 GB（3.07 GiB）。验证 `models/qwen3_next_experts_4bit_g64/blobs` 及其 `blob_index.json` 后，可以删除中间目录 `models/qwen3_next_expert_files_4bit_g64`。41 GB 仅指主模型权重，不是数据准备期间的峰值磁盘占用。
+> [!NOTE]
+> 下载与转换在同一轮执行时，请预留约 90 GiB 临时空间，因为验证前源权重与最终输出会短暂共存。成功清理后只保留约 42.7 GiB 的运行目录（另有可忽略的下载元数据）。旧流程会额外复制 per-expert 文件，准备目录一度约 128 GB；新流程已去掉这部分重复占用。
 
 ## 详细使用
 
@@ -259,10 +258,10 @@ TUI 支持以下操作：
 
 | 参数 | 说明 | 默认值 |
 | --- | --- | --- |
-| `--model` | 4-bit MLX 主模型路径 | `models/qwen3_next_80b_4bit` |
-| `--expert-dir` | 专家根目录；默认在其 `blobs/` 子目录读取 blob。若直接指定 blob 目录，请设置 `BLOB_DIR` | `models/qwen3_next_experts_4bit_g64` |
-| `--mtp-out` | MTP 权重文件 | `models/qn_mtp_weights.safetensors` |
-| `--qn-config` | Qwen3-Next 配置文件 | `models/qwen3_next_80b_4bit/config.json` |
+| `--model` | 4-bit MLX 紧凑主模型核心路径 | `models/vates-runtime/model` |
+| `--expert-dir` | 专家根目录；默认在其 `blobs/` 子目录读取 blob。若直接指定 blob 目录，请设置 `BLOB_DIR` | `models/vates-runtime/experts` |
+| `--mtp-out` | 紧凑 MTP 核心文件 | `models/vates-runtime/mtp/core.safetensors` |
+| `--qn-config` | Qwen3-Next 配置文件 | `models/vates-runtime/model/config.json` |
 | `-k`, `--k` | MTP 投机宽度；由公开 CLI 固定 | `3` |
 | `-n`, `--max-tokens` | 每轮最多生成的新 token 数 | `4096` |
 | `--expert-slots` | 主模型专家池容量；由公开 CLI 固定 | `152` |
@@ -327,7 +326,7 @@ vates --help
 
 | 项目 | 结果 |
 | --- | --- |
-| 存储与内存 | 主模型权重在磁盘上约 41 GB；固定配置的 MLX 活跃内存约 10.96 GiB、MLX 峰值约 11.51 GiB，都不是进程 RSS 或系统总内存 |
+| 存储与内存 | 准备完成的运行目录约 42.7 GiB（`du` 约显示 43 GB）；固定配置的 MLX 活跃内存约 10.96 GiB、MLX 峰值约 11.51 GiB，都不是进程 RSS 或系统总内存 |
 | Prefill | 单独报告 prompt token 数、秒数和 tok/s；同步执行，不计入 Decode 速度。首 token 延迟取决于未缓存提示词长度和 SSD 状态 |
 | 稳态 Decode | 已有固定 128-token 稳态实测约 31–37 tok/s；缓存热度和 prompt 会显著影响结果 |
 | TUI 开销 A/B | 同一热池对比中，异步 TUI 流式输出 31.65 tok/s，完全关闭流式输出 31.76 tok/s，差异约 0.35% |
@@ -398,7 +397,7 @@ make -C native/ext PYTHON="$VATES_PYTHON" native_moe_ext
 <details>
 <summary><strong>模型文件应该放在哪里？</strong></summary>
 
-默认路径位于仓库根目录的 `models/`。固定配置还需要 `models/qn_mtp_experts_4bit_g64`。也可以通过 `--model`、`--expert-dir`、`--mtp-out` 和 `--qn-config` 指定其他主模型位置。
+运行 `vates prepare --download`，默认会生成 `models/vates-runtime`。需要整体换位置时设置 `VATES_RUNTIME_DIR`；也可以通过 `--model`、`--expert-dir`、`--mtp-out` 和 `--qn-config` 分别指定路径。
 
 </details>
 
