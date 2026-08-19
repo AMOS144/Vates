@@ -17,7 +17,7 @@ An out-of-core streaming MoE inference engine for MLX, with Qwen3-Next MTP self-
 [![MLX](https://img.shields.io/badge/MLX-0.31%2B-8A2BE2?style=flat)](https://github.com/ml-explore/mlx)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-[Demo](#demo) · [Quick Start](#quick-start) · [Usage](#usage) · [FAQ](#faq) · [Contributing](#contributing)
+[Quick Start](#quick-start) · [Usage](#usage) · [FAQ](#faq) · [Contributing](#contributing)
 
 </div>
 
@@ -31,12 +31,6 @@ vates targets **Qwen3-Next-80B-A3B 4-bit MLX**, which has 48 MoE transformer lay
 
 > [!NOTE]
 > The prepared runtime bundle is estimated at approximately 42.7 GiB (shown as roughly 43 GB by `du`, below the 44 GB target); the downloaded 4-bit main-model source alone is approximately 41.8 GiB. The profile merged in [PR #1](https://github.com/AMOS144/Vates/pull/1) measured approximately 10.96 GiB of active MLX memory and an approximately 11.51 GiB MLX peak. These figures are not process RSS or total system memory, and they do not mean that a machine with only that much unified memory is sufficient. macOS, mapped files, native allocations, the filesystem cache, and other applications require additional headroom. Actual memory use and speed depend on hardware, prompt length, model files, and cache warmth. The repository does not include model weights.
-
-## Demo
-
-Click the image below to play the demo:
-
-[![vates demo](https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo-poster.png)](https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo.mp4)
 
 ## Features
 
