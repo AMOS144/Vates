@@ -17,7 +17,7 @@
 [![MLX](https://img.shields.io/badge/MLX-0.31%2B-8A2BE2?style=flat)](https://github.com/ml-explore/mlx)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-[演示](#演示) · [快速开始](#快速开始) · [详细使用](#详细使用) · [常见问题](#常见问题-faq) · [参与贡献](#开发与贡献)
+[快速开始](#快速开始) · [详细使用](#详细使用) · [常见问题](#常见问题-faq) · [参与贡献](#开发与贡献)
 
 </div>
 
@@ -31,12 +31,6 @@
 
 > [!NOTE]
 > 4-bit 主模型权重在磁盘上约占 41 GB。[PR #1](https://github.com/AMOS144/Vates/pull/1) 合入的固定配置实测 MLX 活跃内存约 10.96 GiB、MLX 峰值约 11.51 GiB。它们都不是进程 RSS 或系统总内存，也不代表同等容量的统一内存足以运行。macOS、映射文件、原生分配、文件系统缓存和其他应用仍需要额外余量。实际内存与速度会受到硬件、提示词长度、模型文件和缓存热度影响。仓库不包含主模型、专家 blob、MTP 权重或流式 MTP 专家文件。
-
-## 演示
-
-点击下方封面播放演示视频：
-
-[![vates 演示](https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo-poster.png)](https://github.com/AMOS144/Vates/releases/download/v0.1.0/vates-demo.mp4)
 
 ## 功能亮点
 
